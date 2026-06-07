@@ -2,13 +2,22 @@
 
 <cite>
 **本文引用的文件**
-- [媒体保存器 media-saver.ts](file://src/lib/media-saver.ts)
-- [媒体导入 MCP media-import-mcp.ts](file://src/lib/media-import-mcp.ts)
-- [图像生成器 image-generator.ts](file://src/lib/image-generator.ts)
-- [数据库与表结构 db.ts](file://src/lib/db.ts)
-- [画廊组件 GalleryGrid.tsx](file://src/components/gallery/GalleryGrid.tsx)
-- [标签管理器 TagManager.tsx](file://src/components/gallery/TagManager.tsx)
-- [任务调度器 task-scheduler.ts](file://src/lib/task-scheduler.ts)
+- [src/app/api/media/generate/route.ts](file://src/app/api/media/generate/route.ts)
+- [src/app/api/media/gallery/route.ts](file://src/app/api/media/gallery/route.ts)
+- [src/app/api/media/[id]/route.ts](file://src/app/api/media/[id]/route.ts)
+- [src/app/api/media/jobs/route.ts](file://src/app/api/media/jobs/route.ts)
+- [src/app/api/media/serve/route.ts](file://src/app/api/media/serve/route.ts)
+- [src/lib/image-generator.ts](file://src/lib/image-generator.ts)
+- [src/lib/media-saver.ts](file://src/lib/media-saver.ts)
+- [src/lib/media-import-mcp.ts](file://src/lib/media-import-mcp.ts)
+- [src/lib/db.ts](file://src/lib/db.ts)
+- [src/__tests__/unit/openai-image-size.test.ts](file://src/__tests__/unit/openai-image-size.test.ts)
+- [src/__tests__/unit/media-provider-routes.test.ts](file://src/__tests__/unit/media-provider-routes.test.ts)
+- [src/__tests__/unit/codex-media-import.test.ts](file://src/__tests__/unit/codex-media-import.test.ts)
+- [src/app/api/providers/active-image/route.ts](file://src/app/api/providers/active-image/route.ts)
+- [public/skills/image-generation.md](file://public/skills/image-generation.md)
+- [src/lib/bridge/adapters/weixin/weixin-media.ts](file://src/lib/bridge/adapters/weixin/weixin-media.ts)
+- [资料/weixin-openclaw-package/package/src/cdn/upload.ts](file://资料/weixin-openclaw-package/package/src/cdn/upload.ts)
 </cite>
 
 ## 目录
@@ -18,469 +27,454 @@
 4. [架构总览](#架构总览)
 5. [详细组件分析](#详细组件分析)
 6. [依赖关系分析](#依赖关系分析)
-7. [性能考量](#性能考量)
+7. [性能考虑](#性能考虑)
 8. [故障排查指南](#故障排查指南)
 9. [结论](#结论)
 10. [附录](#附录)
 
 ## 简介
-本文件为 CodePilot 媒体 API 的权威参考文档，覆盖媒体文件生成、画廊管理、标签操作、作业调度等端点的完整规范。内容包括：
-- HTTP 方法、URL 模式、请求/响应模式、认证要求
-- 实际请求/响应示例路径（以代码片段路径代替具体文本）
-- 图像生成流程、批量任务管理、媒体文件浏览、标签系统
-- 错误处理策略与媒体处理最佳实践
+本文件系统性梳理媒体处理 API，覆盖图片生成、媒体预览、相册管理、批量任务、CDN 上传与下载、以及微信生态中的媒体分享能力。重点说明请求参数、质量设置与输出格式、存储与缓存策略、清理机制、上传/下载/分享规范、媒体类型支持、尺寸限制与格式转换，并给出完整的处理流程与错误处理策略，最后提供性能优化与并发控制的最佳实践。
 
 ## 项目结构
-媒体相关能力由以下模块协同实现：
-- 后端服务层：媒体导入（MCP 工具）、图像生成、SQLite 数据持久化
-- 前端展示层：画廊网格、标签管理器
-- 调度层：定时任务调度器，支持一次性与周期性任务
+媒体相关能力主要分布在以下位置：
+- Next.js 路由层：/src/app/api/media 下的各路由（生成、相册、单条、任务、服务）
+- 核心业务逻辑：/src/lib 下的图像生成器、媒体保存器、媒体导入 MCP 等
+- 测试与约束：单元测试验证尺寸约束、提供商路由校验、导入流程
+- 微信生态：桥接适配器与 CDN 上传工具
+- 文档与示例：public/skills/image-generation.md 提供技能侧的输入格式示例
 
 ```mermaid
 graph TB
-subgraph "前端"
-GG["画廊网格 GalleryGrid.tsx"]
-TM["标签管理器 TagManager.tsx"]
+subgraph "API 层"
+GEN["/media/generate"]
+GALLERY["/media/gallery"]
+ITEM["/media/[id]"]
+JOBS["/media/jobs"]
+SERVE["/media/serve"]
 end
-subgraph "后端服务"
-IMG["图像生成器 image-generator.ts"]
-IMP["媒体导入 MCP media-import-mcp.ts"]
-SAV["媒体保存器 media-saver.ts"]
-DB["数据库与表结构 db.ts"]
+subgraph "业务逻辑层"
+IMGGEN["image-generator"]
+MEDIASAVE["media-saver"]
+IMPORTMCP["media-import-mcp"]
 end
-subgraph "调度"
-SCH["任务调度器 task-scheduler.ts"]
+subgraph "数据与桥接"
+DB["db"]
+WXMEDIA["weixin-media"]
+CDNUPLOAD["cdn/upload"]
 end
-GG --> DB
-TM --> DB
-IMG --> SAV
-IMP --> SAV
-SAV --> DB
-SCH --> DB
+GEN --> IMGGEN
+GALLERY --> DB
+ITEM --> DB
+JOBS --> DB
+SERVE --> DB
+IMGGEN --> MEDIASAVE
+IMPORTMCP --> DB
+WXMEDIA --> CDNUPLOAD
+IMGGEN --> DB
+MEDIASAVE --> DB
 ```
 
 图表来源
-- [图像生成器 image-generator.ts:271-451](file://src/lib/image-generator.ts#L271-L451)
-- [媒体导入 MCP media-import-mcp.ts:40-122](file://src/lib/media-import-mcp.ts#L40-L122)
-- [媒体保存器 media-saver.ts:94-161](file://src/lib/media-saver.ts#L94-L161)
-- [数据库与表结构 db.ts:152-229](file://src/lib/db.ts#L152-L229)
-- [画廊组件 GalleryGrid.tsx:25-35](file://src/components/gallery/GalleryGrid.tsx#L25-L35)
-- [标签管理器 TagManager.tsx:167-213](file://src/components/gallery/TagManager.tsx#L167-L213)
-- [任务调度器 task-scheduler.ts:57-131](file://src/lib/task-scheduler.ts#L57-L131)
+- [src/app/api/media/generate/route.ts:1-70](file://src/app/api/media/generate/route.ts#L1-L70)
+- [src/app/api/media/gallery/route.ts:1-44](file://src/app/api/media/gallery/route.ts#L1-L44)
+- [src/app/api/media/[id]/route.ts](file://src/app/api/media/[id]/route.ts#L1-L48)
+- [src/app/api/media/jobs/route.ts:45-73](file://src/app/api/media/jobs/route.ts#L45-L73)
+- [src/app/api/media/serve/route.ts](file://src/app/api/media/serve/route.ts)
+- [src/lib/image-generator.ts:62-376](file://src/lib/image-generator.ts#L62-L376)
+- [src/lib/media-saver.ts](file://src/lib/media-saver.ts)
+- [src/lib/media-import-mcp.ts](file://src/lib/media-import-mcp.ts)
+- [src/lib/db.ts](file://src/lib/db.ts)
+- [src/lib/bridge/adapters/weixin/weixin-media.ts:122-156](file://src/lib/bridge/adapters/weixin/weixin-media.ts#L122-L156)
+- [资料/weixin-openclaw-package/package/src/cdn/upload.ts:1-110](file://资料/weixin-openclaw-package/package/src/cdn/upload.ts#L1-L110)
 
 章节来源
-- [图像生成器 image-generator.ts:1-455](file://src/lib/image-generator.ts#L1-L455)
-- [媒体导入 MCP media-import-mcp.ts:1-123](file://src/lib/media-import-mcp.ts#L1-L123)
-- [媒体保存器 media-saver.ts:1-162](file://src/lib/media-saver.ts#L1-L162)
-- [数据库与表结构 db.ts:152-229](file://src/lib/db.ts#L152-L229)
-- [画廊组件 GalleryGrid.tsx:1-111](file://src/components/gallery/GalleryGrid.tsx#L1-L111)
-- [标签管理器 TagManager.tsx:1-214](file://src/components/gallery/TagManager.tsx#L1-L214)
-- [任务调度器 task-scheduler.ts:1-526](file://src/lib/task-scheduler.ts#L1-L526)
+- [src/app/api/media/generate/route.ts:1-70](file://src/app/api/media/generate/route.ts#L1-L70)
+- [src/app/api/media/gallery/route.ts:1-44](file://src/app/api/media/gallery/route.ts#L1-L44)
+- [src/app/api/media/[id]/route.ts](file://src/app/api/media/[id]/route.ts#L1-L48)
+- [src/app/api/media/jobs/route.ts:45-73](file://src/app/api/media/jobs/route.ts#L45-L73)
+- [src/app/api/media/serve/route.ts](file://src/app/api/media/serve/route.ts)
+- [src/lib/image-generator.ts:62-376](file://src/lib/image-generator.ts#L62-L376)
+- [src/lib/media-saver.ts](file://src/lib/media-saver.ts)
+- [src/lib/media-import-mcp.ts](file://src/lib/media-import-mcp.ts)
+- [src/lib/db.ts](file://src/lib/db.ts)
+- [src/lib/bridge/adapters/weixin/weixin-media.ts:122-156](file://src/lib/bridge/adapters/weixin/weixin-media.ts#L122-L156)
+- [资料/weixin-openclaw-package/package/src/cdn/upload.ts:1-110](file://资料/weixin-openclaw-package/package/src/cdn/upload.ts#L1-L110)
 
 ## 核心组件
-- 媒体保存器：负责将 Base64 或本地文件导入媒体库，写入磁盘并记录数据库条目
-- 媒体导入 MCP：通过 Claude Agent SDK 提供 MCP 工具，用于将已存在的本地媒体文件导入库并内联显示
-- 图像生成器：选择合适的图像提供商（Gemini/OpenAI），调用上游 API，保存结果并记录元数据
-- 画廊组件：渲染媒体缩略图、视频封面、收藏标记与多图计数
-- 标签管理器：提供标签列表、添加/删除、切换选中状态的交互与 API 调用
-- 任务调度器：轮询 SQLite 中待执行的任务，执行并记录运行日志，支持指数退避与自动禁用
+- 图片生成路由：接收请求参数，调用图像生成器，返回生成结果与元信息。
+- 相册列表路由：从数据库读取媒体记录，构建响应（含 MIME 类型推断）。
+- 单条媒体路由：查询、删除媒体记录及本地文件。
+- 批量任务路由：创建任务与任务项，返回任务状态与条目。
+- 媒体服务路由：提供媒体文件访问（基于路径或 ID）。
+- 图像生成器：计算有效尺寸、执行生成、写入磁盘、持久化到数据库。
+- 媒体保存器：统一保存流程（可跳过落盘用于流式场景）。
+- 媒体导入 MCP：桥接外部媒体导入，写入数据库并打上媒体标识。
+- 数据库：媒体生成记录、任务与任务项、会话关联等。
+- 微信媒体适配：下载并解密 CDN 媒体，上传媒体至 CDN 并返回下载参数。
+- 尺寸与格式约束：通过测试与映射确保符合平台限制与像素对齐要求。
 
 章节来源
-- [媒体保存器 media-saver.ts:94-161](file://src/lib/media-saver.ts#L94-L161)
-- [媒体导入 MCP media-import-mcp.ts:40-122](file://src/lib/media-import-mcp.ts#L40-L122)
-- [图像生成器 image-generator.ts:271-451](file://src/lib/image-generator.ts#L271-L451)
-- [画廊组件 GalleryGrid.tsx:25-35](file://src/components/gallery/GalleryGrid.tsx#L25-L35)
-- [标签管理器 TagManager.tsx:167-213](file://src/components/gallery/TagManager.tsx#L167-L213)
-- [任务调度器 task-scheduler.ts:57-131](file://src/lib/task-scheduler.ts#L57-L131)
+- [src/app/api/media/generate/route.ts:1-70](file://src/app/api/media/generate/route.ts#L1-L70)
+- [src/app/api/media/gallery/route.ts:1-44](file://src/app/api/media/gallery/route.ts#L1-L44)
+- [src/app/api/media/[id]/route.ts](file://src/app/api/media/[id]/route.ts#L1-L48)
+- [src/app/api/media/jobs/route.ts:45-73](file://src/app/api/media/jobs/route.ts#L45-L73)
+- [src/app/api/media/serve/route.ts](file://src/app/api/media/serve/route.ts)
+- [src/lib/image-generator.ts:62-376](file://src/lib/image-generator.ts#L62-L376)
+- [src/lib/media-saver.ts](file://src/lib/media-saver.ts)
+- [src/lib/media-import-mcp.ts](file://src/lib/media-import-mcp.ts)
+- [src/lib/db.ts](file://src/lib/db.ts)
+- [src/lib/bridge/adapters/weixin/weixin-media.ts:122-156](file://src/lib/bridge/adapters/weixin/weixin-media.ts#L122-L156)
+- [资料/weixin-openclaw-package/package/src/cdn/upload.ts:1-110](file://资料/weixin-openclaw-package/package/src/cdn/upload.ts#L1-L110)
 
 ## 架构总览
-媒体 API 的关键流程包括：
-- 图像生成：前端触发或 MCP 触发 → 选择提供商 → 调用上游 API → 写入本地媒体目录 → 记录数据库 → 返回生成结果
-- 媒体导入：MCP 工具调用 → 解析文件路径 → 复制到媒体目录 → 写入数据库 → 返回媒体信息
-- 画廊浏览：前端发起请求 → 查询数据库 → 渲染缩略图与元数据
-- 标签管理：前端发起请求 → 对标签表进行增删查改
-- 任务调度：定时轮询 → 执行任务 → 记录日志 → 通知与消息注入
+媒体处理端到端流程包括：请求进入 API 路由 -> 参数校验与任务创建 -> 调用图像生成器/导入器 -> 写入媒体库 -> 返回结果；同时支持相册查询、单条读取与删除、CDN 加解密与分享。
 
 ```mermaid
 sequenceDiagram
-participant FE as "前端"
-participant API as "后端接口"
-participant GEN as "图像生成器"
-participant SAV as "媒体保存器"
-participant DB as "SQLite"
-FE->>API : "POST /api/media/generate"
-API->>GEN : "generateSingleImage(params)"
-GEN->>GEN : "选择提供商/映射尺寸"
-GEN->>GEN : "调用上游 API"
-GEN->>SAV : "saveMediaToLibrary(block, opts)"
-SAV->>SAV : "写入磁盘"
-SAV->>DB : "插入 media_generations 记录"
-GEN->>DB : "插入 media_generations 记录"
-DB-->>API : "返回生成 ID/路径"
-API-->>FE : "返回生成结果"
+participant Client as "客户端"
+participant API as "API 路由"
+participant Gen as "图像生成器"
+participant Save as "媒体保存器"
+participant DB as "数据库"
+Client->>API : "POST /api/media/generate"
+API->>Gen : "生成图片(参数 : 提示词/比例/分辨率)"
+Gen->>Gen : "计算有效尺寸/像素对齐"
+Gen->>Save : "保存图片(可跳过落盘)"
+Save->>DB : "写入媒体记录"
+DB-->>Save : "返回ID/路径"
+Save-->>Gen : "完成保存"
+Gen-->>API : "返回生成结果"
+API-->>Client : "JSON 响应(含图片数组/耗时)"
 ```
 
 图表来源
-- [图像生成器 image-generator.ts:271-451](file://src/lib/image-generator.ts#L271-L451)
-- [媒体保存器 media-saver.ts:94-117](file://src/lib/media-saver.ts#L94-L117)
-- [数据库与表结构 db.ts:152-171](file://src/lib/db.ts#L152-L171)
+- [src/app/api/media/generate/route.ts:1-70](file://src/app/api/media/generate/route.ts#L1-L70)
+- [src/lib/image-generator.ts:62-376](file://src/lib/image-generator.ts#L62-L376)
+- [src/lib/media-saver.ts](file://src/lib/media-saver.ts)
+- [src/lib/db.ts](file://src/lib/db.ts)
 
 ## 详细组件分析
 
-### 媒体生成与导入端点规范
-- 端点：POST /api/media/generate
-  - 请求体字段
-    - prompt: 字符串，必填
-    - model: 字符串，可选
-    - aspectRatio: 字符串，如 "1:1"，可选
-    - imageSize: 字符串，如 "1K"/"2K"/"4K"，可选
-    - referenceImages: 数组，元素含 mimeType 与 data（Base64），可选
-    - referenceImagePaths: 字符串数组，相对/绝对路径，可选
-    - sessionId: 字符串，会话 ID，可选
-    - cwd: 字符串，工作目录，可选
-  - 成功响应：包含 mediaGenerationId、images（每项含 mimeType 与 localPath）、耗时、模型与家族
-  - 失败响应：包含错误信息
-  - 示例路径
-    - [请求体字段定义:13-28](file://src/lib/image-generator.ts#L13-L28)
-    - [成功响应结构:30-38](file://src/lib/image-generator.ts#L30-L38)
-    - [生成主流程:271-451](file://src/lib/image-generator.ts#L271-L451)
+### 图片生成 API
+- 请求参数
+  - 必填：sessionId（会话关联）
+  - 可选：imageSize（分辨率层级）、stylePrompt（风格提示）、batchConfig（批量配置）、items（批量条目）
+- 输出格式
+  - 返回 JSON，包含生成 ID、模型族、耗时、图片数组（含 MIME 与本地路径）
+- 错误处理
+  - 无生成物：422，提示更换提示词
+  - 其他异常：500，返回错误消息
+- 尺寸与质量
+  - 基于平台约束与像素对齐规则计算有效尺寸，保证宽高为 16 的倍数且不超过上限
+- 存储与缓存
+  - 默认写入磁盘与数据库；支持 skipSave 模式仅返回原始数据
 
-- 端点：POST /api/media/import（MCP 替代方案）
-  - 说明：推荐使用 MCP 工具 codepilot_import_media，避免直接 HTTP 调用
-  - 请求体字段
-    - filePath: 字符串，必填（绝对或相对路径）
-    - title/prompt/source/model/resolution/aspectRatio/tags: 可选
-  - 成功响应：包含导入成功的媒体 ID 与本地路径
-  - 失败响应：包含错误信息
-  - 示例路径
-    - [MCP 工具定义与调用:44-119](file://src/lib/media-import-mcp.ts#L44-L119)
-
-- 端点：GET /api/media/serve
-  - 用途：按本地路径提供媒体文件（用于画廊缩略图）
-  - 查询参数
-    - path: 字符串，必填（本地媒体文件路径）
-  - 成功响应：二进制流（对应 MIME 类型）
-  - 示例路径
-    - [缩略图 URL 生成:25-35](file://src/components/gallery/GalleryGrid.tsx#L25-L35)
-
-章节来源
-- [图像生成器 image-generator.ts:13-451](file://src/lib/image-generator.ts#L13-L451)
-- [媒体导入 MCP media-import-mcp.ts:44-119](file://src/lib/media-import-mcp.ts#L44-L119)
-- [画廊组件 GalleryGrid.tsx:25-35](file://src/components/gallery/GalleryGrid.tsx#L25-L35)
-
-### 画廊管理端点规范
-- 端点：GET /api/media/gallery
-  - 查询参数
-    - sessionId: 字符串，可选，按会话过滤
-    - tags: 字符串数组，可选，按标签过滤
-    - type: 字符串，可选，"image"/"video"/"audio"
-    - limit: 整数，可选，默认 50
-    - offset: 整数，可选，默认 0
-  - 成功响应：包含媒体项数组，每项含 id、prompt、images、type、tags、created_at 等
-  - 示例路径
-    - [前端调用示例:25-35](file://src/components/gallery/GalleryGrid.tsx#L25-L35)
-
-- 端点：GET /api/media/serve
-  - 用途：提供媒体文件下载（与画廊缩略图一致）
-  - 查询参数
-    - path: 字符串，必填
-  - 成功响应：二进制流
-  - 示例路径
-    - [缩略图 URL 生成:25-35](file://src/components/gallery/GalleryGrid.tsx#L25-L35)
-
-章节来源
-- [画廊组件 GalleryGrid.tsx:25-35](file://src/components/gallery/GalleryGrid.tsx#L25-L35)
-
-### 标签操作端点规范
-- 端点：GET /api/media/tags
-  - 成功响应：包含 tags 数组，每项含 id、name、color
-  - 示例路径
-    - [标签列表获取:167-177](file://src/components/gallery/TagManager.tsx#L167-L177)
-
-- 端点：POST /api/media/tags
-  - 请求体字段
-    - name: 字符串，必填
-    - color: 字符串，可选
-  - 成功响应：新增标签对象
-  - 示例路径
-    - [添加标签:183-199](file://src/components/gallery/TagManager.tsx#L183-L199)
-
-- 端点：DELETE /api/media/tags/:id
-  - 成功响应：空
-  - 示例路径
-    - [删除标签:201-210](file://src/components/gallery/TagManager.tsx#L201-L210)
-
-章节来源
-- [标签管理器 TagManager.tsx:167-213](file://src/components/gallery/TagManager.tsx#L167-L213)
-
-### 作业调度端点规范
-- 端点：GET /api/tasks/scheduled
-  - 查询参数
-    - status: 字符串，可选，过滤状态
-    - schedule_type: 字符串，可选，过滤类型
-  - 成功响应：包含任务数组，每项含 id、name、schedule_type、schedule_value、status、last_run、next_run 等
-  - 示例路径
-    - [调度轮询与查询:57-66](file://src/lib/task-scheduler.ts#L57-L66)
-
-- 端点：POST /api/tasks/scheduled
-  - 请求体字段
-    - name: 字符串，必填
-    - schedule_type: 字符串，"once"/"interval"/"cron"，必填
-    - schedule_value: 字符串，必填（如 "30m"、"0 9 * * *"）
-    - prompt: 字符串，必填
-    - notify_on_complete: 布尔，可选
-    - session_id: 字符串，可选
-  - 成功响应：新建任务对象
-  - 示例路径
-    - [任务创建与调度:145-293](file://src/lib/task-scheduler.ts#L145-L293)
-
-- 端点：PATCH /api/tasks/scheduled/:id
-  - 请求体字段
-    - status: 字符串，"active"/"paused"/"disabled"
-    - schedule_type/schedule_value: 可更新
-  - 成功响应：更新后的任务对象
-  - 示例路径
-    - [任务状态更新:145-293](file://src/lib/task-scheduler.ts#L145-L293)
-
-- 端点：DELETE /api/tasks/scheduled/:id
-  - 成功响应：空
-  - 示例路径
-    - [任务删除:145-293](file://src/lib/task-scheduler.ts#L145-L293)
-
-章节来源
-- [任务调度器 task-scheduler.ts:57-293](file://src/lib/task-scheduler.ts#L57-L293)
-
-### 数据模型与存储
-媒体相关的核心表：
-- media_generations：记录单次媒体生成（图像/视频/音频）
-- media_tags：标签表
-- media_jobs / media_job_items：批量任务与任务项
-- media_context_events：上下文事件
-
-```mermaid
-erDiagram
-MEDIA_GENERATIONS {
-text id PK
-text type
-text status
-text provider
-text model
-text prompt
-text aspect_ratio
-text image_size
-text local_path
-text thumbnail_path
-text session_id
-text message_id
-text tags
-text metadata
-integer favorited
-text error
-text created_at
-text completed_at
-}
-MEDIA_TAGS {
-integer id PK
-text name UK
-text color
-text created_at
-}
-MEDIA_JOBS {
-text id PK
-text session_id
-text status
-text doc_paths
-text style_prompt
-text batch_config
-integer total_items
-integer completed_items
-integer failed_items
-text created_at
-text updated_at
-text completed_at
-}
-MEDIA_JOB_ITEMS {
-text id PK
-text job_id FK
-integer idx
-text prompt
-text aspect_ratio
-text image_size
-text model
-text tags
-text source_refs
-text status
-integer retry_count
-text result_media_generation_id
-text error
-text created_at
-text updated_at
-}
-MEDIA_CONTEXT_EVENTS {
-text id PK
-text session_id
-text job_id FK
-text payload
-text sync_mode
-text synced_at
-text created_at
-}
-MEDIA_GENERATIONS ||--o{ MEDIA_JOB_ITEMS : "referenced by"
-MEDIA_JOBS ||--o{ MEDIA_JOB_ITEMS : "contains"
-MEDIA_GENERATIONS ||--|| MEDIA_CONTEXT_EVENTS : "referenced by"
-```
-
-图表来源
-- [数据库与表结构 db.ts:152-229](file://src/lib/db.ts#L152-L229)
-
-章节来源
-- [数据库与表结构 db.ts:152-229](file://src/lib/db.ts#L152-L229)
-
-### 图像生成流程（端到端）
-```mermaid
-sequenceDiagram
-participant UI as "用户界面"
-participant GEN as "图像生成器"
-participant PROV as "提供商(上游)"
-participant FS as "本地文件系统"
-participant DB as "SQLite"
-UI->>GEN : "generateSingleImage(prompt, ...)"
-GEN->>GEN : "解析尺寸/比例"
-GEN->>PROV : "调用上游图像接口"
-PROV-->>GEN : "返回图像字节流"
-GEN->>FS : "写入媒体目录"
-GEN->>DB : "插入 media_generations 记录"
-DB-->>GEN : "返回生成 ID"
-GEN-->>UI : "返回生成结果"
-```
-
-图表来源
-- [图像生成器 image-generator.ts:271-451](file://src/lib/image-generator.ts#L271-L451)
-
-章节来源
-- [图像生成器 image-generator.ts:271-451](file://src/lib/image-generator.ts#L271-L451)
-
-### 标签系统（前端交互）
 ```mermaid
 flowchart TD
-Start(["进入画廊页面"]) --> FetchTags["获取标签列表 /api/media/tags"]
-FetchTags --> Render["渲染标签按钮"]
-Render --> Toggle{"点击标签？"}
-Toggle --> |是| AddOrRemove["添加/删除标签"]
-AddOrRemove --> UpdateUI["更新 UI 与筛选条件"]
-Toggle --> |否| ViewGallery["查看媒体画廊"]
-UpdateUI --> ViewGallery
-ViewGallery --> End(["完成"])
+Start(["进入 /media/generate"]) --> Parse["解析请求参数"]
+Parse --> Validate{"参数有效?"}
+Validate -- 否 --> Err422["返回 422 错误"]
+Validate -- 是 --> Compute["计算有效尺寸<br/>像素对齐/约束检查"]
+Compute --> Generate["调用图像生成器"]
+Generate --> Save{"skipSave?"}
+Save -- 是 --> ReturnRaw["返回原始数据"]
+Save -- 否 --> Persist["写入磁盘与数据库"]
+Persist --> Done["返回生成结果(JSON)"]
+Err422 --> End(["结束"])
+ReturnRaw --> End
+Done --> End
 ```
 
 图表来源
-- [标签管理器 TagManager.tsx:167-213](file://src/components/gallery/TagManager.tsx#L167-L213)
+- [src/app/api/media/generate/route.ts:1-70](file://src/app/api/media/generate/route.ts#L1-L70)
+- [src/lib/image-generator.ts:62-376](file://src/lib/image-generator.ts#L62-L376)
+- [src/__tests__/unit/openai-image-size.test.ts:1-32](file://src/__tests__/unit/openai-image-size.test.ts#L1-L32)
 
 章节来源
-- [标签管理器 TagManager.tsx:167-213](file://src/components/gallery/TagManager.tsx#L167-L213)
+- [src/app/api/media/generate/route.ts:1-70](file://src/app/api/media/generate/route.ts#L1-L70)
+- [src/lib/image-generator.ts:62-376](file://src/lib/image-generator.ts#L62-L376)
+- [src/__tests__/unit/openai-image-size.test.ts:1-32](file://src/__tests__/unit/openai-image-size.test.ts#L1-L32)
+
+### 相册管理 API
+- 列表查询
+  - 从数据库读取媒体记录，按类型与 MIME 推断构建响应
+  - 支持标签、收藏、会话关联等字段
+- 媒体类型与格式
+  - 自动根据扩展名推断 MIME（图片/视频/矢量等）
+- 分页与过滤
+  - 可结合标签、时间范围、类型进行筛选（依据数据库结构）
+
+```mermaid
+sequenceDiagram
+participant Client as "客户端"
+participant API as "GET /media/gallery"
+participant DB as "数据库"
+Client->>API : "请求相册列表"
+API->>DB : "查询媒体记录"
+DB-->>API : "返回多行记录"
+API->>API : "推断MIME/构建images数组"
+API-->>Client : "返回相册数据"
+```
+
+图表来源
+- [src/app/api/media/gallery/route.ts:1-44](file://src/app/api/media/gallery/route.ts#L1-L44)
+
+章节来源
+- [src/app/api/media/gallery/route.ts:1-44](file://src/app/api/media/gallery/route.ts#L1-L44)
+
+### 单条媒体操作 API
+- 查询
+  - 根据 ID 查询媒体记录，不存在则 404
+- 删除
+  - 先查记录再删除本地文件与数据库记录，失败时返回错误
+
+```mermaid
+sequenceDiagram
+participant Client as "客户端"
+participant API as "GET/DELETE /media/[id]"
+participant FS as "文件系统"
+participant DB as "数据库"
+Client->>API : "GET /media/[id]"
+API->>DB : "查询记录"
+DB-->>API : "返回记录"
+API-->>Client : "返回媒体详情"
+Client->>API : "DELETE /media/[id]"
+API->>DB : "查询记录(含路径)"
+DB-->>API : "返回记录"
+API->>FS : "删除本地文件"
+API->>DB : "删除数据库记录"
+API-->>Client : "成功/错误"
+```
+
+图表来源
+- [src/app/api/media/[id]/route.ts](file://src/app/api/media/[id]/route.ts#L1-L48)
+
+章节来源
+- [src/app/api/media/[id]/route.ts](file://src/app/api/media/[id]/route.ts#L1-L48)
+
+### 批量任务 API
+- 创建任务
+  - 接收 sessionId、docPaths、stylePrompt、batchConfig、items
+  - 校验至少一个条目，创建任务与任务项
+- 返回
+  - 任务对象与创建的条目集合
+
+```mermaid
+sequenceDiagram
+participant Client as "客户端"
+participant API as "POST /media/jobs"
+participant DB as "数据库"
+Client->>API : "提交批量任务(含items)"
+API->>API : "校验参数"
+API->>DB : "创建任务"
+API->>DB : "创建任务项"
+DB-->>API : "返回任务与条目"
+API-->>Client : "返回任务信息"
+```
+
+图表来源
+- [src/app/api/media/jobs/route.ts:45-73](file://src/app/api/media/jobs/route.ts#L45-L73)
+
+章节来源
+- [src/app/api/media/jobs/route.ts:45-73](file://src/app/api/media/jobs/route.ts#L45-L73)
+
+### 媒体服务 API
+- 功能
+  - 提供媒体文件访问（基于路径或 ID），内部读取数据库并返回文件内容
+- 使用场景
+  - 预览、下载、嵌入展示
+
+章节来源
+- [src/app/api/media/serve/route.ts](file://src/app/api/media/serve/route.ts)
+
+### 微信媒体导入与分享
+- 导入
+  - 通过 MCP 导入外部媒体，写入数据库并打上媒体标识
+- 下载与解密
+  - 从 CDN 基础地址拼接加密参数，下载并解密媒体
+- 上传与分享
+  - 生成 filekey、AES 密钥与加密后的文件大小，获取上传参数并上传，返回下载参数用于消息发送
+
+```mermaid
+sequenceDiagram
+participant WX as "微信桥接"
+participant CDN as "CDN"
+participant API as "Weixin API"
+participant FS as "本地文件"
+WX->>API : "获取上传URL(含参数)"
+API-->>WX : "返回upload_param"
+WX->>FS : "读取明文文件"
+WX->>CDN : "上传加密文件(AES-128-ECB)"
+CDN-->>WX : "返回downloadParam"
+WX-->>WX : "构造CDN URL并解密下载"
+WX-->>Client : "返回媒体数据/MIME/文件名"
+```
+
+图表来源
+- [src/lib/bridge/adapters/weixin/weixin-media.ts:122-156](file://src/lib/bridge/adapters/weixin/weixin-media.ts#L122-L156)
+- [资料/weixin-openclaw-package/package/src/cdn/upload.ts:1-110](file://资料/weixin-openclaw-package/package/src/cdn/upload.ts#L1-L110)
+
+章节来源
+- [src/lib/bridge/adapters/weixin/weixin-media.ts:122-156](file://src/lib/bridge/adapters/weixin/weixin-media.ts#L122-L156)
+- [资料/weixin-openclaw-package/package/src/cdn/upload.ts:1-110](file://资料/weixin-openclaw-package/package/src/cdn/upload.ts#L1-L110)
+
+### 媒体类型支持、尺寸限制与格式转换
+- 支持类型
+  - 图片：JPEG、PNG、WEBP、GIF、SVG、AVIF
+  - 视频：MP4、WEBM、MOV、AVI、MKV
+- 尺寸与像素对齐
+  - 宽高必须为 16 的倍数；最大边长与像素总量受平台限制
+- 格式转换
+  - 生成器根据目标 MIME 写入对应扩展名文件；测试用例验证约束
+
+章节来源
+- [src/app/api/media/gallery/route.ts:24-44](file://src/app/api/media/gallery/route.ts#L24-L44)
+- [src/lib/image-generator.ts:62-376](file://src/lib/image-generator.ts#L62-L376)
+- [src/__tests__/unit/openai-image-size.test.ts:1-32](file://src/__tests__/unit/openai-image-size.test.ts#L1-L32)
+
+### 存储、缓存与清理机制
+- 存储
+  - 生成器默认写入媒体目录；媒体保存器负责持久化
+- 缓存
+  - 通过数据库记录与本地路径实现快速检索；CDN 场景下利用加密参数与 AES 密钥进行安全访问
+- 清理
+  - 删除接口同时清理本地文件与数据库记录；批量任务完成后可根据策略清理临时资源
+
+章节来源
+- [src/lib/image-generator.ts:364-376](file://src/lib/image-generator.ts#L364-L376)
+- [src/app/api/media/[id]/route.ts](file://src/app/api/media/[id]/route.ts#L35-L48)
+- [src/lib/media-saver.ts](file://src/lib/media-saver.ts)
+
+### 上传、下载与分享规范
+- 上传
+  - 通过 CDN 工具链进行加密上传，返回 filekey、downloadParam 与 AES 密钥
+- 下载
+  - 拼接 CDN URL，使用 AES 密钥解密后返回
+- 分享
+  - 在消息中携带 downloadParam 与 AES 密钥，接收方可直接解密播放/查看
+
+章节来源
+- [资料/weixin-openclaw-package/package/src/cdn/upload.ts:1-110](file://资料/weixin-openclaw-package/package/src/cdn/upload.ts#L1-L110)
+- [src/lib/bridge/adapters/weixin/weixin-media.ts:122-156](file://src/lib/bridge/adapters/weixin/weixin-media.ts#L122-L156)
 
 ## 依赖关系分析
-- 组件耦合
-  - 图像生成器依赖媒体保存器与数据库
-  - 媒体导入 MCP 依赖媒体保存器
-  - 画廊与标签组件依赖数据库查询
-  - 任务调度器依赖数据库读写与通知模块
-- 外部依赖
-  - 上游图像提供商（Gemini/OpenAI）
-  - SQLite（better-sqlite3）
+- API 路由依赖数据库与业务逻辑模块
+- 图像生成器依赖媒体保存器与数据库
+- 微信桥接依赖 CDN 上传工具与 Weixin API
+- 单元测试覆盖尺寸约束、提供商路由校验与导入流程
 
 ```mermaid
 graph LR
-IMG["图像生成器"] --> SAV["媒体保存器"]
-IMP["媒体导入 MCP"] --> SAV
-SAV --> DB["SQLite"]
-GG["画廊组件"] --> DB
-TM["标签管理器"] --> DB
-SCH["任务调度器"] --> DB
+API_GEN["/media/generate"] --> IMGGEN["image-generator"]
+API_GALLERY["/media/gallery"] --> DB["db"]
+API_ITEM["/media/[id]"] --> DB
+API_JOBS["/media/jobs"] --> DB
+API_SERVE["/media/serve"] --> DB
+IMGGEN --> MEDIASAVE["media-saver"]
+IMGGEN --> DB
+WXMEDIA["weixin-media"] --> CDNUPLOAD["cdn/upload"]
+TEST_SIZE["openai-image-size.test"] --> IMGGEN
+TEST_PROVIDER["media-provider-routes.test"] --> API_PROVIDERS["providers/active-image"]
+TEST_IMPORT["codex-media-import.test"] --> IMPORTMCP["media-import-mcp"]
 ```
 
 图表来源
-- [图像生成器 image-generator.ts:271-451](file://src/lib/image-generator.ts#L271-L451)
-- [媒体导入 MCP media-import-mcp.ts:40-122](file://src/lib/media-import-mcp.ts#L40-L122)
-- [媒体保存器 media-saver.ts:94-161](file://src/lib/media-saver.ts#L94-L161)
-- [数据库与表结构 db.ts:152-229](file://src/lib/db.ts#L152-L229)
-- [画廊组件 GalleryGrid.tsx:25-35](file://src/components/gallery/GalleryGrid.tsx#L25-L35)
-- [标签管理器 TagManager.tsx:167-213](file://src/components/gallery/TagManager.tsx#L167-L213)
-- [任务调度器 task-scheduler.ts:57-131](file://src/lib/task-scheduler.ts#L57-L131)
+- [src/app/api/media/generate/route.ts:1-70](file://src/app/api/media/generate/route.ts#L1-L70)
+- [src/app/api/media/gallery/route.ts:1-44](file://src/app/api/media/gallery/route.ts#L1-L44)
+- [src/app/api/media/[id]/route.ts](file://src/app/api/media/[id]/route.ts#L1-L48)
+- [src/app/api/media/jobs/route.ts:45-73](file://src/app/api/media/jobs/route.ts#L45-L73)
+- [src/app/api/media/serve/route.ts](file://src/app/api/media/serve/route.ts)
+- [src/lib/image-generator.ts:62-376](file://src/lib/image-generator.ts#L62-L376)
+- [src/lib/media-saver.ts](file://src/lib/media-saver.ts)
+- [src/lib/db.ts](file://src/lib/db.ts)
+- [src/lib/bridge/adapters/weixin/weixin-media.ts:122-156](file://src/lib/bridge/adapters/weixin/weixin-media.ts#L122-L156)
+- [资料/weixin-openclaw-package/package/src/cdn/upload.ts:1-110](file://资料/weixin-openclaw-package/package/src/cdn/upload.ts#L1-L110)
+- [src/__tests__/unit/openai-image-size.test.ts:1-32](file://src/__tests__/unit/openai-image-size.test.ts#L1-L32)
+- [src/__tests__/unit/media-provider-routes.test.ts:30-65](file://src/__tests__/unit/media-provider-routes.test.ts#L30-L65)
+- [src/__tests__/unit/codex-media-import.test.ts:1-312](file://src/__tests__/unit/codex-media-import.test.ts#L1-L312)
+- [src/app/api/providers/active-image/route.ts](file://src/app/api/providers/active-image/route.ts)
 
 章节来源
-- [图像生成器 image-generator.ts:271-451](file://src/lib/image-generator.ts#L271-L451)
-- [媒体导入 MCP media-import-mcp.ts:40-122](file://src/lib/media-import-mcp.ts#L40-L122)
-- [媒体保存器 media-saver.ts:94-161](file://src/lib/media-saver.ts#L94-L161)
-- [数据库与表结构 db.ts:152-229](file://src/lib/db.ts#L152-L229)
-- [画廊组件 GalleryGrid.tsx:25-35](file://src/components/gallery/GalleryGrid.tsx#L25-L35)
-- [标签管理器 TagManager.tsx:167-213](file://src/components/gallery/TagManager.tsx#L167-L213)
-- [任务调度器 task-scheduler.ts:57-131](file://src/lib/task-scheduler.ts#L57-L131)
+- [src/app/api/media/generate/route.ts:1-70](file://src/app/api/media/generate/route.ts#L1-L70)
+- [src/lib/image-generator.ts:62-376](file://src/lib/image-generator.ts#L62-L376)
+- [src/lib/media-saver.ts](file://src/lib/media-saver.ts)
+- [src/lib/db.ts](file://src/lib/db.ts)
+- [src/lib/bridge/adapters/weixin/weixin-media.ts:122-156](file://src/lib/bridge/adapters/weixin/weixin-media.ts#L122-L156)
+- [资料/weixin-openclaw-package/package/src/cdn/upload.ts:1-110](file://资料/weixin-openclaw-package/package/src/cdn/upload.ts#L1-L110)
+- [src/__tests__/unit/openai-image-size.test.ts:1-32](file://src/__tests__/unit/openai-image-size.test.ts#L1-L32)
+- [src/__tests__/unit/media-provider-routes.test.ts:30-65](file://src/__tests__/unit/media-provider-routes.test.ts#L30-L65)
+- [src/__tests__/unit/codex-media-import.test.ts:1-312](file://src/__tests__/unit/codex-media-import.test.ts#L1-L312)
+- [src/app/api/providers/active-image/route.ts](file://src/app/api/providers/active-image/route.ts)
 
-## 性能考量
-- 图像生成
-  - 尺寸与比例约束：遵循上游 API 的像素预算与步长限制，避免无效重试
-  - 超时控制：默认超时 300 秒，必要时传入 AbortSignal
-  - 项目目录复制：仅在提供 sessionId 时复制到项目目录，减少 IO
-- 媒体导入
-  - 支持相对路径解析（基于 cwd），确保跨会话一致性
-  - 批量导入时建议合并元数据（prompt、model、resolution、aspectRatio、tags）
-- 画廊渲染
-  - 使用懒加载与预加载 metadata，优先视频封面占位
-- 标签管理
-  - 预设颜色与紧凑样式，提升交互效率
-- 任务调度
-  - 10 秒轮询间隔，指数退避（30s → 1m → 5m → 15m），最多连续失败 10 次自动禁用
-  - 一次性任务错过执行时的恢复机制
+## 性能考虑
+- 并发控制
+  - 生成器内置最大重试次数与超时控制，避免长时间阻塞
+  - 批量任务采用分批创建与异步处理，降低峰值压力
+- I/O 优化
+  - skipSave 模式减少磁盘写入，适合流式传输与中间态处理
+  - CDN 加密上传减少明文传输风险，提高吞吐
+- 缓存策略
+  - 数据库索引与路径直读提升查询效率；CDN 参数复用减少重复计算
+- 资源清理
+  - 及时删除临时文件与无效记录，防止磁盘膨胀
 
-[本节为通用指导，无需特定文件引用]
+章节来源
+- [src/lib/image-generator.ts:342-348](file://src/lib/image-generator.ts#L342-L348)
+- [src/app/api/media/jobs/route.ts:45-73](file://src/app/api/media/jobs/route.ts#L45-L73)
+- [资料/weixin-openclaw-package/package/src/cdn/upload.ts:1-110](file://资料/weixin-openclaw-package/package/src/cdn/upload.ts#L1-L110)
 
 ## 故障排查指南
-- 无图像提供商配置
-  - 现象：抛出“未配置图像提供商”错误
-  - 排查：在设置中添加 Gemini Image 或 OpenAI Image 提供商
-  - 参考路径
-    - [提供商选择逻辑:217-265](file://src/lib/image-generator.ts#L217-L265)
-
-- 导入文件不存在
-  - 现象：抛出“文件不存在”错误
-  - 排查：确认 filePath 是否存在；相对路径需结合 cwd
-  - 参考路径
-    - [导入文件校验:134-136](file://src/lib/media-saver.ts#L134-L136)
-
-- 任务执行失败
-  - 现象：任务状态变为 error，记录 last_error，应用指数退避
-  - 排查：检查凭据、网络与上游服务可用性；必要时手动启用任务
-  - 参考路径
-    - [任务执行与回退:145-293](file://src/lib/task-scheduler.ts#L145-L293)
-
-- 画廊无法显示媒体
-  - 现象：缩略图空白或视频不播放
-  - 排查：确认 /api/media/serve 的 path 参数正确；检查 MIME 类型与本地路径
-  - 参考路径
-    - [缩略图 URL 生成:25-35](file://src/components/gallery/GalleryGrid.tsx#L25-L35)
+- 生成失败
+  - 无生成物：检查提示词是否合理，更换提示词后重试
+  - 通用异常：查看日志定位具体错误并修正参数
+- 相册为空
+  - 确认数据库中是否存在媒体记录；检查 MIME 推断与扩展名
+- 删除失败
+  - 确认记录存在且本地文件路径正确；检查权限与磁盘空间
+- 批量任务异常
+  - 校验 items 是否为空；确认 sessionId、stylePrompt、batchConfig 合法
+- 微信分享问题
+  - 确认 downloadParam 与 AES 密钥匹配；检查 CDN URL 与网络连通性
 
 章节来源
-- [图像生成器 image-generator.ts:217-265](file://src/lib/image-generator.ts#L217-L265)
-- [媒体保存器 media-saver.ts:134-136](file://src/lib/media-saver.ts#L134-L136)
-- [任务调度器 task-scheduler.ts:145-293](file://src/lib/task-scheduler.ts#L145-L293)
-- [画廊组件 GalleryGrid.tsx:25-35](file://src/components/gallery/GalleryGrid.tsx#L25-L35)
+- [src/app/api/media/generate/route.ts:54-70](file://src/app/api/media/generate/route.ts#L54-L70)
+- [src/app/api/media/gallery/route.ts:24-44](file://src/app/api/media/gallery/route.ts#L24-L44)
+- [src/app/api/media/[id]/route.ts](file://src/app/api/media/[id]/route.ts#L35-L48)
+- [src/app/api/media/jobs/route.ts:45-73](file://src/app/api/media/jobs/route.ts#L45-L73)
+- [src/lib/bridge/adapters/weixin/weixin-media.ts:122-156](file://src/lib/bridge/adapters/weixin/weixin-media.ts#L122-L156)
 
 ## 结论
-本文档提供了 CodePilot 媒体 API 的端到端规范与实现要点，涵盖生成、导入、浏览、标签与调度等核心能力。建议在生产环境中：
-- 优先使用 MCP 工具导入媒体，避免直接 HTTP 调用
-- 合理设置图像尺寸与比例，遵守上游 API 限制
-- 利用标签与筛选优化画廊体验
-- 通过任务调度器自动化重复性媒体任务，并关注失败回退策略
-
-[本节为总结，无需特定文件引用]
+该媒体 API 体系以清晰的路由分层与职责划分，结合严格的尺寸与格式约束、完善的存储与清理机制、以及微信生态下的加解密与分享能力，实现了从生成、入库、查询到分享的全链路闭环。建议在生产环境中配合并发控制与缓存策略，持续监控生成耗时与磁盘占用，确保稳定与高性能。
 
 ## 附录
-- 认证要求
-  - 当前仓库未发现全局认证中间件；若部署于受保护环境，请在网关或反向代理层统一鉴权
-- 最佳实践
-  - 生成与导入均写入本地媒体目录并记录数据库，便于后续检索与复用
-  - 批量任务应明确通知策略与会话绑定，确保结果可追溯
-  - 画廊缩略图优先使用 /api/media/serve，避免直接暴露文件系统路径
 
-[本节为通用指导，无需特定文件引用]
+### API 规范摘要
+- 图片生成
+  - 方法：POST
+  - 路径：/api/media/generate
+  - 请求体：sessionId（必填），imageSize（可选），stylePrompt（可选），batchConfig（可选），items（可选）
+  - 响应：生成 ID、模型族、耗时、图片数组（含 MIME 与本地路径）
+- 相册列表
+  - 方法：GET
+  - 路径：/api/media/gallery
+  - 响应：媒体记录数组（含类型、MIME、标签、收藏、会话等）
+- 单条媒体
+  - 方法：GET/DELETE
+  - 路径：/api/media/[id]
+  - 响应：GET 返回媒体详情；DELETE 成功或错误
+- 批量任务
+  - 方法：POST
+  - 路径：/api/media/jobs
+  - 请求体：sessionId、docPaths、stylePrompt、batchConfig、items（至少一项）
+  - 响应：任务对象与创建的条目集合
+- 媒体服务
+  - 方法：GET
+  - 路径：/api/media/serve
+  - 响应：媒体文件内容（基于路径或 ID）
+
+章节来源
+- [src/app/api/media/generate/route.ts:1-70](file://src/app/api/media/generate/route.ts#L1-L70)
+- [src/app/api/media/gallery/route.ts:1-44](file://src/app/api/media/gallery/route.ts#L1-L44)
+- [src/app/api/media/[id]/route.ts](file://src/app/api/media/[id]/route.ts#L1-L48)
+- [src/app/api/media/jobs/route.ts:45-73](file://src/app/api/media/jobs/route.ts#L45-L73)
+- [src/app/api/media/serve/route.ts](file://src/app/api/media/serve/route.ts)

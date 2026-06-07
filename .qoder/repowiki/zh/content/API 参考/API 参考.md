@@ -2,23 +2,20 @@
 
 <cite>
 **本文引用的文件**
-- [src/app/api/chat/route.ts](file://src/app/api/chat/route.ts)
+- [apps/site/src/app/api/search/route.ts](file://apps/site/src/app/api/search/route.ts)
 - [src/app/api/chat/messages/route.ts](file://src/app/api/chat/messages/route.ts)
-- [src/app/api/chat/sessions/[id]/route.ts](file://src/app/api/chat/sessions/[id]/route.ts)
-- [src/app/api/chat/interrupt/route.ts](file://src/app/api/chat/interrupt/route.ts)
-- [src/app/api/bridge/route.ts](file://src/app/api/bridge/route.ts)
-- [src/app/api/providers/route.ts](file://src/app/api/providers/route.ts)
-- [src/app/api/providers/[id]/route.ts](file://src/app/api/providers/[id]/route.ts)
-- [src/app/api/skills/route.ts](file://src/app/api/skills/route.ts)
-- [src/app/api/skills/[name]/route.ts](file://src/app/api/skills/[name]/route.ts)
-- [src/app/api/plugins/route.ts](file://src/app/api/plugins/route.ts)
-- [src/app/api/plugins/[id]/route.ts](file://src/app/api/plugins/[id]/route.ts)
-- [src/app/api/files/route.ts](file://src/app/api/files/route.ts)
-- [src/app/api/health/route.ts](file://src/app/api/health/route.ts)
-- [src/app/api/settings/route.ts](file://src/app/api/settings/route.ts)
-- [src/app/api/claude-auth/route.ts](file://src/app/api/claude-auth/route.ts)
-- [src/app/api/claude-sessions/route.ts](file://src/app/api/claude-sessions/route.ts)
-- [src/app/api/claude-status/route.ts](file://src/app/api/claude-status/route.ts)
+- [src/app/api/files/open/route.ts](file://src/app/api/files/open/route.ts)
+- [src/app/api/files/html-preview/[...segments]/route.ts](file://src/app/api/files/html-preview/[...segments]/route.ts)
+- [src/app/api/uploads/route.ts](file://src/app/api/uploads/route.ts)
+- [src/lib/html-preview-url.ts](file://src/lib/html-preview-url.ts)
+- [src/lib/files.ts](file://src/lib/files.ts)
+- [src/lib/channels/types.ts](file://src/lib/channels/types.ts)
+- [src/lib/channels/feishu/index.ts](file://src/lib/channels/feishu/index.ts)
+- [src/lib/bridge/adapters/weixin/weixin-media.ts](file://src/lib/bridge/adapters/weixin/weixin-media.ts)
+- [资料/weixin-openclaw-package/package/src/cdn/upload.ts](file://资料/weixin-openclaw-package/package/src/cdn/upload.ts)
+- [apps/site/src/middleware.ts](file://apps/site/src/middleware.ts)
+- [src/__tests__/unit/codex-phase-6-wiring.test.ts](file://src/__tests__/unit/codex-phase-6-wiring.test.ts)
+- [src/__tests__/unit/codex-proxy-error-visibility.test.ts](file://src/__tests__/unit/codex-proxy-error-visibility.test.ts)
 </cite>
 
 ## 目录
@@ -28,556 +25,294 @@
 4. [架构总览](#架构总览)
 5. [详细组件分析](#详细组件分析)
 6. [依赖关系分析](#依赖关系分析)
-7. [性能与并发特性](#性能与并发特性)
-8. [认证与安全](#认证与安全)
-9. [错误处理与状态码](#错误处理与状态码)
-10. [速率限制](#速率限制)
-11. [请求/响应示例与客户端实现指南](#请求响应示例与客户端实现指南)
-12. [故障排查](#故障排查)
-13. [结论](#结论)
+7. [性能考量](#性能考量)
+8. [故障排查指南](#故障排查指南)
+9. [结论](#结论)
+10. [附录](#附录)
 
 ## 简介
-本文件为 CodePilot 后端 API 的完整参考文档，覆盖聊天消息、桥接控制、供应商管理、媒体与文件扫描、技能与插件管理、健康检查、设置与 Claude 状态等接口。文档以 RESTful 风格描述各端点的 HTTP 方法、URL 模式、请求/响应结构，并提供错误处理策略、性能与并发特性说明，以及客户端实现建议。
+本文件为 CodePilot 的完整 API 参考文档，覆盖聊天、文件、媒体等核心能力的 REST 接口规范。文档从系统架构、端点定义、数据模型、错误处理、安全与性能等方面进行系统化梳理，并提供调用序列与时序图示，帮助开发者快速集成与扩展。
 
 ## 项目结构
-API 基于 Next.js App Router，路由位于 src/app/api 下，按功能域划分目录（如 chat、bridge、providers、skills、plugins、files、settings、health、claude-*）。每个路由文件导出一个或多个 HTTP 处理函数（GET/POST/PUT/PATCH/DELETE），并返回标准的 Response 或 NextResponse。
+CodePilot 的 API 主要位于应用层路由中，采用 Next.js App Router 风格的约定式路由组织方式。站点侧的搜索 API 位于站点应用，而核心业务 API（聊天、文件、上传、预览）位于主应用。
 
 ```mermaid
 graph TB
-subgraph "聊天相关"
-CHAT["/api/chat<br/>POST 发送消息"]
-MSG["/api/chat/messages<br/>POST/PUT 消息持久化"]
-SES["/api/chat/sessions/[id]<br/>GET/PATCH/DELETE 会话"]
-INT["/api/chat/interrupt<br/>POST 中断会话"]
+subgraph "站点应用"
+S_API_Search["/api/search<br/>站点搜索"]
 end
-subgraph "桥接控制"
-BR["/api/bridge<br/>GET/POST 桥接状态与启停"]
+subgraph "主应用"
+A_Chat_Messages["/api/chat/messages<br/>消息持久化"]
+A_Files_Open["/api/files/open<br/>打开本地路径"]
+A_Files_HtmlPreview["/api/files/html-preview/[...segments]<br/>HTML 预览"]
+A_Uploads["/api/uploads<br/>静态资源下载"]
 end
-subgraph "供应商与模型"
-PR_ALL["/api/providers<br/>GET/POST 供应商列表与新增"]
-PR_ID["/api/providers/[id]<br/>GET/PUT/DELETE 单个供应商"]
-end
-subgraph "技能与插件"
-SK_R["/api/skills<br/>GET/POST 技能清单与创建"]
-SK_N["/api/skills/[name]<br/>GET/PUT/DELETE 技能读取/更新/删除"]
-PL_R["/api/plugins<br/>GET 插件清单"]
-PL_ID["/api/plugins/[id]<br/>GET/PUT 插件启用/禁用"]
-end
-subgraph "文件与媒体"
-FS["/api/files<br/>GET 扫描目录树"]
-end
-subgraph "系统与状态"
-HL["/api/health<br/>GET 健康检查"]
-ST["/api/settings<br/>GET/PUT 用户设置"]
-CA["/api/claude-auth<br/>GET Claude 登录状态"]
-CS["/api/claude-sessions<br/>GET 列表"]
-CT["/api/claude-status<br/>GET CLI 状态与特性"]
-end
-CHAT --> MSG
-CHAT --> SES
-CHAT --> INT
-SK_R --> SK_N
-PL_R --> PL_ID
+S_API_Search --> |"查询"| A_Chat_Messages
+A_Chat_Messages --> |"写入/更新"| DB["数据库"]
+A_Files_Open --> OS["操作系统命令执行"]
+A_Files_HtmlPreview --> FS["文件系统读取"]
+A_Uploads --> FS
 ```
 
 图表来源
-- [src/app/api/chat/route.ts:27-630](file://src/app/api/chat/route.ts#L27-L630)
-- [src/app/api/chat/messages/route.ts:11-98](file://src/app/api/chat/messages/route.ts#L11-L98)
-- [src/app/api/chat/sessions/[id]/route.ts](file://src/app/api/chat/sessions/[id]/route.ts#L5-L117)
-- [src/app/api/chat/interrupt/route.ts:13-44](file://src/app/api/chat/interrupt/route.ts#L13-L44)
-- [src/app/api/bridge/route.ts:14-56](file://src/app/api/bridge/route.ts#L14-L56)
-- [src/app/api/providers/route.ts:38-143](file://src/app/api/providers/route.ts#L38-L143)
-- [src/app/api/providers/[id]/route.ts](file://src/app/api/providers/[id]/route.ts#L18-L177)
-- [src/app/api/skills/route.ts:290-421](file://src/app/api/skills/route.ts#L290-L421)
-- [src/app/api/skills/[name]/route.ts](file://src/app/api/skills/[name]/route.ts#L239-L411)
-- [src/app/api/plugins/route.ts:5-17](file://src/app/api/plugins/route.ts#L5-L17)
-- [src/app/api/plugins/[id]/route.ts](file://src/app/api/plugins/[id]/route.ts#L23-L101)
-- [src/app/api/files/route.ts:7-63](file://src/app/api/files/route.ts#L7-L63)
-- [src/app/api/health/route.ts:3-5](file://src/app/api/health/route.ts#L3-L5)
-- [src/app/api/settings/route.ts:28-60](file://src/app/api/settings/route.ts#L28-L60)
-- [src/app/api/claude-auth/route.ts:12-38](file://src/app/api/claude-auth/route.ts#L12-L38)
-- [src/app/api/claude-sessions/route.ts:3-12](file://src/app/api/claude-sessions/route.ts#L3-L12)
-- [src/app/api/claude-status/route.ts:68-149](file://src/app/api/claude-status/route.ts#L68-L149)
+- [apps/site/src/app/api/search/route.ts](file://apps/site/src/app/api/search/route.ts)
+- [src/app/api/chat/messages/route.ts](file://src/app/api/chat/messages/route.ts)
+- [src/app/api/files/open/route.ts](file://src/app/api/files/open/route.ts)
+- [src/app/api/files/html-preview/[...segments]/route.ts](file://src/app/api/files/html-preview/[...segments]/route.ts)
+- [src/app/api/uploads/route.ts](file://src/app/api/uploads/route.ts)
 
 章节来源
-- [src/app/api/chat/route.ts:1-1060](file://src/app/api/chat/route.ts#L1-L1060)
-- [src/app/api/bridge/route.ts:1-57](file://src/app/api/bridge/route.ts#L1-L57)
-- [src/app/api/providers/route.ts:1-144](file://src/app/api/providers/route.ts#L1-L144)
-- [src/app/api/providers/[id]/route.ts](file://src/app/api/providers/[id]/route.ts#L1-L178)
-- [src/app/api/skills/route.ts:1-491](file://src/app/api/skills/route.ts#L1-L491)
-- [src/app/api/skills/[name]/route.ts](file://src/app/api/skills/[name]/route.ts#L1-L412)
-- [src/app/api/plugins/route.ts:1-18](file://src/app/api/plugins/route.ts#L1-L18)
-- [src/app/api/plugins/[id]/route.ts](file://src/app/api/plugins/[id]/route.ts#L1-L102)
-- [src/app/api/files/route.ts:1-64](file://src/app/api/files/route.ts#L1-L64)
-- [src/app/api/health/route.ts:1-6](file://src/app/api/health/route.ts#L1-L6)
-- [src/app/api/settings/route.ts:1-61](file://src/app/api/settings/route.ts#L1-L61)
-- [src/app/api/claude-auth/route.ts:1-39](file://src/app/api/claude-auth/route.ts#L1-L39)
-- [src/app/api/claude-sessions/route.ts:1-13](file://src/app/api/claude-sessions/route.ts#L1-L13)
-- [src/app/api/claude-status/route.ts:1-150](file://src/app/api/claude-status/route.ts#L1-L150)
+- [apps/site/src/app/api/search/route.ts](file://apps/site/src/app/api/search/route.ts)
+- [apps/site/src/middleware.ts](file://apps/site/src/middleware.ts)
 
 ## 核心组件
-- 聊天引擎：负责接收用户消息、组装上下文、调用上游模型、流式输出、保存消息与媒体、处理权限与工具调用。
-- 会话管理：提供会话查询、更新（工作目录、标题、模式、模型、提供商、权限配置、清空消息）与删除。
-- 桥接控制：统一查询桥接状态与启动/停止/自动启动桥接服务。
-- 供应商管理：提供供应商列表、创建、更新（含协议与基础地址校验）、删除；支持默认供应商与图片生成供应商联动。
-- 技能与插件：技能清单与 CRUD（含冲突检测与来源优先级），插件清单与启用/禁用（含市场来源解析）。
-- 文件与媒体：目录扫描（带路径安全与深度限制）、媒体块落盘与本地路径替换。
-- 系统与状态：健康检查、用户设置读写、Claude 登录状态与 CLI 安装状态、会话列表。
+- 聊天消息 API：用于在不触发模型推理的前提下持久化消息，支持新增与更新两种操作。
+- 文件 API：提供打开本地路径与 HTML 预览两类能力；上传路由提供静态资源下载。
+- 媒体与桥接：通过微信/飞书等渠道适配器实现媒体上传与发送，涉及 CDN 加密上传与引用参数生成。
+- 站点搜索 API：面向站点内容的搜索入口。
 
 章节来源
-- [src/app/api/chat/route.ts:27-630](file://src/app/api/chat/route.ts#L27-L630)
-- [src/app/api/chat/sessions/[id]/route.ts](file://src/app/api/chat/sessions/[id]/route.ts#L5-L117)
-- [src/app/api/bridge/route.ts:14-56](file://src/app/api/bridge/route.ts#L14-L56)
-- [src/app/api/providers/route.ts:38-143](file://src/app/api/providers/route.ts#L38-L143)
-- [src/app/api/providers/[id]/route.ts](file://src/app/api/providers/[id]/route.ts#L18-L177)
-- [src/app/api/skills/route.ts:290-421](file://src/app/api/skills/route.ts#L290-L421)
-- [src/app/api/skills/[name]/route.ts](file://src/app/api/skills/[name]/route.ts#L239-L411)
-- [src/app/api/plugins/route.ts:5-17](file://src/app/api/plugins/route.ts#L5-L17)
-- [src/app/api/plugins/[id]/route.ts](file://src/app/api/plugins/[id]/route.ts#L23-L101)
-- [src/app/api/files/route.ts:7-63](file://src/app/api/files/route.ts#L7-L63)
-- [src/app/api/health/route.ts:3-5](file://src/app/api/health/route.ts#L3-L5)
-- [src/app/api/settings/route.ts:28-60](file://src/app/api/settings/route.ts#L28-L60)
-- [src/app/api/claude-auth/route.ts:12-38](file://src/app/api/claude-auth/route.ts#L12-L38)
-- [src/app/api/claude-sessions/route.ts:3-12](file://src/app/api/claude-sessions/route.ts#L3-L12)
-- [src/app/api/claude-status/route.ts:68-149](file://src/app/api/claude-status/route.ts#L68-L149)
+- [src/app/api/chat/messages/route.ts](file://src/app/api/chat/messages/route.ts)
+- [src/app/api/files/open/route.ts](file://src/app/api/files/open/route.ts)
+- [src/app/api/files/html-preview/[...segments]/route.ts](file://src/app/api/files/html-preview/[...segments]/route.ts)
+- [src/app/api/uploads/route.ts](file://src/app/api/uploads/route.ts)
+- [src/lib/bridge/adapters/weixin/weixin-media.ts](file://src/lib/bridge/adapters/weixin/weixin-media.ts)
+- [src/lib/channels/types.ts](file://src/lib/channels/types.ts)
+- [src/lib/channels/feishu/index.ts](file://src/lib/channels/feishu/index.ts)
 
 ## 架构总览
-下图展示从客户端到聊天引擎、数据库、供应商解析、MCP 服务器与 Claude SDK/原生运行时的整体交互。
+下图展示 API 层与外部系统的交互关系，包括数据库、文件系统、操作系统命令、CDN 上传与渠道网关。
+
+```mermaid
+graph TB
+Client["客户端"] --> API["API 路由层"]
+API --> ChatMsg["聊天消息持久化"]
+API --> FilesOpen["打开本地路径"]
+API --> HtmlPreview["HTML 预览"]
+API --> Uploads["静态资源下载"]
+ChatMsg --> DB["数据库"]
+FilesOpen --> OS["操作系统命令"]
+HtmlPreview --> FS["文件系统"]
+Uploads --> FS
+subgraph "渠道与媒体"
+ChannelTypes["渠道类型接口"]
+Feishu["飞书适配器"]
+WeixinMedia["微信媒体上传"]
+CDNUpload["CDN 加密上传"]
+end
+API --> ChannelTypes
+ChannelTypes --> Feishu
+Feishu --> WeixinMedia
+WeixinMedia --> CDNUpload
+```
+
+图表来源
+- [src/app/api/chat/messages/route.ts](file://src/app/api/chat/messages/route.ts)
+- [src/app/api/files/open/route.ts](file://src/app/api/files/open/route.ts)
+- [src/app/api/files/html-preview/[...segments]/route.ts](file://src/app/api/files/html-preview/[...segments]/route.ts)
+- [src/app/api/uploads/route.ts](file://src/app/api/uploads/route.ts)
+- [src/lib/channels/types.ts](file://src/lib/channels/types.ts)
+- [src/lib/channels/feishu/index.ts](file://src/lib/channels/feishu/index.ts)
+- [src/lib/bridge/adapters/weixin/weixin-media.ts](file://src/lib/bridge/adapters/weixin/weixin-media.ts)
+
+## 详细组件分析
+
+### 聊天消息 API
+- 功能：在不触发模型推理的情况下，向会话中写入用户或助手消息；支持后续替换生成结果。
+- 支持方法与路径
+  - POST /api/chat/messages：新增消息
+  - PUT /api/chat/messages：更新消息内容
+- 请求与响应要点
+  - 新增消息：需要会话标识、角色（用户/助手）、内容；可选 token 使用量；返回新消息对象
+  - 更新消息：优先按消息 ID 更新；若无匹配则按会话+提示块或提示文本回溯更新；返回受影响行数与最终消息 ID
+- 错误处理
+  - 参数缺失返回 400
+  - 会话不存在返回 404
+  - 其他异常返回 500
+- 使用场景
+  - 图像生成模式：先写入“请求”消息，生成完成后以结果替换
+  - 多轮对话中插入/修正中间产物
+
+```mermaid
+sequenceDiagram
+participant C as "客户端"
+participant R as "路由"
+participant DB as "数据库"
+rect rgb(255,255,255)
+Note over C,R : 新增消息
+C->>R : POST /api/chat/messages
+R->>DB : 写入消息
+DB-->>R : 返回消息
+R-->>C : { message }
+end
+rect rgb(255,255,255)
+Note over C,R : 更新消息
+C->>R : PUT /api/chat/messages
+alt 按消息ID更新
+R->>DB : updateMessageContent(...)
+DB-->>R : 变更行数
+else 回退：按会话+提示块/提示文本
+R->>DB : updateMessageBySessionAndHint(...)
+DB-->>R : 变更行数与消息ID
+end
+R-->>C : { updatedMessageId, changes }
+end
+```
+
+图表来源
+- [src/app/api/chat/messages/route.ts](file://src/app/api/chat/messages/route.ts)
+
+章节来源
+- [src/app/api/chat/messages/route.ts](file://src/app/api/chat/messages/route.ts)
+
+### 文件 API
+- 打开本地路径
+  - 方法与路径：POST /api/files/open
+  - 行为：根据操作系统平台执行打开命令（macOS 使用 open，Windows 使用 explorer，Linux 使用 xdg-open）
+  - 请求体字段：path（字符串，必填）
+  - 成功返回：{ ok: true }
+  - 错误返回：400（缺少路径）、500（执行失败）
+- HTML 预览
+  - 方法与路径：GET /api/files/html-preview/[...segments]
+  - 行为：解析路径段，校验真实路径在基座目录内，读取文件并按扩展名映射 MIME 类型返回
+  - 安全性：强制动态运行时与路径白名单校验，防止越权访问
+  - 响应头：包含 Content-Type 与缓存控制
+- 静态资源下载
+  - 方法与路径：GET /api/uploads
+  - 行为：解析文件路径，校验存在性，读取文件并按扩展名映射 MIME 类型返回
+  - 响应头：设置缓存策略
+
+```mermaid
+flowchart TD
+Start(["进入 /api/files/open"]) --> ReadBody["读取请求体中的 path"]
+ReadBody --> Validate{"path 存在且为字符串？"}
+Validate -- 否 --> Err400["返回 400 错误"]
+Validate -- 是 --> DetectOS["检测操作系统平台"]
+DetectOS --> ExecCmd["执行对应打开命令"]
+ExecCmd --> ExecOK{"执行是否成功？"}
+ExecOK -- 否 --> Err500["返回 500 错误"]
+ExecOK -- 是 --> Ok["返回 { ok: true }"]
+```
+
+图表来源
+- [src/app/api/files/open/route.ts](file://src/app/api/files/open/route.ts)
+
+章节来源
+- [src/app/api/files/open/route.ts](file://src/app/api/files/open/route.ts)
+- [src/app/api/files/html-preview/[...segments]/route.ts](file://src/app/api/files/html-preview/[...segments]/route.ts)
+- [src/app/api/uploads/route.ts](file://src/app/api/uploads/route.ts)
+- [src/lib/html-preview-url.ts](file://src/lib/html-preview-url.ts)
+- [src/lib/files.ts](file://src/lib/files.ts)
+
+### 媒体与桥接 API
+- 微信媒体上传（CDN 加密上传）
+  - 步骤：计算明文 MD5、生成 AES 密钥、计算密文字节长度、获取预签名上传 URL、加密并上传、返回加密下载参数与密钥
+  - 返回字段：encryptQueryParam、aesKeyBase64、cipherSize
+- 飞书渠道适配器
+  - 角色：实现渠道类型接口，提供授权校验、消息开始/结束回调、卡片流控制器等
+  - 授权：isAuthorized(userId, chatId) 基于配置判断
+  - 生命周期：onMessageStart/onMessageEnd 用于反馈处理状态
+- 站点搜索 API
+  - 路由：/api/search
+  - 作用：为站点内容提供搜索入口（具体实现由该路由文件定义）
 
 ```mermaid
 sequenceDiagram
 participant Client as "客户端"
-participant Chat as "/api/chat"
-participant DB as "数据库"
-participant Resolver as "供应商解析器"
-participant MCP as "MCP 服务器"
-participant Claude as "Claude SDK/原生"
-Client->>Chat : POST /api/chat (消息体含 session_id, content, 模型/权限/文件等)
-Chat->>DB : 获取会话/加锁/持久化用户消息
-Chat->>Resolver : 解析有效提供商与模型
-Chat->>MCP : 加载运行时所需 MCP 服务器
-Chat->>Claude : 流式生成响应SSE
-Claude-->>Chat : SSE 事件文本/工具/状态/结果/错误
-Chat->>DB : 收集流并保存助手消息含媒体落盘
-Chat-->>Client : 返回 SSE 流
+participant WX as "微信媒体上传"
+participant CDN as "CDN 上传"
+Client->>WX : 上传媒体数据
+WX->>WX : 计算明文MD5/AES密钥/密文字节长度
+WX->>CDN : 获取预签名上传URL
+CDN-->>WX : 返回 upload_param
+WX->>CDN : 加密并PUT上传
+CDN-->>WX : 上传成功
+WX-->>Client : 返回 { encryptQueryParam, aesKeyBase64, cipherSize }
 ```
 
 图表来源
-- [src/app/api/chat/route.ts:27-630](file://src/app/api/chat/route.ts#L27-L630)
-
-## 详细组件分析
-
-### 聊天消息发送（/api/chat）
-- 方法与路径
-  - POST /api/chat
-- 请求体字段
-  - 必填：session_id, content
-  - 可选：model, mode, files[], toolTimeout, provider_id, systemPromptAppend, autoTrigger, thinking, effort, enableFileCheckpointing, displayOverride, context_1m
-- 行为要点
-  - 校验提供者存在性与会话存在性
-  - 会话独占锁，防止并发请求
-  - 支持 /compact 命令的即时压缩
-  - 组装系统提示、历史与摘要，估计上下文占用，必要时自动压缩
-  - 选择 SDK 会话 ID 或全新会话，避免旧历史残留
-  - 流式输出，同时后台收集并保存助手消息，媒体落盘后替换为本地路径
-  - 支持中断（/api/chat/interrupt）
-- 响应
-  - 成功：text/event-stream（SSE）
-  - 错误：JSON { error, code? }
-- 典型状态码
-  - 400 缺少参数
-  - 404 会话不存在
-  - 409 会话忙
-  - 412 需要配置提供者
-  - 500 内部错误
+- [src/lib/bridge/adapters/weixin/weixin-media.ts](file://src/lib/bridge/adapters/weixin/weixin-media.ts)
+- [资料/weixin-openclaw-package/package/src/cdn/upload.ts](file://资料/weixin-openclaw-package/package/src/cdn/upload.ts)
 
 章节来源
-- [src/app/api/chat/route.ts:27-630](file://src/app/api/chat/route.ts#L27-L630)
-
-### 消息持久化（/api/chat/messages）
-- 方法与路径
-  - POST /api/chat/messages：仅持久化消息，不触发模型
-  - PUT /api/chat/messages：更新消息内容（支持 message_id 或 session+hint 回退）
-- 请求体字段
-  - POST：session_id, role, content, token_usage?
-  - PUT：message_id 或 session_id + prompt_hint 或 raw_request_block + content
-- 响应
-  - 成功：JSON { message | ok, updated_message_id, fallback_used }
-  - 错误：JSON { error }
-
-章节来源
-- [src/app/api/chat/messages/route.ts:11-98](file://src/app/api/chat/messages/route.ts#L11-L98)
-
-### 会话管理（/api/chat/sessions/[id]）
-- 方法与路径
-  - GET /api/chat/sessions/[id]：获取会话详情
-  - PATCH /api/chat/sessions/[id]：更新会话属性（工作目录、标题、模式、模型、提供商、权限、清空消息）
-  - DELETE /api/chat/sessions/[id]：删除会话
-- 行为要点
-  - 更改模型/提供商时若未显式传入 sdk_session_id，则清除旧 SDK 会话 ID，避免后续恢复失败
-  - 切换至 full_access 时自动批准该会话的待定桥接权限
-- 响应
-  - 成功：JSON { session | success }
-  - 错误：JSON { error }
-
-章节来源
-- [src/app/api/chat/sessions/[id]/route.ts](file://src/app/api/chat/sessions/[id]/route.ts#L5-L117)
-
-### 会话中断（/api/chat/interrupt）
-- 方法与路径
-  - POST /api/chat/interrupt
-- 请求体字段
-  - sessionId：必填
-- 行为要点
-  - 尝试原生运行时中断（AbortController）与 SDK 运行时中断（conversation.interrupt）
-- 响应
-  - 成功：JSON { interrupted: true }
-  - 错误：JSON { interrupted: false, error }
-
-章节来源
-- [src/app/api/chat/interrupt/route.ts:13-44](file://src/app/api/chat/interrupt/route.ts#L13-L44)
-
-### 桥接控制（/api/bridge）
-- 方法与路径
-  - GET /api/bridge：查询桥接状态（无副作用）
-  - POST /api/bridge：{ action: 'start' | 'stop' | 'auto-start' }
-- 响应
-  - 成功：JSON { ok?, reason?, status }
-  - 错误：JSON { error }
-
-章节来源
-- [src/app/api/bridge/route.ts:14-56](file://src/app/api/bridge/route.ts#L14-L56)
-
-### 供应商管理（/api/providers 与 /api/providers/[id]）
-- 列表与新增（/api/providers）
-  - GET：返回 providers、env_detected、default_provider_id
-  - POST：创建供应商，进行协议与基础地址校验
-- 更新与删除（/api/providers/[id]）
-  - GET：获取单个供应商（密钥掩码）
-  - PUT：更新供应商，协议与基础地址校验，媒体类型供应商必须提供基础地址
-  - DELETE：删除供应商，清理默认与活跃图片生成供应商设置
-- 响应
-  - 成功：JSON { provider | success }
-  - 错误：JSON { error, code? }
-
-章节来源
-- [src/app/api/providers/route.ts:38-143](file://src/app/api/providers/route.ts#L38-L143)
-- [src/app/api/providers/[id]/route.ts](file://src/app/api/providers/[id]/route.ts#L18-L177)
-
-### 技能管理（/api/skills 与 /api/skills/[name]）
-- 清单与创建（/api/skills）
-  - GET：扫描全局/项目/安装/插件/SDK 命令，去重与合并，支持 cwd 查询参数
-  - POST：创建全局或项目级命令（.md）
-- 读取/更新/删除（/api/skills/[name]）
-  - GET：按名称查找，支持 source=agents|claude 限定来源，冲突时返回多来源
-  - PUT：更新指定来源的技能内容
-  - DELETE：删除指定来源的技能
-- 响应
-  - 成功：JSON { skills | skill | success }
-  - 错误：JSON { error, sources? }
-
-章节来源
-- [src/app/api/skills/route.ts:290-421](file://src/app/api/skills/route.ts#L290-L421)
-- [src/app/api/skills/[name]/route.ts](file://src/app/api/skills/[name]/route.ts#L239-L411)
-
-### 插件管理（/api/plugins 与 /api/plugins/[id]）
-- 清单（/api/plugins）
-  - GET：返回插件列表，支持 cwd 参数
-- 启用/禁用（/api/plugins/[id]）
-  - GET：按 name@marketplace 查找插件
-  - PUT：{ enabled: boolean, cwd? }，返回 layer 与 escalated 标记
-- 响应
-  - 成功：JSON { plugins | plugin | success, layer?, escalated? }
-  - 错误：JSON { error }
-
-章节来源
-- [src/app/api/plugins/route.ts:5-17](file://src/app/api/plugins/route.ts#L5-L17)
-- [src/app/api/plugins/[id]/route.ts](file://src/app/api/plugins/[id]/route.ts#L23-L101)
-
-### 文件扫描（/api/files）
-- 方法与路径
-  - GET /api/files?dir=...&depth=...&baseDir=...
-- 行为要点
-  - 校验目录参数与路径安全性（禁止根目录作为 baseDir；默认限制在用户主目录）
-  - 限制最大深度
-- 响应
-  - 成功：JSON { tree, root }
-  - 错误：JSON { error }
-
-章节来源
-- [src/app/api/files/route.ts:7-63](file://src/app/api/files/route.ts#L7-L63)
-
-### 健康检查（/api/health）
-- 方法与路径
-  - GET /api/health
-- 响应
-  - 成功：JSON { status: 'ok' }
-
-章节来源
-- [src/app/api/health/route.ts:3-5](file://src/app/api/health/route.ts#L3-L5)
-
-### 用户设置（/api/settings）
-- 方法与路径
-  - GET /api/settings：读取 ~/.claude/settings.json
-  - PUT /api/settings：写入 settings 对象
-- 响应
-  - 成功：JSON { settings | success }
-  - 错误：JSON { error }
-
-章节来源
-- [src/app/api/settings/route.ts:28-60](file://src/app/api/settings/route.ts#L28-L60)
-
-### Claude 登录状态（/api/claude-auth）
-- 方法与路径
-  - GET /api/claude-auth
-- 响应
-  - 成功：JSON { authenticated, email?, accountType?, organizationName? }
-
-章节来源
-- [src/app/api/claude-auth/route.ts:12-38](file://src/app/api/claude-auth/route.ts#L12-L38)
-
-### Claude 会话列表（/api/claude-sessions）
-- 方法与路径
-  - GET /api/claude-sessions
-- 响应
-  - 成功：JSON { sessions }
-  - 错误：JSON { error }
-
-章节来源
-- [src/app/api/claude-sessions/route.ts:3-12](file://src/app/api/claude-sessions/route.ts#L3-L12)
-
-### Claude CLI 状态（/api/claude-status）
-- 方法与路径
-  - GET /api/claude-status
-- 响应
-  - 成功：JSON { connected, version, latestVersion?, updateAvailable?, manualUpdateChannel?, binaryPath, installType, otherInstalls, missingGit, warnings, features }
-- 特性检测
-  - thinking、context1m、effort 等基于版本比较
-
-章节来源
-- [src/app/api/claude-status/route.ts:68-149](file://src/app/api/claude-status/route.ts#L68-L149)
+- [src/lib/bridge/adapters/weixin/weixin-media.ts](file://src/lib/bridge/adapters/weixin/weixin-media.ts)
+- [src/lib/channels/types.ts](file://src/lib/channels/types.ts)
+- [src/lib/channels/feishu/index.ts](file://src/lib/channels/feishu/index.ts)
+- [apps/site/src/app/api/search/route.ts](file://apps/site/src/app/api/search/route.ts)
 
 ## 依赖关系分析
-- 聊天引擎依赖
-  - 数据库：会话、消息、设置、任务同步
-  - 供应商解析：统一解析有效提供商与模型
-  - 上下文组装：工作区、CLI 工具、小部件提示
-  - MCP 服务器：根据预测运行时加载
-  - Claude SDK/原生：流式生成与中断
-- 技能/插件依赖
-  - 文件系统扫描与 YAML Front Matter 解析
-  - SDK 能力缓存（命令/插件）
-- 供应商依赖
-  - 协议有效性与基础地址约束
-  - 默认/活跃图片供应商联动
+- 路由与工具链
+  - 路由层依赖数据库与文件系统工具，确保数据一致性与安全性
+  - HTML 预览依赖路径解析与安全校验工具，避免越权读取
+- 渠道与适配器
+  - 渠道类型接口统一了不同渠道的能力契约
+  - 飞书适配器基于网关客户端实现消息发送与反应管理
+- 测试与验证
+  - 单元测试覆盖路由行为与错误分支，保障稳定性
 
 ```mermaid
 graph LR
-Chat["/api/chat"] --> DB["数据库"]
-Chat --> Resolver["供应商解析"]
-Chat --> MCP["MCP 服务器"]
-Chat --> Claude["Claude SDK/原生"]
-Skills["/api/skills/*"] --> FS["文件系统"]
-Plugins["/api/plugins/*"] --> SDKCap["SDK 能力缓存"]
-Providers["/api/providers/*"] --> Catalog["协议/基础地址校验"]
+Route_Chat["聊天消息路由"] --> Util_DB["数据库工具"]
+Route_FilesOpen["打开路径路由"] --> OS_CMD["操作系统命令"]
+Route_HtmlPreview["HTML 预览路由"] --> Util_SafePath["安全路径工具"]
+Route_Uploads["上传路由"] --> FS["文件系统"]
+Feishu["飞书适配器"] --> Types["渠道类型接口"]
+Weixin["微信媒体上传"] --> CDN["CDN 上传"]
 ```
 
 图表来源
-- [src/app/api/chat/route.ts:27-630](file://src/app/api/chat/route.ts#L27-L630)
-- [src/app/api/skills/route.ts:290-421](file://src/app/api/skills/route.ts#L290-L421)
-- [src/app/api/plugins/route.ts:5-17](file://src/app/api/plugins/route.ts#L5-L17)
-- [src/app/api/providers/route.ts:38-143](file://src/app/api/providers/route.ts#L38-L143)
-
-## 性能与并发特性
-- 会话独占锁：POST /api/chat 在处理期间对会话加锁，避免并发请求导致状态不一致
-- 流式输出：使用 SSE 文本流，边生成边返回，降低首包延迟
-- 自动上下文压缩：在估计超限时自动压缩历史，减少后续请求成本
-- 会话锁续期：长时间流式生成时定期续期锁，避免过期
-- 任务调度：首次调用启动任务调度器，保障后台任务执行
+- [src/app/api/chat/messages/route.ts](file://src/app/api/chat/messages/route.ts)
+- [src/app/api/files/open/route.ts](file://src/app/api/files/open/route.ts)
+- [src/app/api/files/html-preview/[...segments]/route.ts](file://src/app/api/files/html-preview/[...segments]/route.ts)
+- [src/app/api/uploads/route.ts](file://src/app/api/uploads/route.ts)
+- [src/lib/channels/types.ts](file://src/lib/channels/types.ts)
+- [src/lib/channels/feishu/index.ts](file://src/lib/channels/feishu/index.ts)
+- [src/lib/bridge/adapters/weixin/weixin-media.ts](file://src/lib/bridge/adapters/weixin/weixin-media.ts)
 
 章节来源
-- [src/app/api/chat/route.ts:68-79](file://src/app/api/chat/route.ts#L68-L79)
-- [src/app/api/chat/route.ts:566-569](file://src/app/api/chat/route.ts#L566-L569)
+- [src/__tests__/unit/codex-phase-6-wiring.test.ts](file://src/__tests__/unit/codex-phase-6-wiring.test.ts)
+- [src/__tests__/unit/codex-proxy-error-visibility.test.ts](file://src/__tests__/unit/codex-proxy-error-visibility.test.ts)
 
-## 认证与安全
-- 认证方式
-  - Claude 登录状态：通过 ~/.claude/.credentials 判断是否登录
-  - 供应商密钥：返回时掩码显示，更新时支持保留掩码值
-- 安全措施
-  - 文件扫描限制 baseDir 不可为文件系统根，限制扫描范围
-  - 路径安全校验，防止越权访问
-  - 供应商创建/更新时强制要求特定协议的基础地址（如 Anthropic、OpenAI Image、Gemini Image）
+## 性能考量
+- HTML 预览与上传路由对静态资源设置了强缓存策略，降低重复请求开销
+- 路由层采用 Node.js 运行时与动态路由策略，满足实时文件读取需求
+- 建议
+  - 对大文件上传采用分片或断点续传（如需扩展）
+  - 在高并发场景下对文件系统访问加锁或限流
+  - 将频繁访问的静态资源置于 CDN 或应用缓存层
 
-章节来源
-- [src/app/api/claude-auth/route.ts:12-38](file://src/app/api/claude-auth/route.ts#L12-L38)
-- [src/app/api/providers/route.ts:55-130](file://src/app/api/providers/route.ts#L55-L130)
-- [src/app/api/providers/[id]/route.ts](file://src/app/api/providers/[id]/route.ts#L39-L129)
-- [src/app/api/files/route.ts:22-52](file://src/app/api/files/route.ts#L22-L52)
-
-## 错误处理与状态码
-- 常见状态码
-  - 400：缺少参数、无效输入
-  - 403：越权或不允许的目录
-  - 404：资源不存在（会话/技能/插件/供应商）
-  - 409：资源冲突（如技能同名不同内容）
-  - 412：前置条件不满足（如需要配置提供者）
-  - 413：请求过大（由上游或流式处理逻辑决定）
-  - 429：速率限制（见“速率限制”）
-  - 500：内部错误
-- 错误响应格式
-  - JSON { error, code? }
+## 故障排查指南
+- 聊天消息接口
+  - 400：请求体缺少必要字段
+  - 404：会话不存在
+  - 500：内部异常（数据库或序列化错误）
+- 文件打开接口
+  - 400：缺少 path
+  - 500：命令执行失败（权限不足、路径不存在等）
+- HTML 预览与上传接口
+  - 403/404：路径越权或文件不存在
+  - 500：文件读取异常
+- 媒体上传接口
+  - 400/500：CDN 获取 URL 失败或上传失败
+  - 建议检查网络、凭证与超时设置
 
 章节来源
-- [src/app/api/chat/route.ts:38-58](file://src/app/api/chat/route.ts#L38-L58)
-- [src/app/api/chat/messages/route.ts:21-38](file://src/app/api/chat/messages/route.ts#L21-L38)
-- [src/app/api/skills/[name]/route.ts](file://src/app/api/skills/[name]/route.ts#L252-L267)
-- [src/app/api/files/route.ts:31-51](file://src/app/api/files/route.ts#L31-L51)
-
-## 速率限制
-- 当前仓库未发现显式的速率限制实现。建议在网关或应用层引入基于 IP/会话/令牌的限流策略，结合 SSE 流式输出场景，避免长连接滥用。
-
-## 请求/响应示例与客户端实现指南
-以下为常见场景的请求/响应示意与实现建议（请以实际返回为准）：
-
-- 发送聊天消息（SSE）
-  - 请求
-    - 方法：POST
-    - 路径：/api/chat
-    - 请求头：Content-Type: application/json
-    - 示例请求体字段：session_id, content, model, mode, files[], toolTimeout, provider_id, systemPromptAppend, autoTrigger, thinking, effort, enableFileCheckpointing, displayOverride, context_1m
-  - 响应
-    - 成功：text/event-stream，事件类型包括 text、tool_use、tool_result、status、task_update、result、error、done
-    - 失败：JSON { error, code? }
-  - 客户端实现要点
-    - 使用 EventSource 或 fetch + ReadableStream 读取 SSE
-    - 解析事件类型，分别渲染文本、工具调用、工具结果与状态栏
-    - 遇到 error 事件时终止并提示错误
-    - 遇到 done 结束流
-
-- 持久化消息（非流式）
-  - 请求
-    - 方法：POST
-    - 路径：/api/chat/messages
-    - 请求体：{ session_id, role, content, token_usage? }
-  - 响应：JSON { message }
-
-- 更新消息内容
-  - 请求
-    - 方法：PUT
-    - 路径：/api/chat/messages
-    - 请求体：{ message_id, content } 或 { session_id, prompt_hint, content }
-  - 响应：JSON { ok, updated_message_id, fallback_used }
-
-- 获取会话详情
-  - 请求
-    - 方法：GET
-    - 路径：/api/chat/sessions/[id]
-  - 响应：JSON { session }
-
-- 更新会话属性
-  - 请求
-    - 方法：PATCH
-    - 路径：/api/chat/sessions/[id]
-    - 请求体：{ working_directory?, title?, mode?, model?, provider_id?, sdk_session_id?, permission_profile?, clear_messages? }
-  - 响应：JSON { session }
-
-- 删除会话
-  - 请求
-    - 方法：DELETE
-    - 路径：/api/chat/sessions/[id]
-  - 响应：JSON { success }
-
-- 中断会话
-  - 请求
-    - 方法：POST
-    - 路径：/api/chat/interrupt
-    - 请求体：{ sessionId }
-  - 响应：JSON { interrupted }
-
-- 获取桥接状态与启停
-  - 请求
-    - 方法：GET /api/bridge：查询状态
-    - 方法：POST /api/bridge：{ action: 'start' | 'stop' | 'auto-start' }
-  - 响应：JSON { ok?, reason?, status }
-
-- 供应商管理
-  - 新增/更新/删除：遵循 /api/providers 与 /api/providers/[id] 的请求/响应规范
-  - 注意：Anthropic 与媒体类供应商必须提供基础地址
-
-- 技能管理
-  - 创建/读取/更新/删除：遵循 /api/skills 与 /api/skills/[name] 的请求/响应规范
-  - 冲突处理：当同一技能在多来源存在且内容不一致时，返回多来源信息
-
-- 插件管理
-  - 列表：GET /api/plugins
-  - 启用/禁用：PUT /api/plugins/[id]，请求体 { enabled: boolean, cwd? }
-
-- 文件扫描
-  - 请求：GET /api/files?dir=...&depth=...&baseDir=...
-  - 响应：JSON { tree, root }
-
-- 健康检查
-  - 请求：GET /api/health
-  - 响应：JSON { status: 'ok' }
-
-- 用户设置
-  - 读取：GET /api/settings
-  - 写入：PUT /api/settings，请求体 { settings }
-
-- Claude 登录状态
-  - 请求：GET /api/claude-auth
-  - 响应：JSON { authenticated, email?, accountType?, organizationName? }
-
-- Claude 会话列表
-  - 请求：GET /api/claude-sessions
-  - 响应：JSON { sessions }
-
-- Claude CLI 状态
-  - 请求：GET /api/claude-status
-  - 响应：JSON { connected, version, latestVersion?, updateAvailable?, manualUpdateChannel?, binaryPath, installType, otherInstalls, missingGit, warnings, features }
-
-章节来源
-- [src/app/api/chat/route.ts:27-630](file://src/app/api/chat/route.ts#L27-L630)
-- [src/app/api/chat/messages/route.ts:11-98](file://src/app/api/chat/messages/route.ts#L11-L98)
-- [src/app/api/chat/sessions/[id]/route.ts](file://src/app/api/chat/sessions/[id]/route.ts#L5-L117)
-- [src/app/api/chat/interrupt/route.ts:13-44](file://src/app/api/chat/interrupt/route.ts#L13-L44)
-- [src/app/api/bridge/route.ts:14-56](file://src/app/api/bridge/route.ts#L14-L56)
-- [src/app/api/providers/route.ts:38-143](file://src/app/api/providers/route.ts#L38-L143)
-- [src/app/api/providers/[id]/route.ts](file://src/app/api/providers/[id]/route.ts#L18-L177)
-- [src/app/api/skills/route.ts:290-421](file://src/app/api/skills/route.ts#L290-L421)
-- [src/app/api/skills/[name]/route.ts](file://src/app/api/skills/[name]/route.ts#L239-L411)
-- [src/app/api/plugins/route.ts:5-17](file://src/app/api/plugins/route.ts#L5-L17)
-- [src/app/api/plugins/[id]/route.ts](file://src/app/api/plugins/[id]/route.ts#L23-L101)
-- [src/app/api/files/route.ts:7-63](file://src/app/api/files/route.ts#L7-L63)
-- [src/app/api/health/route.ts:3-5](file://src/app/api/health/route.ts#L3-L5)
-- [src/app/api/settings/route.ts:28-60](file://src/app/api/settings/route.ts#L28-L60)
-- [src/app/api/claude-auth/route.ts:12-38](file://src/app/api/claude-auth/route.ts#L12-L38)
-- [src/app/api/claude-sessions/route.ts:3-12](file://src/app/api/claude-sessions/route.ts#L3-L12)
-- [src/app/api/claude-status/route.ts:68-149](file://src/app/api/claude-status/route.ts#L68-L149)
-
-## 故障排查
-- 会话忙（409）
-  - 现象：同一会话并发请求被拒绝
-  - 处理：等待当前请求完成或释放锁
-- 需要提供者（412）
-  - 现象：未配置任何 CodePilot 提供者
-  - 处理：先创建/配置提供者再发起聊天
-- 路径越权（403）
-  - 现象：扫描目录时 baseDir 为根或超出允许范围
-  - 处理：提供正确的 baseDir 或使用用户主目录
-- 技能冲突（409）
-  - 现象：同一技能在多来源存在且内容不同
-  - 处理：明确 source 参数或清理重复来源
-- 供应商基础地址缺失
-  - 现象：Anthropic 或媒体类供应商未提供基础地址
-  - 处理：补充正确的 base_url
-
-章节来源
-- [src/app/api/chat/route.ts:48-58](file://src/app/api/chat/route.ts#L48-L58)
-- [src/app/api/files/route.ts:31-51](file://src/app/api/files/route.ts#L31-L51)
-- [src/app/api/skills/[name]/route.ts](file://src/app/api/skills/[name]/route.ts#L252-L267)
-- [src/app/api/providers/route.ts:95-130](file://src/app/api/providers/route.ts#L95-L130)
-- [src/app/api/providers/[id]/route.ts](file://src/app/api/providers/[id]/route.ts#L76-L109)
+- [src/app/api/chat/messages/route.ts](file://src/app/api/chat/messages/route.ts)
+- [src/app/api/files/open/route.ts](file://src/app/api/files/open/route.ts)
+- [src/app/api/files/html-preview/[...segments]/route.ts](file://src/app/api/files/html-preview/[...segments]/route.ts)
+- [src/app/api/uploads/route.ts](file://src/app/api/uploads/route.ts)
+- [src/lib/bridge/adapters/weixin/weixin-media.ts](file://src/lib/bridge/adapters/weixin/weixin-media.ts)
 
 ## 结论
-本文档提供了 CodePilot 后端 API 的完整参考，涵盖聊天、桥接、供应商、技能/插件、文件与媒体、系统状态等关键领域。客户端应遵循 SSE 事件语义、正确处理错误与状态码，并在需要时配合会话锁与自动压缩机制优化体验。建议在生产环境引入速率限制与可观测性策略，确保稳定性与可维护性。
+本文档提供了 CodePilot 的核心 API 规范与实现要点，涵盖聊天消息、文件与媒体等模块。通过统一的路由组织、安全的路径校验与清晰的错误处理，开发者可以稳定地集成与扩展相关能力。建议在生产环境中结合缓存、限流与监控进一步完善。
+
+## 附录
+- 版本控制：当前仓库未发现显式的 API 版本号或语义化版本策略，建议在路由或响应头中引入版本标记以便演进
+- 速率限制：未发现内置限流机制，建议在网关或中间件层增加限流策略
+- 安全考虑
+  - HTML 预览与上传路由已内置路径安全校验与 MIME 映射，避免任意文件执行
+  - 建议在生产环境启用 HTTPS、CSP 与最小权限原则
+- 客户端实现建议
+  - 使用稳定的 HTTP 客户端库，统一处理重试与超时
+  - 对上传类接口采用进度回调与断点续传
+  - 在多渠道场景下抽象统一的消息发送接口，屏蔽渠道差异

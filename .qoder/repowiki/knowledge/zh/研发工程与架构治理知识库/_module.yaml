@@ -1,0 +1,8 @@
+schema_version: 1
+module_path: docs_knowledge
+title: 研发工程与架构治理知识库
+scope:
+    - docs/
+source_files: []
+depends_on: []
+related_to: []
