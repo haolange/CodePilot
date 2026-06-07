@@ -13,14 +13,6 @@
 
 ---
 
-## 🚧 Project Refactor Notice / 项目重构公告
-
-**EN:** CodePilot is undergoing a larger product refactor before the next release. We are rebuilding the runtime/session foundation, background resident tasks and local notifications, scheduled AI work, Markdown/Artifact previews, and local agent adapters such as Codex. Existing releases remain available; the next versions will focus on making these foundations stable and useful.
-
-**中文：** CodePilot 正在进行一次较大的产品重构，为下一轮正式发布整理底层能力。重点包括会话级 Runtime、后台常驻任务与本机通知、定时提醒和后台 AI 任务、Markdown / Artifact 预览稳定性，以及 Codex 等本地 Agent 适配。现有版本仍可下载使用；接下来的版本会优先把这些基础能力做稳、做好用。
-
----
-
 ![CodePilot](https://github.com/user-attachments/assets/9750450a-9f6f-49ce-acd4-c623a4e24281)
 
 ---
@@ -35,7 +27,7 @@
 |---|---|---|
 | macOS | [Apple Silicon (.dmg)](https://github.com/op7418/CodePilot/releases/latest) · [Intel (.dmg)](https://github.com/op7418/CodePilot/releases/latest) | arm64 / x64 |
 | Windows | [Installer (.exe)](https://github.com/op7418/CodePilot/releases/latest) | x64 + arm64 |
-| Linux | [AppImage](https://github.com/op7418/CodePilot/releases/latest) · [.deb](https://github.com/op7418/CodePilot/releases/latest) · [.rpm](https://github.com/op7418/CodePilot/releases/latest) | x64 + arm64 |
+| Linux | Build from source | x64 + arm64 |
 
 Or visit the [Releases](https://github.com/op7418/CodePilot/releases) page for all versions.
 
@@ -274,10 +266,10 @@ npm run build                  # Production build
 npm run electron:build         # Build Electron distributable
 npm run electron:pack:mac      # macOS DMG (arm64 + x64)
 npm run electron:pack:win      # Windows NSIS installer
-npm run electron:pack:linux    # Linux AppImage, deb, rpm
+npm run electron:pack:linux    # Linux AppImage, deb, rpm (local build only — not a GitHub Release download)
 ```
 
-**CI/CD:** Pushing a `v*` tag triggers a full multi-platform build and creates a GitHub Release automatically.
+**CI/CD:** Pushing a `v*` tag builds the macOS and Windows packages and creates a GitHub Release automatically. Linux is not part of the release build — build it locally with `npm run electron:pack:linux`.
 
 **Notes:**
 - Electron forks a Next.js standalone server on `127.0.0.1` with a random free port

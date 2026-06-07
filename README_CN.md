@@ -11,8 +11,6 @@
 
 [English](./README.md) | [日本語](./README_JA.md)
 
-> **项目公告（2026 年 5 月）：** CodePilot 正在进行一次较大的产品重构，为下一轮正式发布整理底层能力。重点包括会话级 Runtime、后台常驻与本机通知、定时提醒和后台 AI 任务、Markdown / Artifact 预览稳定性，以及 Codex 等本地 Agent 适配。现有版本仍可下载使用；接下来的版本会优先把这些基础能力做稳、做好用。
-
 ![CodePilot](https://github.com/user-attachments/assets/9750450a-9f6f-49ce-acd4-c623a4e24281)
 
 ---
@@ -27,7 +25,7 @@
 |---|---|---|
 | macOS | [Apple Silicon (.dmg)](https://github.com/op7418/CodePilot/releases/latest) · [Intel (.dmg)](https://github.com/op7418/CodePilot/releases/latest) | arm64 / x64 |
 | Windows | [安装包 (.exe)](https://github.com/op7418/CodePilot/releases/latest) | x64 + arm64 |
-| Linux | [AppImage](https://github.com/op7418/CodePilot/releases/latest) · [.deb](https://github.com/op7418/CodePilot/releases/latest) · [.rpm](https://github.com/op7418/CodePilot/releases/latest) | x64 + arm64 |
+| Linux | 从源码构建 | x64 + arm64 |
 
 或访问 [Releases](https://github.com/op7418/CodePilot/releases) 页面获取所有版本。
 
@@ -266,10 +264,10 @@ npm run build                  # 生产构建
 npm run electron:build         # 构建 Electron 可分发包
 npm run electron:pack:mac      # macOS DMG（arm64 + x64）
 npm run electron:pack:win      # Windows NSIS 安装包
-npm run electron:pack:linux    # Linux AppImage、deb、rpm
+npm run electron:pack:linux    # Linux AppImage、deb、rpm（仅本地构建——不是 GitHub Release 的预编译下载项）
 ```
 
-**CI/CD：** 推送 `v*` tag 会自动触发全平台构建并创建 GitHub Release。
+**CI/CD：** 推送 `v*` tag 会自动构建 macOS 和 Windows 包并创建 GitHub Release。Linux 不在 release 构建内——用 `npm run electron:pack:linux` 在本地构建。
 
 **说明：**
 - Electron 在 `127.0.0.1` 上 fork Next.js standalone 服务器，使用随机可用端口

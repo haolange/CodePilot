@@ -1,28 +1,38 @@
-## CodePilot v0.54.0
+## CodePilot v0.55.1
 
-> 本版本补齐服务商生态：新增 DeepSeek 独立预设，OpenAI OAuth 加入 GPT-5.5，小米 MiMo 两个套餐升级到 V2.5-Pro，同时修掉切换服务商时的环境变量残留问题。
-
-### 新增功能
-
-- **DeepSeek 服务商** — 在服务商列表里新增 DeepSeek 独立预设，走官方 Anthropic 兼容端点 `api.deepseek.com/anthropic`，只需填 Key 即用。默认主模型 DeepSeek V4 Pro，Haiku 档位映射到更便宜的 DeepSeek V4 Flash，压缩/总结这类辅助调用能自动走便宜档
-- **OpenAI OAuth 支持 GPT-5.5** — ChatGPT Plus/Pro 授权登录后，模型下拉里新增 GPT-5.5（排在 GPT-5.4 之上），新会话未指定模型时默认用 GPT-5.5
+> ⚠️ **本系列是一次大规模重构更新，底层改动面很大。** v0.55.1 在 v0.55.0 基础上修复了"内测版收不到正式版更新提示"等问题；如果你仍在意稳定性、不想冒险踩坑，可以继续观察后续修订版本。
+>
+> 在重构正式版 v0.55.0（多执行引擎 / 上下文用量可视化 / Codex 账号原生能力）基础上的修订版，主要修复了 0.55.0-preview 内测用户收不到正式版更新提示的问题。
 
 ### 修复问题
 
-- **切换服务商时环境变量残留** — 之前如果用户在系统环境里设过 DeepSeek 文档里的 `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK` / `CLAUDE_CODE_EFFORT_LEVEL`，切到其它服务商后这两个变量仍会带到子进程里，影响其它服务商的请求行为。现在切换服务商时会连同这两个 key 一起清掉，避免跨服务商污染
+- **内测版收不到正式版更新提示** — 之前装了 0.55.0-preview 内测版的用户，应用检查更新时会把正式版误判成"和当前版本一样"，导致不弹更新提示。现在内测版能正确识别出正式版更新（修复并入 0.55.1 后，之后版本的更新检测也一并修正）。
 
-### 优化改进
+### 重构正式版主要内容（自上一个正式版 0.54.0 起，首次升级的用户可一并了解）
 
-- **小米 MiMo 升级到 V2.5-Pro** — 按量付费和 Token Plan 两个预设里的默认模型从 `mimo-v2-pro` 全部切到 `mimo-v2.5-pro`，界面上显示名也同步更新为 MiMo-V2.5-Pro
+- **多执行引擎，可整体切换也可按会话切换** — 同一个应用里支持 Anthropic Claude Code、CodePilot 自建 Native、OpenAI Codex 三种执行引擎；可设全局默认，也能在单个对话里临时切换。
+- **上下文用量可视化** — 聊天里实时看到本次对话占用了多少上下文、还剩多少，并按来源（系统提示 / 工作区规则 / 技能 / 记忆 / 工具 / MCP）分解。
+- **OpenAI Codex 账号原生能力打通** — 用 Codex 账号登录后，助理记忆、Widget 可视化、定时任务 + 到点通知、Dashboard、CLI 工具在 Codex 引擎下也能用；接不了的能力会如实标注为不支持。
+- **集中修复内测反馈问题** — macOS 菜单栏图标看不清、Windows 生成命令是 bash 语法 / 安装无法选目录 / 服务商编辑窗口关闭按钮贴脸 / Codex 无法启动、OpenRouter + Opus 会话被静默换成 Sonnet、小米 MiMo 型号被改回默认、飞书桥接后台刷错误日志等。
+
+### 已知问题
+
+以下问题已记录、不影响主流程，正在跟进（欢迎到 GitHub Issues 反馈复现细节）：
+
+- Windows 上服务商编辑窗口右上角关闭按钮在个别情况下点击无反应（仍在 Windows 真机验证中）。
+- 个别用户反馈流式回复期间继续追加消息进队列的行为异常（核查中）。
+- MCP 在设置页能看到，但运行时模型调不到，需要把 MCP 配置到项目路径才识别（排查中）。
+
+**反馈入口**：欢迎在 [GitHub Issues](https://github.com/op7418/CodePilot/issues) 提交问题与复现步骤。
 
 ## 下载地址
 
 ### macOS
-- [Apple Silicon (M1/M2/M3/M4)](https://github.com/op7418/CodePilot/releases/download/v0.54.0/CodePilot-0.54.0-arm64.dmg)
-- [Intel](https://github.com/op7418/CodePilot/releases/download/v0.54.0/CodePilot-0.54.0-x64.dmg)
+- [Apple Silicon (M1/M2/M3/M4)](https://github.com/op7418/CodePilot/releases/download/v0.55.1/CodePilot-0.55.1-arm64.dmg)
+- [Intel](https://github.com/op7418/CodePilot/releases/download/v0.55.1/CodePilot-0.55.1-x64.dmg)
 
 ### Windows
-- [Windows 安装包](https://github.com/op7418/CodePilot/releases/download/v0.54.0/CodePilot.Setup.0.54.0.exe)
+- [Windows 安装包](https://github.com/op7418/CodePilot/releases/download/v0.55.1/CodePilot.Setup.0.55.1.exe)
 
 ## 安装说明
 
