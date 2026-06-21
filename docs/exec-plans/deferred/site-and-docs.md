@@ -1,6 +1,8 @@
+> **Archive note（2026-06-05，document-system-governance）**：本计划已移出 `active/`，归入 `deferred/`——用户明确暂缓，未来可能重启。**不是当前任务入口**；当前工作入口见 [exec-plans README](../README.md)，重启方式见 [deferred/README.md](README.md)。
+
 # 官网 + 文档站（apps/site）
 
-> ⏸ **本轮重构暂缓**（见 [refactor-closeout.md](./refactor-closeout.md) "暂缓清单"）— Phase 0-3 已完成；Phase 4（packages/ui 抽取）+ Phase 5（桌面端适配 + CI/CD）等大规模官网/文档站工作不主动推进。
+> ⏸ **本轮重构暂缓**（见 [refactor-closeout.md](../completed/refactor-closeout.md) "暂缓清单"）— Phase 0-3 已完成；Phase 4（packages/ui 抽取）+ Phase 5（桌面端适配 + CI/CD）等大规模官网/文档站工作不主动推进。
 
 > 创建时间：2026-03-10
 > 最后更新：2026-03-10

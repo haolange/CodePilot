@@ -317,6 +317,11 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
     }
   }, [currentProviderId, invalidSessionProvider]);
 
+  // Resolve upstream model ID for the current model/provider so both the
+  // context indicator and Run Checkpoint can disambiguate alias windows
+  // (first-party opus = 1M vs Bedrock/Vertex opus = 200K).
+  const [currentModelUpstream, setCurrentModelUpstream] = useState<string | undefined>(undefined);
+
   // Run Checkpoint signals — session-scoped only.
   //
   // An ALREADY-OPENED conversation has its own `currentProviderId/currentModel`
@@ -337,7 +342,10 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
   // usedContextTokens reads from the same `useContextUsage` hook
   // RunCockpit uses so the cost trigger reads the SAME used count the
   // user sees in the status row.
-  const usage = useContextUsage(messages, currentModel);
+  const usage = useContextUsage(messages, currentModel, {
+    context1m,
+    upstreamModelId: currentModelUpstream,
+  });
   const usedContextTokens = usage.used;
 
   const checkpointReasons = useMemo(() => {
@@ -382,11 +390,8 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
     return () => controller.abort();
   }, [currentProviderId]);
 
-  // Resolve upstream model ID for the current model/provider so the context
-  // indicator can disambiguate alias windows (first-party opus = 1M vs
-  // Bedrock/Vertex opus = 200K). /api/providers/models already returns
-  // upstreamModelId per model on the returned groups.
-  const [currentModelUpstream, setCurrentModelUpstream] = useState<string | undefined>(undefined);
+  // /api/providers/models already returns upstreamModelId per model on the
+  // returned groups.
   useEffect(() => {
     const pid = currentProviderId || 'env';
     const controller = new AbortController();
@@ -474,7 +479,7 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
 
   // Pending image generation notices
   const pendingImageNoticesRef = useRef<string[]>([]);
-  const sendMessageRef = useRef<(content: string, files?: FileAttachment[], systemPromptAppend?: string, displayOverride?: string, mentions?: MentionRef[]) => Promise<void>>(undefined);
+  const sendMessageRef = useRef<(content: string, files?: FileAttachment[], systemPromptAppend?: string, displayOverride?: string, mentions?: MentionRef[]) => Promise<boolean | void>>(undefined);
   const initMetaRef = useRef<{ tools?: unknown; slash_commands?: unknown; skills?: unknown } | null>(null);
 
   const handleModeChange = useCallback((newMode: string) => {
@@ -1023,11 +1028,11 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
       // so the early-outs have to live here too.
       if (providerFetchState === 'idle') {
         console.warn('[ChatView] sendMessage suppressed: provider feed still loading');
-        return;
+        return false; // not delivered → composer preserves the user's text + attachments (#615)
       }
       if (noCompatibleProvider) {
         console.warn('[ChatView] sendMessage suppressed: no provider compatible with active runtime');
-        return;
+        return false; // not delivered → preserve composer (#615)
       }
       // Mirror doStartStream's Guard 4 *before* we push the optimistic
       // bubble. MessageInput's disabled prop already blocks the typical
@@ -1038,7 +1043,7 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
       // refuse to fire — same ghost-message shape Step 4b just fixed.
       if (sessionProviderRuntimeIncompatible) {
         console.warn('[ChatView] sendMessage suppressed: session provider not compatible with active runtime — pick a different provider in the composer');
-        return;
+        return false; // not delivered → preserve composer (#615)
       }
 
       const displayUserContent = displayOverride || content;

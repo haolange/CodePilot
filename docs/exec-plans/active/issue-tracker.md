@@ -1,7 +1,7 @@
 # Issue Tracker — 统一问题跟踪
 
 > 创建时间：2026-04-13
-> 最后更新：2026-06-04（合并前对齐提交状态：B-020 MiMo 回退 → 已修 `ea860da`；B-021 Provider 编辑双 X → 已修 `2646f23`，待 Windows 真机；#578 中断后发送 → 已修 `fcce794`，B-022「streaming 期间排队」待专项 smoke；自动权限 / 对话编辑仍 FR）
+> 最后更新：2026-06-06（新增 B-024 Codex Runtime Stop 后恢复发送：#578 前端 force-abort 已修，但 `/api/chat/interrupt` 漏掉 `codex_runtime` fan-out，待 Claude Code 按 [codex-stop-recovery.md](codex-stop-recovery.md) 修）
 > 合并自：`open-issues-2026-03-12.md` + `v0.48-post-release-issues.md` + GitHub Issues 最新盘点
 
 **AI 须知：**
@@ -255,6 +255,26 @@
 - **影响:** MCP 可见性与可调用性不一致——用户以为已启用但模型实际调不到；属"设置页看得到、运行时不可调用"的假承诺（触及 CLAUDE.md 语义验收）。
 - **需核查:** 全局/用户级 Claude Code MCP 配置与 CodePilot runtime 注入 / 运行状态 UI 的来源是否一致；为什么只有配置到项目路径才识别。
 - **下一步:** 合并后排查 runtime MCP 注入来源 vs 运行状态 UI 来源；若不修则降级文案，别让设置页假承诺"已启用"。
+
+#### B-024 Codex Runtime 终止后无法拉起新任务
+- **计划:** [codex-stop-recovery.md](codex-stop-recovery.md)
+- **状态:** 🔴 未修复（2026-06-06 用户反馈；Codex 已调研，待 Claude Code 修）
+- **现象:** Codex Runtime 正在执行任务时点击 Stop / 终止后，同一会话后续无法发送新指令，像是进程或 session 挂死；用户需要新建会话、重启或等待未知时间才能继续。
+- **本地核实:** 三因素根因：#578 的 `stream-session-manager.ts` force-abort 兜底只保证前端 stream 离开 active；`src/app/api/chat/interrupt/route.ts` 只调用 native 和 SDK conversation interrupt，未调用 `getRuntime('codex_runtime')?.interrupt(sessionId)`；`chat/route.ts` 已把 abortController 传到 Codex Runtime，但 `src/lib/codex/runtime.ts` 当前不读 `options.abortController?.signal`。而 Codex Runtime 已有 `turn/interrupt` 实现，说明中断能力存在但两条入口都没接上。
+- **影响:** Stop 后后台 Codex turn 可能继续运行，`chat/route.ts` 的后台 `collectStreamResponse` 不结束，session lock 的 60s renew interval 不会 clear，会持续续租 600s lock，下一条同会话 send 可能被无限期 `SESSION_BUSY` 或 runtime running 状态阻塞。
+- **需核查:**
+  - `/api/chat/interrupt` 是否对 `native` / `codex_runtime` / SDK conversation 都做 best-effort fan-out。
+  - 用户很快点 Stop 时，`turn/start` 尚未返回 turnId，`activeCodexTurns` 还没 set，Codex Runtime interrupt 是否会 no-op 并丢失中断。
+  - Stop 后 `collectStreamResponse`、session lock、runtime status 是否在 terminal/interrupted 路径完成收口；即使上游没有 terminal event，也要有精确 lockId 的 bounded cleanup。
+- **下一步:** Claude Code 按计划 P1-P3 修复并补 guardrail：route fan-out、Codex abort signal/race、精确 lockId watchdog；P5/P6 只在 P1-P3 smoke 后仍有状态分裂/no-output 时展开。
+
+#### B-025 主日志 12G 暴涨与 Codex Runtime 闪退
+- **计划:** [log-bloat-codex-runtime-crash.md](log-bloat-codex-runtime-crash.md)
+- **状态:** 🔴 日志暴涨已确认；闪退高相关待 live 复现（2026-06-08 用户提供 12G `codepilot-main` 日志）
+- **现象:** 用户另一台电脑 `codepilot-main` 日志达到约 12.5G；Codex Runtime 下客户端偶发闪退，最近一次疑似发生在突破沙盒权限、需要网络授权/搜索文件时。
+- **本地核实:** 用户日志尾部 50MB 中约 70,000 行里 69,253 行是 Codex app-server `codex_core::tasks` enter/exit tracing；`electron/main.ts` 明确没有 size-based rotation；`src/lib/codex/app-server-manager.ts` 默认 `RUST_LOG=info`；Electron 主进程把 server stdout/stderr 写入持久日志，并且 `serverErrors.push(msg)` 无界累积。
+- **影响:** 日志暴涨会吃磁盘；无界 `serverErrors` 会把同一批 tracing 噪声留在主进程内存里，是 Codex Runtime 闪退/卡死的高置信候选根因。当前日志没有 `panic` / OOM / uncaught 栈，仍需 live smoke 和 crash breadcrumb 定案。
+- **下一步:** Claude Code 优先修 P0 logging 上限：主日志 size rotation、`serverErrors` ring buffer、Codex tracing 默认降级/过滤；随后补 `render-process-gone` / `child-process-gone` / uncaught breadcrumb，并跑真实 Codex `require_escalated` / network approval smoke。
 
 ---
 

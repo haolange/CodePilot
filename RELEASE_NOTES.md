@@ -1,26 +1,35 @@
-## CodePilot v0.55.1
+## CodePilot v0.56.0
 
-> ⚠️ **本系列是一次大规模重构更新，底层改动面很大。** v0.55.1 在 v0.55.0 基础上修复了"内测版收不到正式版更新提示"等问题；如果你仍在意稳定性、不想冒险踩坑，可以继续观察后续修订版本。
+> 本次更新的部分修复由 Claude Fable 5 完成。
 >
-> 在重构正式版 v0.55.0（多执行引擎 / 上下文用量可视化 / Codex 账号原生能力）基础上的修订版，主要修复了 0.55.0-preview 内测用户收不到正式版更新提示的问题。
+> 模型与渠道扩充版本：新增 Claude Fable 5、小米 MiMo UltraSpeed 模型与通用 OpenAI 兼容第三方渠道，并修复用量统计、回复状态丢失、服务商列表刷新等一批问题。推荐所有用户升级。
+
+### 新增功能
+
+- **支持 Claude Fable 5** — Anthropic 最新发布的旗舰模型（定位在 Opus 之上），在 Anthropic 官方服务商和内置 Claude Code 模式下均可选用，支持 1M 上下文窗口与全部思考深度（Effort）档位。注意官方定价为 Opus 4.8 的两倍，请按需选用。
+- **小米 MiMo 新增 UltraSpeed 超高速模型** — MiMo 渠道可选用 `mimo-v2.5-pro-ultraspeed`（官方超高速体验模式，资源有限、按日审批）；默认模型保持不变，不影响现有会话。
+- **通用 OpenAI 兼容第三方渠道** — 设置 > 服务商中可以新增任意 OpenAI 协议兼容的网关：填入 Base URL、API Key 和模型名即可在 CodePilot 与 Codex 引擎中使用（Claude Code 引擎不支持此类渠道，界面有明确标注）。
 
 ### 修复问题
 
-- **内测版收不到正式版更新提示** — 之前装了 0.55.0-preview 内测版的用户，应用检查更新时会把正式版误判成"和当前版本一样"，导致不弹更新提示。现在内测版能正确识别出正式版更新（修复并入 0.55.1 后，之后版本的更新检测也一并修正）。
+- 修复对话中途出错时，该轮 token 用量不计入统计的问题——此前成本和上下文用量会被悄悄低估。
+- 修复回复结束后切换会话或长时间挂机回来，完成状态（终止原因、用量信息）丢失的问题。
+- 修复编辑或删除服务商后，聊天页的模型列表最长要等 5 分钟才更新的问题，现在立即生效。
+- 修复模型选择器「Claude Code」分组一直缺少 Opus 4.8 的问题（本次随 Fable 5 接入一并补齐）。
+- 修复早期版本创建的 OpenAI 兼容服务商可能在应用重启后丢失的问题。
 
-### 重构正式版主要内容（自上一个正式版 0.54.0 起，首次升级的用户可一并了解）
+### 优化改进
 
-- **多执行引擎，可整体切换也可按会话切换** — 同一个应用里支持 Anthropic Claude Code、CodePilot 自建 Native、OpenAI Codex 三种执行引擎；可设全局默认，也能在单个对话里临时切换。
-- **上下文用量可视化** — 聊天里实时看到本次对话占用了多少上下文、还剩多少，并按来源（系统提示 / 工作区规则 / 技能 / 记忆 / 工具 / MCP）分解。
-- **OpenAI Codex 账号原生能力打通** — 用 Codex 账号登录后，助理记忆、Widget 可视化、定时任务 + 到点通知、Dashboard、CLI 工具在 Codex 引擎下也能用；接不了的能力会如实标注为不支持。
-- **集中修复内测反馈问题** — macOS 菜单栏图标看不清、Windows 生成命令是 bash 语法 / 安装无法选目录 / 服务商编辑窗口关闭按钮贴脸 / Codex 无法启动、OpenRouter + Opus 会话被静默换成 Sonnet、小米 MiMo 型号被改回默认、飞书桥接后台刷错误日志等。
+- 选用 Fable 5 且设置了「关闭思考」时，会明确提示该模型思考始终开启（官方限制），不再静默忽略你的设置；思考深度可改用 Effort 调节。
+- 运行中的命令实时输出窗口不再从半行中间开始显示。
 
 ### 已知问题
 
-以下问题已记录、不影响主流程，正在跟进（欢迎到 GitHub Issues 反馈复现细节）：
+以下问题已记录、不影响主流程，仍在跟进（欢迎到 GitHub Issues 反馈复现细节）：
 
+- 新增的 OpenAI 兼容渠道与 MiMo UltraSpeed 已通过完整自动化测试，真实第三方网关 / 审批 key 的端到端验证仍在补充中，遇到接入问题请反馈。
 - Windows 上服务商编辑窗口右上角关闭按钮在个别情况下点击无反应（仍在 Windows 真机验证中）。
-- 个别用户反馈流式回复期间继续追加消息进队列的行为异常（核查中）。
+- 流式回复期间继续追加消息进队列的行为异常（核查中）。
 - MCP 在设置页能看到，但运行时模型调不到，需要把 MCP 配置到项目路径才识别（排查中）。
 
 **反馈入口**：欢迎在 [GitHub Issues](https://github.com/op7418/CodePilot/issues) 提交问题与复现步骤。
@@ -28,11 +37,11 @@
 ## 下载地址
 
 ### macOS
-- [Apple Silicon (M1/M2/M3/M4)](https://github.com/op7418/CodePilot/releases/download/v0.55.1/CodePilot-0.55.1-arm64.dmg)
-- [Intel](https://github.com/op7418/CodePilot/releases/download/v0.55.1/CodePilot-0.55.1-x64.dmg)
+- [Apple Silicon (M1/M2/M3/M4)](https://github.com/op7418/CodePilot/releases/download/v0.56.0/CodePilot-0.56.0-arm64.dmg)
+- [Intel](https://github.com/op7418/CodePilot/releases/download/v0.56.0/CodePilot-0.56.0-x64.dmg)
 
 ### Windows
-- [Windows 安装包](https://github.com/op7418/CodePilot/releases/download/v0.55.1/CodePilot.Setup.0.55.1.exe)
+- [Windows 安装包](https://github.com/op7418/CodePilot/releases/download/v0.56.0/CodePilot.Setup.0.56.0.exe)
 
 ## 安装说明
 
