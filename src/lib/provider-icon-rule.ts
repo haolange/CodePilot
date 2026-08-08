@@ -24,11 +24,14 @@ export type ProviderIconKey =
   | "xiaomi-mimo"
   | "ollama"
   | "openai"
+  | "xai"
   | "deepseek"
   | "bedrock"
   | "google"
   | "aws"
   | "anthropic"
+  | "cline"
+  | "opencode"
   | "default";
 
 export function getProviderIconKey(name: string, baseUrl: string): ProviderIconKey {
@@ -36,6 +39,14 @@ export function getProviderIconKey(name: string, baseUrl: string): ProviderIconK
   const url = baseUrl.toLowerCase();
 
   if (lower.includes("openrouter")) return "openrouter";
+  // OpenCode Go: the provider name carries a protocol suffix — "OpenCode Go
+  // (OpenAI)" / "(Anthropic)". Match BEFORE the openai / anthropic name
+  // matchers below, which would otherwise steal the wrong brand logo
+  // (OpenCode brand icon added in @lobehub/icons 4.9.0).
+  if (url.includes("opencode.ai") || lower.includes("opencode")) return "opencode";
+  // ClinePass — Cline brand icon. Scoped to brand-unique fragments
+  // (`cline.bot` host / `clinepass` name) to avoid stealing on "client" etc.
+  if (url.includes("cline.bot") || lower.includes("clinepass")) return "cline";
   if (
     url.includes("bigmodel.cn") ||
     url.includes("z.ai") ||
@@ -73,6 +84,13 @@ export function getProviderIconKey(name: string, baseUrl: string): ProviderIconK
   if (url.includes("xiaomimimo") || lower.includes("mimo") || lower.includes("小米"))
     return "xiaomi-mimo";
   if (url.includes("11434") || lower.includes("ollama")) return "ollama";
+  if (
+    url.includes("api.x.ai") ||
+    lower.includes("xai") ||
+    lower.includes("x.ai") ||
+    lower.includes("grok")
+  )
+    return "xai";
   if (
     url.includes("api.openai.com") ||
     lower.includes("openai") ||

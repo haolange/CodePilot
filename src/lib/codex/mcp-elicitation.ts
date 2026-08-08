@@ -19,7 +19,8 @@
 
 import type { PermissionRequestEvent } from '@/types';
 import { createPermissionRequest, getPermissionRequest } from '@/lib/db';
-import { registerPendingPermission } from '@/lib/permission-registry';
+import { issueApprovalToken } from '@/lib/permission-approval-token';
+import { registerPendingPermission, buildPermissionResolvedEvent } from '@/lib/permission-registry';
 import { getBuiltinMcpServer, type ElicitationPolicy } from './builtin-mcp-servers';
 
 /** Shape of `McpServerElicitationRequestResponse` (codex 0.133 v2). */
@@ -92,12 +93,16 @@ export async function handleCodexMcpElicitationApproval(args: {
   // when `message` is vague. (Codex review — non-blocking.)
   if (args.mode != null) toolInput.mode = args.mode;
   if (args.requestedSchema != null) toolInput.requestedSchema = args.requestedSchema;
+  const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
   const sdkPermission: PermissionRequestEvent = {
     permissionRequestId: requestId,
     toolName,
     toolInput,
     toolUseId: '',
     description,
+    // HMAC over (id, expiresAt) — /api/chat/permission rejects approvals
+    // that don't echo it (Phase 4 ② hardening).
+    approvalToken: issueApprovalToken(requestId, expiresAt),
   };
 
   try {
@@ -107,7 +112,7 @@ export async function handleCodexMcpElicitationApproval(args: {
       toolName,
       toolInput: JSON.stringify(toolInput),
       decisionReason: description,
-      expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+      expiresAt,
     });
   } catch (err) {
     console.warn('[codex.mcp-elicitation] createPermissionRequest failed:', err);
@@ -118,6 +123,19 @@ export async function handleCodexMcpElicitationApproval(args: {
   );
 
   // Resolves via /api/chat/permission → resolvePendingPermission (same as SDK).
-  const result = await registerPendingPermission(requestId, toolInput);
+  // onTimeout pushes permission_resolved(timeout) so an MCP elicitation that
+  // times out shows the same auto-deny UI as every other path (A5 Step 2).
+  const result = await registerPendingPermission(
+    requestId,
+    toolInput,
+    undefined,
+    () => {
+      try {
+        args.emitSse(`data: ${JSON.stringify(buildPermissionResolvedEvent(requestId))}\n\n`);
+      } catch {
+        // stream already closed — deny still applies
+      }
+    },
+  );
   return result.behavior === 'allow' ? ACCEPT_ELICITATION : DECLINE_ELICITATION;
 }

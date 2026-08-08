@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import Link from "next/link";
 import {
   Bell,
@@ -17,6 +17,13 @@ import {
   DropdownMenuItem,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
 import { PromptDialog } from "@/components/ui/prompt-dialog";
 import { cn } from "@/lib/utils";
 import type { ChatSession } from "@/types";
@@ -37,7 +44,7 @@ interface SessionListItemProps {
   t: (key: TranslationKey, params?: Record<string, string | number>) => string;
   onMouseEnter: () => void;
   onMouseLeave: () => void;
-  onDelete: (e: React.MouseEvent, sessionId: string) => void;
+  onDelete: (sessionId: string) => void;
   onRename: (sessionId: string, newTitle: string) => void;
   onAddToSplit: (session: ChatSession) => void;
 }
@@ -61,26 +68,43 @@ export function SessionListItem({
 }: SessionListItemProps) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
+  const contextRenameIntentRef = useRef(false);
   const showActions = isHovered || menuOpen || isDeleting;
+  const handleDropdownRenameSelect = (event: Event) => {
+    // Prevent popup focus restoration from racing the dialog's autofocus.
+    event.preventDefault();
+    setMenuOpen(false);
+    setRenameOpen(true);
+  };
+  const handleContextRenameSelect = () => {
+    // Let Radix close the context menu normally. The matching
+    // onCloseAutoFocus handler below only suppresses focus restoration to
+    // the row, so the rename dialog keeps the focus it just received.
+    contextRenameIntentRef.current = true;
+    setRenameOpen(true);
+  };
 
   return (
-    <div
-      className="group relative"
-      onMouseEnter={onMouseEnter}
-      onMouseLeave={onMouseLeave}
-    >
-      <Link
-        href={`/chat/${session.id}`}
-        className={cn(
-          "flex items-center gap-2 rounded-xl px-3 h-8 transition-all duration-150 min-w-0",
-          isWorkspace
-            ? isActive
-              ? "bg-primary/[0.12] text-sidebar-accent-foreground"
-              : "text-sidebar-foreground hover:bg-primary/[0.10]"
-            : isActive
-              ? "bg-sidebar-accent text-sidebar-accent-foreground"
-              : "text-sidebar-foreground hover:bg-sidebar-accent"
-        )}
+    <>
+      <ContextMenu>
+        <ContextMenuTrigger asChild>
+          <div
+            className="group relative"
+            onMouseEnter={onMouseEnter}
+            onMouseLeave={onMouseLeave}
+          >
+            <Link
+              href={`/chat/${session.id}`}
+              className={cn(
+                "flex items-center gap-2 rounded-xl px-3 h-8 transition-all duration-150 min-w-0",
+                isWorkspace
+                  ? isActive
+                    ? "bg-primary/[0.12] text-sidebar-accent-foreground"
+                    : "text-sidebar-foreground hover:bg-primary/[0.10]"
+                  : isActive
+                    ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                    : "text-sidebar-foreground hover:bg-sidebar-accent"
+              )}
       >
         {/* Left icon area — streaming/approval indicators.
             Skip empty 14px slot for assistant (workspace) sessions when idle:
@@ -114,63 +138,90 @@ export function SessionListItem({
             {formatRelativeTime(session.updated_at, t)}
           </span>
         </span>
-      </Link>
-      {/* Three-dot menu — absolute over the right area */}
-      <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
-        <DropdownMenuTrigger asChild>
-          <Button
-            variant="ghost"
-            size="icon"
-            className={cn(
-              "absolute right-2 top-1/2 -translate-y-1/2 z-10 flex items-center justify-center text-muted-foreground/60 hover:text-foreground transition-opacity h-5 w-5 p-0",
-              showActions ? "opacity-100" : "opacity-0 pointer-events-none"
-            )}
-            onPointerDown={(e) => e.stopPropagation()}
-          >
-            <DotsThree size={16} weight="bold" />
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="min-w-[160px]">
-          <DropdownMenuItem
+            </Link>
+            {/* Three-dot menu — absolute over the right area */}
+            <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className={cn(
+                    "absolute right-2 top-1/2 -translate-y-1/2 z-10 flex items-center justify-center text-muted-foreground/60 hover:text-foreground transition-opacity h-5 w-5 p-0",
+                    showActions ? "opacity-100" : "opacity-0 pointer-events-none"
+                  )}
+                  onPointerDown={(e) => e.stopPropagation()}
+                  aria-label={t('chatList.moreActions' as TranslationKey)}
+                >
+                  <DotsThree size={16} weight="bold" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="min-w-[160px]">
+                <DropdownMenuItem
+                  disabled={isActive || !canSplit}
+                  onClick={() => onAddToSplit(session)}
+                >
+                  <Columns size={14} />
+                  <span>{t('chatList.splitScreen' as TranslationKey)}</span>
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={handleDropdownRenameSelect}>
+                  <CodePilotIcon name="edit" size="sm" aria-hidden />
+                  <span>{t('chatList.renameConversation' as TranslationKey)}</span>
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => {
+                  // v11 fix — see lib/clipboard.ts for why fire-and-forget
+                  // writeText fails in Electron renderers post-DropdownMenu blur.
+                  void copyWithToast({ text: session.id, t });
+                }}>
+                  <CodePilotIcon name="copy" size="sm" aria-hidden />
+                  <span>{t('chatList.copySessionId' as TranslationKey)}</span>
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  variant="destructive"
+                  onClick={() => onDelete(session.id)}
+                >
+                  <CodePilotIcon name="delete" size="sm" aria-hidden />
+                  <span>{t('chatList.deleteConversation' as TranslationKey)}</span>
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        </ContextMenuTrigger>
+        <ContextMenuContent
+          className="min-w-[180px]"
+          onCloseAutoFocus={(event) => {
+            if (!contextRenameIntentRef.current) return;
+            event.preventDefault();
+            contextRenameIntentRef.current = false;
+          }}
+        >
+          <ContextMenuItem
             disabled={isActive || !canSplit}
-            onClick={() => onAddToSplit(session)}
+            onSelect={() => onAddToSplit(session)}
           >
             <Columns size={14} />
             <span>{t('chatList.splitScreen' as TranslationKey)}</span>
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            onSelect={(e) => {
-              // Prevent the default close-menu → focus-trigger behavior.
-              // Radix DropdownMenu tries to restore focus to the trigger
-              // when the menu closes, which fights with the dialog's
-              // autoFocus. Calling preventDefault lets us manage close
-              // independently and open the dialog cleanly.
-              e.preventDefault();
-              setMenuOpen(false);
-              setRenameOpen(true);
-            }}
-          >
+          </ContextMenuItem>
+          <ContextMenuItem onSelect={handleContextRenameSelect}>
             <CodePilotIcon name="edit" size="sm" aria-hidden />
             <span>{t('chatList.renameConversation' as TranslationKey)}</span>
-          </DropdownMenuItem>
-          <DropdownMenuItem onClick={() => {
-            // v11 fix — see lib/clipboard.ts for why fire-and-forget
-            // writeText fails in Electron renderers post-DropdownMenu blur.
-            void copyWithToast({ text: session.id, t });
-          }}>
+          </ContextMenuItem>
+          <ContextMenuItem
+            onSelect={() => void copyWithToast({ text: session.id, t })}
+          >
             <CodePilotIcon name="copy" size="sm" aria-hidden />
             <span>{t('chatList.copySessionId' as TranslationKey)}</span>
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-          <DropdownMenuItem
+          </ContextMenuItem>
+          <ContextMenuSeparator />
+          <ContextMenuItem
             variant="destructive"
-            onClick={(e) => onDelete(e as unknown as React.MouseEvent, session.id)}
+            onSelect={() => onDelete(session.id)}
           >
             <CodePilotIcon name="delete" size="sm" aria-hidden />
             <span>{t('chatList.deleteConversation' as TranslationKey)}</span>
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
+          </ContextMenuItem>
+        </ContextMenuContent>
+      </ContextMenu>
       {/* Rename dialog — replaces window.prompt() which is unsupported in
           Electron renderers (throws TypeError: prompt() is not supported).
           See docs/exec-plans/active/v0.48-post-release-issues.md §5.6. */}
@@ -188,7 +239,7 @@ export function SessionListItem({
           }
         }}
       />
-    </div>
+    </>
   );
 }
 

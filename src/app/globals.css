@@ -1,5 +1,6 @@
 @import "tailwindcss";
 @import "tw-animate-css";
+@import "katex/dist/katex.min.css";
 
 @custom-variant dark (&:is(.dark *));
 
@@ -272,6 +273,7 @@
      pinned these to specific files + lines). Phase 2 will route these
      surfaces through the tokens; before then, the tokens just exist
      and produce no diff. */
+  --platform-surface-window: var(--background);
   --platform-surface-sidebar: color-mix(in oklch, var(--sidebar) 80%, transparent);
   --platform-surface-bar: var(--background);
   --platform-surface-popover: var(--popover);
@@ -307,7 +309,8 @@
 }
 
 .dark {
-  /* Dark sidebar surface — same alpha treatment, dark base. */
+  /* Dark shell surfaces — same alpha treatment, dark product bases. */
+  --platform-surface-window: var(--background);
   --platform-surface-sidebar: color-mix(in oklch, var(--sidebar) 80%, transparent);
   --platform-surface-bar: var(--background);
   --platform-surface-popover: var(--popover);
@@ -344,24 +347,12 @@ html[data-platform="darwin"][data-shell="electron"][data-platform-style="auto"] 
      intensity Apple uses in sidebar lists vs typical web row hovers. */
   --platform-hover-alpha: 0.7;
 
-  /* Round 28 — Codex review (2026-05-23) flipped the previous
-     "fully transparent sidebar lets vibrancy show through" model.
-     Problem with that model: Electron `BrowserWindow.vibrancy` is a
-     WINDOW-LEVEL material. A transparent sidebar then shares the
-     exact same NSVisualEffectView material as the empty gutter
-     outside it, so there is no visual seam between "card surface"
-     and "gutter background" — users can't perceive the sidebar as
-     a separate floating card no matter how many shadow / radius /
-     z-index passes we add.
-     Fix: give the sidebar its own translucent tint that sits ON TOP
-     of vibrancy. The fill is light enough to keep the vibrancy
-     readable underneath (wallpaper / window-behind tint still
-     bleeds through ~40%) but solid enough to create the "this is a
-     surface, that is gutter" contrast. Bar token stays transparent
-     because the topbar IS meant to read as part of the gutter, not
-     as a fourth floating card. Dark mode value is set under the
-     `.dark` selector below. */
-  --platform-surface-sidebar: color-mix(in oklch, white 58%, transparent);
+  /* Native-theme-synced shell: keep the outer shell fully transparent so
+     Electron's native material is visible. The sidebar gets only a light
+     tint: enough to retain the floating card seam, while leaving most of the
+     native blur/translucency visible. */
+  --platform-surface-window: transparent;
+  --platform-surface-sidebar: color-mix(in oklch, white 40%, transparent);
   --platform-surface-bar: transparent;
   --platform-surface-popover: color-mix(in oklch, var(--popover) 82%, transparent);
   --platform-surface-hud: color-mix(in oklch, var(--popover) 75%, transparent);
@@ -382,12 +373,12 @@ html[data-platform="darwin"][data-shell="electron"][data-platform-style="auto"] 
   --platform-traffic-light-offset-y: 0px;
 }
 
-/* Round 28 — dark-mode tint for the floating sidebar fill. Mirrors
-   the light value (white 58% over vibrancy) inverted to a soft
-   black tint that darkens vibrancy locally so the sidebar still
-   reads as a separate surface against a dark window backdrop. */
+/* Electron's nativeTheme now follows the app mode, so dark readability no
+   longer needs an opaque renderer-level window tint. Keep the outer shell
+   transparent and use the same low-alpha card treatment as light mode. */
 html.dark[data-platform="darwin"][data-shell="electron"][data-platform-style="auto"] {
-  --platform-surface-sidebar: color-mix(in oklch, black 28%, transparent);
+  --platform-surface-window: transparent;
+  --platform-surface-sidebar: color-mix(in oklch, var(--sidebar) 40%, transparent);
 }
 
 @layer base {
@@ -513,7 +504,7 @@ html.dark[data-platform="darwin"][data-shell="electron"][data-platform-style="au
   }
 
   html[data-platform="darwin"][data-shell="electron"][data-platform-style="auto"] body {
-    background-color: transparent;
+    background-color: var(--platform-surface-window);
   }
 
   /* Selection color — derives from primary */
@@ -576,12 +567,21 @@ html.dark[data-platform="darwin"][data-shell="electron"][data-platform-style="au
     font-style: normal;
   }
   .prose a {
-    color: var(--primary);
+    color: var(--color-blue-600);
     text-decoration: underline;
+    text-decoration-color: color-mix(in oklch, var(--color-blue-500) 40%, transparent);
     text-underline-offset: 2px;
   }
+  .prose a:hover {
+    color: var(--color-blue-700);
+    text-decoration-color: var(--color-blue-600);
+  }
   .dark .prose a {
-    color: var(--primary);
+    color: var(--color-blue-400);
+  }
+  .dark .prose a:hover {
+    color: var(--color-blue-300);
+    text-decoration-color: var(--color-blue-300);
   }
   .prose hr {
     border-color: var(--border);
@@ -699,6 +699,223 @@ html.dark[data-platform="darwin"][data-shell="electron"][data-platform-style="au
 }
 
 /*
+ * Markdown Live Preview. The document remains plain Markdown in CodeMirror;
+ * these classes style only decorations/widgets on inactive lines. Clicking a
+ * widget moves the selection to its source range, which removes the decoration
+ * and exposes the exact Markdown for editing.
+ */
+[data-markdown-editor] .cm-gutters {
+  display: none;
+}
+[data-markdown-editor] .cm-editor {
+  /*
+   * Markdown is a document/content surface, not a standalone code-theme
+   * canvas. Keep CodeMirror's syntax highlighting for the active source line,
+   * but pin the editor fill and base text to the same product tokens as the
+   * surrounding workspace/file-tree cards.
+   */
+  background-color: var(--background);
+  color: var(--foreground);
+}
+[data-markdown-editor] .cm-activeLine {
+  background: transparent !important;
+}
+[data-markdown-editor] .cm-content span {
+  text-decoration: none;
+}
+[data-markdown-editor] .cm-line > span:not([class*="cm-lp-"]) {
+  /*
+   * The default Markdown highlighter treats a leading `--- … ---`
+   * frontmatter block as a Setext heading and paints every metadata line
+   * bold + underlined. Live Preview supplies its own semantic typography,
+   * so neutralise that token style on undecorated top-level spans.
+   */
+  font-weight: inherit;
+}
+[data-markdown-editor] .cm-lp-heading {
+  color: var(--foreground);
+  font-family: var(--font-sans), system-ui, sans-serif;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  line-height: 1.35;
+  text-decoration: none;
+}
+[data-markdown-editor] .cm-lp-heading *,
+.cm-lp-strong * {
+  color: inherit;
+  font-weight: inherit;
+  text-decoration: inherit;
+}
+.cm-lp-h1 { font-size: 1.5rem; }
+.cm-lp-h2 { font-size: 1.25rem; }
+.cm-lp-h3 { font-size: 1.125rem; }
+.cm-lp-h4,
+.cm-lp-h5,
+.cm-lp-h6 { font-size: 1rem; }
+.cm-lp-strong {
+  color: var(--foreground);
+  font-size: inherit;
+  font-weight: 600;
+}
+.cm-lp-emphasis { font-style: italic; }
+[data-markdown-editor] .cm-content .cm-lp-strikethrough {
+  text-decoration: line-through;
+}
+.cm-lp-code {
+  border-radius: 0.25rem;
+  background: var(--muted);
+  padding: 0.1rem 0.35rem;
+  color: var(--foreground);
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 0.875em;
+}
+[data-markdown-editor] .cm-content .cm-lp-link,
+[data-markdown-editor] .cm-content .cm-lp-link * {
+  color: var(--primary);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in oklch, var(--primary) 35%, transparent);
+  text-underline-offset: 3px;
+}
+.cm-lp-list-marker,
+.cm-lp-quote-marker {
+  display: inline-block;
+  color: var(--muted-foreground);
+  font-family: var(--font-sans), system-ui, sans-serif;
+  user-select: none;
+}
+.cm-lp-list-marker {
+  min-width: 1.25rem;
+  margin-right: 0.125rem;
+  text-align: center;
+}
+.cm-lp-task-checkbox {
+  display: inline-flex;
+  width: 1.5rem;
+  align-items: center;
+  justify-content: center;
+  margin-right: 0.125rem;
+  vertical-align: -0.125em;
+}
+.cm-lp-task-checkbox input {
+  width: 0.875rem;
+  height: 0.875rem;
+  margin: 0;
+  accent-color: var(--primary);
+  opacity: 1;
+  pointer-events: none;
+}
+.cm-lp-quote-marker {
+  margin-right: 0.5rem;
+  color: var(--border);
+  font-weight: 700;
+}
+.cm-lp-rule {
+  display: inline-block;
+  width: min(100%, 44rem);
+  margin: 0.65rem 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+  vertical-align: middle;
+}
+.cm-lp-image {
+  display: inline-flex;
+  max-width: 100%;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin: 0.5rem 0;
+  vertical-align: top;
+}
+.cm-lp-image img {
+  display: block;
+  max-width: 100%;
+  max-height: 28rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  object-fit: contain;
+}
+.cm-lp-image-caption {
+  color: var(--muted-foreground);
+  font-size: 0.75rem;
+  text-align: center;
+}
+.cm-lp-block {
+  display: block;
+  box-sizing: border-box;
+  width: min(100%, 52rem);
+  margin: 0.65rem 0;
+  overflow: auto;
+  border: 1px solid color-mix(in oklch, var(--border) 70%, transparent);
+  border-radius: var(--radius-lg);
+  background: color-mix(in oklch, var(--muted) 20%, transparent);
+  color: var(--foreground);
+  font-family: var(--font-sans), system-ui, sans-serif;
+  white-space: normal;
+}
+.cm-lp-block-header {
+  padding: 0.4rem 0.75rem;
+  background: color-mix(in oklch, var(--muted) 45%, transparent);
+  color: var(--muted-foreground);
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 0.65rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.cm-lp-code-block pre {
+  margin: 0;
+  padding: 0.85rem;
+  overflow: auto;
+  background: transparent;
+  color: var(--foreground);
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 0.8125rem;
+  line-height: 1.55;
+  white-space: pre;
+}
+.cm-lp-table-wrap { padding: 0.5rem; }
+.cm-lp-table-wrap table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+}
+.cm-lp-table-wrap th,
+.cm-lp-table-wrap td {
+  padding: 0.45rem 0.65rem;
+  border-bottom: 1px solid color-mix(in oklch, var(--border) 65%, transparent);
+  text-align: left;
+}
+.cm-lp-table-wrap th {
+  background: color-mix(in oklch, var(--muted) 40%, transparent);
+  font-weight: 600;
+}
+.cm-lp-table-wrap tr:last-child td { border-bottom: 0; }
+.cm-lp-math-block,
+.cm-lp-mermaid {
+  padding: 1rem;
+  text-align: center;
+}
+.cm-lp-math-inline {
+  display: inline-block;
+  padding: 0 0.15rem;
+  vertical-align: middle;
+}
+.cm-lp-mermaid svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 0 auto;
+}
+.cm-lp-mermaid-loading {
+  color: var(--muted-foreground);
+  font-size: 0.75rem;
+}
+.cm-lp-render-error {
+  color: var(--destructive);
+  font-family: var(--font-mono), ui-monospace, monospace;
+  text-align: left;
+  white-space: pre-wrap;
+}
+
+/*
  * Obsidian-style callout blocks — Phase 4.A Markdown data layer.
  *
  * The callout pre-processor (src/lib/markdown/callout.ts) rewrites
@@ -731,95 +948,4 @@ html.dark[data-platform="darwin"][data-shell="electron"][data-platform-style="au
   color: var(--primary);
   text-decoration: underline dotted;
   cursor: pointer;
-}
-
-/*
- * Markdown presentation styles — Phase 4 UX.
- *
- * Applied in-place on the rendered Markdown body via a class on the
- * `.codepilot-md-body` wrapper. The Markdown file remains the source
- * of truth; switching styles is just a class change, no re-fetch,
- * no new artifact tab, no source replacement.
- *
- * Five styles + smooth transitions so the change feels intentional
- * rather than a flash.
- */
-.codepilot-md-body { transition: padding 150ms ease, font-family 150ms ease, color 150ms ease; }
-.codepilot-md-body :where(h1,h2,h3,h4,h5,h6) { transition: color 150ms ease, font-size 150ms ease, margin 150ms ease; }
-
-/* default — minimal, basically v0.54 look. No-op. */
-.codepilot-md-template-default {}
-
-/* article — wider line height, serif body, accent headings. */
-.codepilot-md-template-article {
-  font-family: 'Georgia', 'Times New Roman', 'Songti SC', 'STSong', serif;
-  line-height: 1.75;
-  color: var(--foreground);
-}
-.codepilot-md-template-article :where(h1, h2, h3, h4, h5, h6) {
-  font-family: system-ui, -apple-system, 'PingFang SC', sans-serif;
-  color: rgb(30 58 138); /* slate blue accent */
-  letter-spacing: -0.005em;
-}
-.dark .codepilot-md-template-article :where(h1, h2, h3, h4, h5, h6) {
-  color: rgb(147 197 253);
-}
-.codepilot-md-template-article :where(p, li) { margin-bottom: 0.7em; }
-
-/* report — sans body, dense, structured. */
-.codepilot-md-template-report {
-  font-family: system-ui, -apple-system, 'Helvetica Neue', 'PingFang SC', sans-serif;
-  line-height: 1.6;
-  font-size: 0.95rem;
-}
-.codepilot-md-template-report :where(h1, h2, h3, h4, h5, h6) {
-  color: rgb(15 118 110);
-  border-bottom: 1px solid rgba(15, 118, 110, 0.15);
-  padding-bottom: 0.25em;
-  margin-top: 1.5em;
-}
-.dark .codepilot-md-template-report :where(h1, h2, h3, h4, h5, h6) {
-  color: rgb(94 234 212);
-  border-bottom-color: rgba(94, 234, 212, 0.2);
-}
-
-/* brief — tight spacing, prominent intro. */
-.codepilot-md-template-brief {
-  font-family: system-ui, -apple-system, 'PingFang SC', sans-serif;
-  line-height: 1.55;
-}
-.codepilot-md-template-brief :where(h1) {
-  color: rgb(180 83 9);
-  font-size: 1.6rem;
-  margin-bottom: 0.5em;
-}
-.codepilot-md-template-brief :where(h2, h3, h4, h5, h6) {
-  color: rgb(180 83 9);
-  margin-top: 1em;
-  margin-bottom: 0.4em;
-}
-.dark .codepilot-md-template-brief :where(h1, h2, h3, h4, h5, h6) {
-  color: rgb(252 211 77);
-}
-.codepilot-md-template-brief :where(p) { margin-bottom: 0.5em; }
-
-/* pitch — large headings, accent banner via first h1. */
-.codepilot-md-template-pitch {
-  font-family: system-ui, -apple-system, 'PingFang SC', sans-serif;
-  line-height: 1.65;
-}
-.codepilot-md-template-pitch :where(h1):first-child {
-  font-size: 2.1rem;
-  color: rgb(124 58 237);
-  background: linear-gradient(90deg, rgba(124, 58, 237, 0.08) 0%, transparent 100%);
-  padding: 0.5em 0.75em;
-  margin-left: -0.75em;
-  border-radius: 4px;
-}
-.codepilot-md-template-pitch :where(h2, h3, h4, h5, h6) {
-  color: rgb(124 58 237);
-  font-weight: 600;
-}
-.dark .codepilot-md-template-pitch :where(h1, h2, h3, h4, h5, h6) {
-  color: rgb(196 181 253);
 }

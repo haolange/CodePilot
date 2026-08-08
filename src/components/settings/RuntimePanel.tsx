@@ -85,6 +85,7 @@ import {
 import type { TranslationKey } from "@/i18n";
 import type { ProviderOptions } from "@/types";
 import type { CodexAvailability } from "@/lib/codex/types";
+import type { RuntimeProbeSnapshot } from "@/lib/runtime-probe";
 import { cn } from "@/lib/utils";
 import Anthropic from "@lobehub/icons/es/Anthropic";
 import OpenAI from "@lobehub/icons/es/OpenAI";
@@ -121,6 +122,17 @@ interface RuntimeStatusInfo {
   reason: string;
   impact: string;
   recovery?: string; // omitted when no recovery is needed
+}
+
+function codexCliInstallRecovery(isZh: boolean, isWindowsElectron: boolean): string {
+  if (isWindowsElectron) {
+    return isZh
+      ? "在 PowerShell 运行 `irm https://chatgpt.com/codex/install.ps1 | iex` 安装独立 CLI，或设置 CODEX_BIN 后刷新"
+      : "Run `irm https://chatgpt.com/codex/install.ps1 | iex` in PowerShell, or set CODEX_BIN, then refresh";
+  }
+  return isZh
+    ? "按 Codex 官方文档安装适用于当前平台的 CLI，或设置 CODEX_BIN 指向自定义路径后刷新"
+    : "Install the Codex CLI using the official instructions for this platform, or set CODEX_BIN to a custom binary, then refresh";
 }
 
 // ---------------------------------------------------------------------------
@@ -439,8 +451,16 @@ export function RuntimePanel(props: RuntimePanelProps = {}) {
   // /api/codex/status is non-destructive (doesn't spawn the binary)
   // so the panel can keep state in sync with the user's environment.
   const [codexAvailability, setCodexAvailability] = useState<CodexAvailability>({ kind: "unknown" });
+  const [codexProbe, setCodexProbe] = useState<RuntimeProbeSnapshot | null>(null);
   const [codexStatusLoading, setCodexStatusLoading] = useState(false);
-  const [codexStatusTick, setCodexStatusTick] = useState(0);
+  const [codexRecoveryState, setCodexRecoveryState] = useState<
+    "idle" | "preparing" | "ready" | "copied_only" | "error"
+  >("idle");
+  const [codexRecoveryMethod, setCodexRecoveryMethod] = useState<"npm" | "standalone_script" | null>(null);
+  const [isWindowsElectron, setIsWindowsElectron] = useState(false);
+  useEffect(() => {
+    setIsWindowsElectron(window.electronAPI?.versions.platform === "win32");
+  }, []);
   useEffect(() => {
     let cancelled = false;
     setCodexStatusLoading(true);
@@ -450,6 +470,7 @@ export function RuntimePanel(props: RuntimePanelProps = {}) {
         const json = await res.json();
         if (!cancelled && json?.availability) {
           setCodexAvailability(json.availability as CodexAvailability);
+          setCodexProbe((json.probe as RuntimeProbeSnapshot | undefined) ?? null);
         }
       } catch (err) {
         if (!cancelled) {
@@ -463,9 +484,50 @@ export function RuntimePanel(props: RuntimePanelProps = {}) {
     return () => {
       cancelled = true;
     };
-  }, [codexStatusTick]);
-  const refreshCodexStatus = useCallback(() => setCodexStatusTick((t) => t + 1), []);
+  }, []);
+  const refreshCodexStatus = useCallback(async () => {
+    setCodexStatusLoading(true);
+    try {
+      // POST explicitly invalidates idle resolution/version/failure caches.
+      // The server keeps a healthy running app-server pinned, so this is safe
+      // to use while chats are active.
+      const res = await fetch("/api/codex/status", {
+        method: "POST",
+        cache: "no-store",
+      });
+      const json = await res.json();
+      if (json?.availability) {
+        setCodexAvailability(json.availability as CodexAvailability);
+        setCodexProbe((json.probe as RuntimeProbeSnapshot | undefined) ?? null);
+      }
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      setCodexAvailability({ kind: "spawn_failed", reason });
+    } finally {
+      setCodexStatusLoading(false);
+    }
+  }, []);
+  const prepareCodexWindowsRecovery = useCallback(async () => {
+    const action = window.electronAPI?.codex?.prepareWindowsRecovery;
+    if (!action) {
+      setCodexRecoveryState("error");
+      return;
+    }
+    setCodexRecoveryState("preparing");
+    try {
+      const result = await action();
+      setCodexRecoveryMethod(result.installMethod ?? null);
+      if (result.copied && result.opened) setCodexRecoveryState("ready");
+      else if (result.copied) setCodexRecoveryState("copied_only");
+      else setCodexRecoveryState("error");
+    } catch {
+      setCodexRecoveryState("error");
+    }
+  }, []);
   const codexConnected = codexAvailability.kind === "ready";
+  const codexBinary = "binary" in codexAvailability
+    ? codexAvailability.binary ?? null
+    : null;
 
   // ── Model options (env provider) — applies when Claude Code 引擎 selected ──
   const [thinkingMode, setThinkingMode] = useState("adaptive");
@@ -1020,18 +1082,29 @@ export function RuntimePanel(props: RuntimePanelProps = {}) {
    */
   const codexRuntimeStatus: RuntimeStatusInfo = useMemo(() => {
     const isSelected = effectiveRuntime === "codex_runtime";
+    const installRecovery = codexCliInstallRecovery(isZh, isWindowsElectron);
+    if (codexAvailability.kind === "desktop_only") {
+      return {
+        state: "blocked",
+        reason: isZh
+          ? "检测到 ChatGPT/Codex 桌面应用，但没有可供 CodePilot 启动的独立 Codex CLI"
+          : "The ChatGPT/Codex desktop app was found, but no standalone Codex CLI is executable by CodePilot",
+        impact: isZh
+          ? "桌面应用本身仍可使用；Codex Runtime 需要能启动 app-server 的 CLI，当前发送会失败"
+          : "The desktop app remains usable, but Codex Runtime needs a CLI that can launch app-server and sends will currently fail",
+        recovery: installRecovery,
+      };
+    }
     if (codexAvailability.kind === "not_installed") {
       return {
         state: "blocked",
         reason: isZh
-          ? "未在 PATH 上检测到 codex 命令"
-          : "codex binary not detected on PATH",
+          ? "未检测到可用的 Codex CLI"
+          : "No usable Codex CLI was detected",
         impact: isZh
           ? "Codex Runtime 整体无法启用：Codex 账户模型（gpt-5.5 等）和 CodePilot 服务商经 proxy 接入两条路径都会发送失败"
           : "Codex Runtime is fully blocked: both Codex Account models (gpt-5.5 etc.) and CodePilot providers via the proxy will fail at send time",
-        recovery: isZh
-          ? "按 Codex 官方指引安装 codex CLI，或设置 CODEX_BIN 指向自定义路径"
-          : "Install codex CLI per the official guide, or set CODEX_BIN to point at a custom binary",
+        recovery: installRecovery,
       };
     }
     if (codexAvailability.kind === "too_old") {
@@ -1053,7 +1126,7 @@ export function RuntimePanel(props: RuntimePanelProps = {}) {
         impact: isZh
           ? "Codex Runtime 整体不可用（Codex 账户模型 + CodePilot 服务商经 proxy 接入都受影响）；查看终端日志获取详细错误"
           : "Codex Runtime is fully unavailable (both Codex Account models and CodePilot providers via the proxy are blocked); check terminal logs for details",
-        recovery: isZh ? "点右上角刷新重试，或重启 CodePilot" : "Click refresh in the top right, or restart CodePilot",
+        recovery: isZh ? "点右上角刷新，重新扫描已安装的 CLI" : "Click refresh to rescan installed CLIs",
       };
     }
     if (codexAvailability.kind === "installed_idle") {
@@ -1095,7 +1168,7 @@ export function RuntimePanel(props: RuntimePanelProps = {}) {
       reason: isZh ? "正在检测 Codex 应用服务状态…" : "Detecting Codex app-server status…",
       impact: isZh ? "状态会在后台轮询后刷新" : "Status updates after background polling",
     };
-  }, [codexAvailability, effectiveRuntime, isZh]);
+  }, [codexAvailability, effectiveRuntime, isZh, isWindowsElectron]);
 
   /**
    * CodePilot Runtime is bundled and always available; the only thing
@@ -1299,6 +1372,8 @@ export function RuntimePanel(props: RuntimePanelProps = {}) {
                 ? (isZh ? "已就绪" : "Ready")
                 : codexAvailability.kind === "not_installed"
                   ? (isZh ? "未安装 codex CLI — 选用后无法发送" : "codex CLI not installed — sends will fail")
+                  : codexAvailability.kind === "desktop_only"
+                    ? (isZh ? "仅检测到桌面应用 — 需独立 CLI" : "Desktop app only — standalone CLI required")
                   : codexAvailability.kind === "installed_idle"
                     ? (isZh ? "已安装，可用" : "Installed, starts on demand")
                   : codexAvailability.kind === "spawn_failed"
@@ -1755,6 +1830,13 @@ export function RuntimePanel(props: RuntimePanelProps = {}) {
                     {isZh ? "未安装" : "Not installed"}
                   </span>
                 </>
+              ) : codexAvailability.kind === "desktop_only" ? (
+                <>
+                  <Warning size={14} weight="fill" className="text-status-warning-foreground" />
+                  <span className="text-xs text-muted-foreground">
+                    {isZh ? "仅桌面应用" : "Desktop app only"}
+                  </span>
+                </>
               ) : codexAvailability.kind === "installed_idle" ? (
                 <>
                   <CheckCircle size={14} className="text-status-success-foreground" />
@@ -1796,6 +1878,16 @@ export function RuntimePanel(props: RuntimePanelProps = {}) {
               </Button>
             </div>
           </div>
+          {codexBinary && (
+            <div className="py-2.5 flex items-start justify-between gap-3">
+              <span className="text-[11px] text-muted-foreground shrink-0">
+                {isZh ? "CLI 来源" : "CLI source"}
+              </span>
+              <span className="text-xs text-muted-foreground font-mono break-all text-right">
+                {codexBinary}
+              </span>
+            </div>
+          )}
           {codexAvailability.kind === "ready" && (
             <div className="py-2.5 flex items-center justify-between gap-3">
               <span className="text-[11px] text-muted-foreground shrink-0">
@@ -1806,7 +1898,95 @@ export function RuntimePanel(props: RuntimePanelProps = {}) {
               </span>
             </div>
           )}
+          {codexProbe && (
+            <>
+              <div className="py-2.5 flex items-center justify-between gap-3">
+                <span className="text-[11px] text-muted-foreground shrink-0">
+                  {isZh ? "候选来源" : "Candidate source"}
+                </span>
+                <span className="text-xs text-muted-foreground font-mono">
+                  {codexProbe.candidateSource}
+                </span>
+              </div>
+              <div className="py-2.5 flex items-start justify-between gap-3">
+                <span className="text-[11px] text-muted-foreground shrink-0">
+                  {isZh ? "沙盒就绪度" : "Sandbox readiness"}
+                </span>
+                <span className="text-xs text-muted-foreground text-right">
+                  {codexProbe.sandbox?.state === "setup"
+                    ? (isZh ? "setup 已完成；runner / 首个受限命令未验证" : "Setup completed; runner / first restricted command unverified")
+                    : codexProbe.sandbox?.state === "error"
+                        ? (isZh ? `错误 · ${codexProbe.sandbox.stage ?? "unknown"}` : `Error · ${codexProbe.sandbox.stage ?? "unknown"}`)
+                        : codexProbe.sandbox?.state === "degraded"
+                          ? (isZh ? `有警告 · ${codexProbe.sandbox.stage ?? "unknown"}` : `Warning · ${codexProbe.sandbox.stage ?? "unknown"}`)
+                          : codexProbe.sandbox?.state === "not_applicable"
+                            ? (isZh ? "等待可执行的独立 CLI" : "Waiting for an executable standalone CLI")
+                            : (isZh ? "未运行 / 无真实信号" : "Not run / no observed signal")}
+                </span>
+              </div>
+              <div className="py-2.5 flex items-start justify-between gap-3">
+                <span className="text-[11px] text-muted-foreground shrink-0">
+                  {isZh ? "诊断 CWD" : "Diagnostic CWD"}
+                </span>
+                <span className="text-xs text-muted-foreground font-mono break-all text-right">
+                  {codexProbe.cwd.resolved}
+                  <span className="block font-sans text-[10px]">
+                    {codexProbe.cwd.source} · {codexProbe.cwd.identity.kind}
+                  </span>
+                </span>
+              </div>
+            </>
+          )}
         </div>
+
+        {(codexAvailability.kind === "desktop_only" || codexAvailability.kind === "not_installed")
+          && isWindowsElectron && (
+          <div className="rounded-md border border-status-warning/30 bg-status-warning-muted/40 px-3.5 py-3 space-y-2.5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <p className="text-xs font-medium">
+                  {isZh ? "准备安装独立 Codex CLI" : "Prepare the standalone Codex CLI"}
+                </p>
+                <p className="text-[11px] text-muted-foreground mt-0.5">
+                  {t("runtime.codexRecoveryNoAutoRun")}
+                </p>
+                <p className="text-[11px] text-muted-foreground mt-0.5">
+                  {t("runtime.codexRecoveryNpmHint")}
+                </p>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1.5"
+                disabled={codexRecoveryState === "preparing"}
+                onClick={prepareCodexWindowsRecovery}
+              >
+                {codexRecoveryState === "preparing" && (
+                  <SpinnerGap size={14} className="animate-spin" />
+                )}
+                {codexRecoveryState === "preparing"
+                  ? t("runtime.codexRecoveryPreparing")
+                  : t("runtime.codexRecoveryAction")}
+              </Button>
+            </div>
+            {codexRecoveryState !== "idle" && codexRecoveryState !== "preparing" && (
+              <p className={cn(
+                "text-xs",
+                codexRecoveryState === "error"
+                  ? "text-destructive"
+                  : "text-status-success-foreground",
+              )} role="status">
+                {codexRecoveryState === "ready"
+                  ? codexRecoveryMethod === "npm"
+                    ? t("runtime.codexRecoveryReadyNpm")
+                    : t("runtime.codexRecoveryReady")
+                  : codexRecoveryState === "copied_only"
+                    ? t("runtime.codexRecoveryCopiedOnly")
+                    : t("runtime.codexRecoveryFailed")}
+              </p>
+            )}
+          </div>
+        )}
 
         {/* Jump links to where account / models live — keeps IA flat:
             Codex Account belongs in Providers, Codex Account models in

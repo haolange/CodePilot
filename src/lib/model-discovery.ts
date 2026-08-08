@@ -32,7 +32,7 @@
  * `applyDiscoveryDiff`'s manual_* guard, not at the discovery layer.
  */
 
-import { isCatalogOnlyPlanProvider, isOpenRouterProviderRecord } from './provider-catalog';
+import { isCatalogOnlyPlanProvider, isCatalogOnlyDiscoveryProvider, isOpenRouterProviderRecord } from './provider-catalog';
 
 export type DiscoveryClassification =
   /** Reliable public/compat endpoint we can probe with provided creds. */
@@ -139,7 +139,7 @@ export function classifyProvider(input: Pick<DiscoveryInput, 'protocol' | 'prese
   const protocol = input.protocol;
 
   // OAuth login flows / env-driven Claude Code don't expose a model list endpoint.
-  if (key === 'openai-oauth' || key === 'claude-code-env') {
+  if (key === 'openai-oauth' || key === 'xai-oauth' || key === 'claude-code-env') {
     return {
       classification: 'unsupported',
       protocol: 'unknown',
@@ -176,6 +176,20 @@ export function classifyProvider(input: Pick<DiscoveryInput, 'protocol' | 'prese
       protocol: 'unknown',
       notes: 'Coding/Token Plan exposes a SKU whitelist, not the full upstream catalog. Probing /v1/models would return non-plan models that error on use.',
       suggestedFallback: 'Use the curated catalog list shipped with the preset; surface "Add custom model" for SKU-whitelist additions.',
+    };
+  }
+
+  // Catalog-only discovery gateways (ClinePass, OpenCode Go). Same outcome as
+  // the plan gate above but a distinct trigger: these are not sdkProxyOnly
+  // plan presets, yet their model endpoint is key-gated (ClinePass) or a
+  // mixed-wire-protocol superset (OpenCode Go), so the shipped catalog is the
+  // only safe truth. Driven by `meta.modelDiscoveryMode: 'catalog_only'`.
+  if (isCatalogOnlyDiscoveryProvider(key)) {
+    return {
+      classification: 'unsupported',
+      protocol: 'unknown',
+      notes: 'Subscription gateway with catalog_only discovery — the model endpoint is key-gated or mixes wire protocols, so the shipped whitelist is authoritative.',
+      suggestedFallback: 'Use the curated catalog list shipped with the preset.',
     };
   }
 

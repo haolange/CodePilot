@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useSyncExternalStore } from "react";
 import { useRouter, usePathname } from "next/navigation";
 import {
   DotOutline,
@@ -29,6 +29,7 @@ import { useSplit } from "@/hooks/useSplit";
 import { useTranslation } from "@/hooks/useTranslation";
 import { useClientPlatform } from '@/hooks/useClientPlatform';
 import { copyWithToast } from "@/lib/clipboard";
+import { renameSession } from "@/lib/session-title-events";
 import type { TranslationKey } from "@/i18n";
 
 export function UnifiedTopBar() {
@@ -68,19 +69,11 @@ export function UnifiedTopBar() {
   const handleRename = useCallback(async (newTitle: string) => {
     const trimmed = newTitle.trim();
     if (!trimmed || !sessionId || trimmed === sessionTitle) return;
-    try {
-      const res = await fetch(`/api/chat/sessions/${sessionId}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: trimmed }),
-      });
-      if (res.ok) {
-        setSessionTitle(trimmed);
-        window.dispatchEvent(new CustomEvent('session-updated', { detail: { id: sessionId, title: trimmed } }));
-      }
-    } catch {
-      // Silent — fail-soft like the sidebar handler.
-    }
+    // Displays what the SERVER stored, not what we sent: PATCH canonicalizes
+    // (50-grapheme clamp, single-lined), so echoing `trimmed` would leave this
+    // bar disagreeing with the sidebar's copy of the same session.
+    const canonical = await renameSession(sessionId, trimmed);
+    if (canonical) setSessionTitle(canonical);
   }, [sessionId, sessionTitle, setSessionTitle]);
 
   const handleDelete = useCallback(async () => {
@@ -132,8 +125,11 @@ export function UnifiedTopBar() {
   // would briefly appear (server: chatListOpen=false → button shown)
   // and then disappear (client effect → chatListOpen=true), tripping
   // a hydration mismatch warning.
-  const [mounted, setMounted] = useState(false);
-  useEffect(() => { setMounted(true); }, []);
+  const mounted = useSyncExternalStore(
+    () => () => {},
+    () => true,
+    () => false,
+  );
   // Round 20 — single sidebar toggle button (open AND close). Used
   // to be a "reopen only" button that lived in the topbar; the
   // matching collapse button lived inside ChatListPanel. Round 20
@@ -255,14 +251,17 @@ export function UnifiedTopBar() {
                   size="sm"
                   className="h-7 max-w-[200px] px-2 text-xs font-normal text-muted-foreground hover:text-foreground"
                   onClick={() => {
-                    if (workingDirectory) {
-                      if (window.electronAPI?.shell?.openPath) {
-                        window.electronAPI.shell.openPath(workingDirectory);
+                    if (workingDirectory && sessionId) {
+                      if (window.electronAPI?.shell?.revealPath) {
+                        void window.electronAPI.shell.revealPath({
+                          path: workingDirectory,
+                          sessionId,
+                        });
                       } else {
                         fetch('/api/files/open', {
                           method: 'POST',
                           headers: { 'Content-Type': 'application/json' },
-                          body: JSON.stringify({ path: workingDirectory }),
+                          body: JSON.stringify({ path: workingDirectory, sessionId }),
                         }).catch(() => {});
                       }
                     }

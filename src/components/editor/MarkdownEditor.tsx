@@ -1,13 +1,57 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { EditorState, Compartment } from "@codemirror/state";
-import { EditorView, keymap } from "@codemirror/view";
-import { basicSetup } from "codemirror";
-import { markdown } from "@codemirror/lang-markdown";
+import {
+  EditorState,
+  Compartment,
+  type Extension,
+} from "@codemirror/state";
+import {
+  EditorView,
+  crosshairCursor,
+  dropCursor,
+  keymap,
+  rectangularSelection,
+} from "@codemirror/view";
+import { minimalSetup } from "codemirror";
+import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
+import { bracketMatching, indentOnInput } from "@codemirror/language";
 import { oneDark } from "@codemirror/theme-one-dark";
 import { indentWithTab } from "@codemirror/commands";
+import {
+  autocompletion,
+  closeBrackets,
+  closeBracketsKeymap,
+  completionKeymap,
+} from "@codemirror/autocomplete";
+import {
+  highlightSelectionMatches,
+  search,
+  searchKeymap,
+} from "@codemirror/search";
 import { useTheme } from "next-themes";
+import {
+  externalMarkdownValueSync,
+  markdownLivePreview,
+} from "@/components/editor/markdown-live-preview";
+
+export const markdownEditingExtensions: Extension = [
+  EditorState.allowMultipleSelections.of(true),
+  dropCursor(),
+  indentOnInput(),
+  bracketMatching(),
+  closeBrackets(),
+  autocompletion(),
+  rectangularSelection(),
+  crosshairCursor(),
+  search(),
+  highlightSelectionMatches(),
+  keymap.of([
+    ...closeBracketsKeymap,
+    ...searchKeymap,
+    ...completionKeymap,
+  ]),
+];
 
 /*
  * MarkdownEditor — Phase 4 replacement for the raw <textarea> in
@@ -34,6 +78,8 @@ export interface MarkdownEditorProps {
   onSave?: () => void;
   /** Optional filename shown via data-attribute (used for testing hooks). */
   filename?: string;
+  /** Session scope used to resolve relative Markdown image paths safely. */
+  sessionId?: string | null;
   /** Aria label for a11y; also shown as placeholder hint. */
   placeholder?: string;
   className?: string;
@@ -44,6 +90,7 @@ export function MarkdownEditor({
   onChange,
   onSave,
   filename,
+  sessionId,
   placeholder,
   className,
 }: MarkdownEditorProps) {
@@ -52,6 +99,7 @@ export function MarkdownEditor({
   // Compartment is stable across renders — store on ref init so we don't
   // create a new one on every render (which would cause reconfigure loops).
   const themeCompartment = useRef(new Compartment()).current;
+  const livePreviewCompartment = useRef(new Compartment()).current;
   const onChangeRef = useRef(onChange);
   const onSaveRef = useRef(onSave);
   const { resolvedTheme } = useTheme();
@@ -72,11 +120,30 @@ export function MarkdownEditor({
     if (!hostRef.current || viewRef.current) return;
 
     const baseTheme = EditorView.theme({
-      "&": { height: "100%", fontSize: "13px" },
-      ".cm-scroller": {
-        fontFamily: "var(--font-mono, ui-monospace, monospace)",
+      "&": {
+        height: "100%",
+        minWidth: "0",
+        width: "100%",
+        fontSize: "14px",
       },
-      ".cm-content": { padding: "12px" },
+      ".cm-scroller": {
+        fontFamily: "var(--font-sans, system-ui, sans-serif)",
+        maxWidth: "100%",
+        overflow: "auto",
+      },
+      ".cm-content": {
+        boxSizing: "border-box",
+        minWidth: "0",
+        width: "100%",
+        maxWidth: "100%",
+        padding: "16px 18px",
+      },
+      ".cm-line": {
+        lineHeight: "1.75rem",
+        overflowWrap: "anywhere",
+        whiteSpace: "pre-wrap",
+        wordBreak: "break-word",
+      },
       "&.cm-focused": { outline: "none" },
     });
 
@@ -93,14 +160,26 @@ export function MarkdownEditor({
     ]);
 
     const initialTheme = resolvedTheme === "dark" ? oneDark : [];
+    const livePreview = isMarkdownFilename(filename)
+      ? markdownLivePreview({ filename, sessionId })
+      : [];
 
     const state = EditorState.create({
       doc: value,
       extensions: [
-        basicSetup,
-        markdown(),
+        // `basicSetup` also installs line numbers, a fold gutter and active-
+        // line highlighting. Live Preview is a document surface rather than
+        // a code editor, so start from the gutter-free setup, then restore
+        // the non-visual editing affordances users already had.
+        minimalSetup,
+        markdownEditingExtensions,
+        // Use the package's extended parser (GFM tables, task lists, etc.).
+        // markdown() defaults to CommonMark and silently parses pipe tables as
+        // paragraphs, which would make Live Preview lose table parity.
+        markdown({ base: markdownLanguage }),
         baseTheme,
         themeCompartment.of(initialTheme),
+        livePreviewCompartment.of(livePreview),
         saveKeymap,
         EditorView.lineWrapping,
         EditorView.updateListener.of((u) => {
@@ -109,13 +188,29 @@ export function MarkdownEditor({
       ],
     });
 
-    viewRef.current = new EditorView({ state, parent: hostRef.current });
+    const view = new EditorView({ state, parent: hostRef.current });
+    viewRef.current = view;
+
+    // The workspace sidebar is continuously resizable. CodeMirror normally
+    // observes its own DOM, but a flex ancestor changing width can leave line
+    // wrapping measured against the previous geometry until another input or
+    // fast resize occurs. Observe the actual host and explicitly request a
+    // measure so slow drags and programmatic sidebar changes wrap immediately.
+    let measureFrame = 0;
+    const resizeObserver = new ResizeObserver(() => {
+      cancelAnimationFrame(measureFrame);
+      measureFrame = requestAnimationFrame(() => view.requestMeasure());
+    });
+    resizeObserver.observe(hostRef.current);
+
     return () => {
-      viewRef.current?.destroy();
+      resizeObserver.disconnect();
+      cancelAnimationFrame(measureFrame);
+      view.destroy();
       viewRef.current = null;
     };
     // Intentional single-run — subsequent prop changes propagate via
-    // dedicated effects (value / theme).
+    // dedicated effects (value / theme / Live Preview options).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -125,12 +220,8 @@ export function MarkdownEditor({
   useEffect(() => {
     const view = viewRef.current;
     if (!view) return;
-    const cur = view.state.doc.toString();
-    if (cur !== value) {
-      view.dispatch({
-        changes: { from: 0, to: cur.length, insert: value },
-      });
-    }
+    const spec = externalMarkdownValueSync(view.state, value);
+    if (spec) view.dispatch(spec);
   }, [value]);
 
   // Theme compartment swap — no EditorView rebuild, no cursor loss.
@@ -144,12 +235,32 @@ export function MarkdownEditor({
     });
   }, [resolvedTheme, themeCompartment]);
 
+  // A PreviewPanel instance may stay mounted while the active file changes.
+  // Reconfigure the resolver so relative images always belong to the current
+  // Markdown file/session without rebuilding the EditorView or losing history.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: livePreviewCompartment.reconfigure(
+        isMarkdownFilename(filename)
+          ? markdownLivePreview({ filename, sessionId })
+          : [],
+      ),
+    });
+  }, [filename, sessionId, livePreviewCompartment]);
+
   return (
     <div
       ref={hostRef}
       className={className ?? "h-full w-full overflow-hidden"}
       data-filename={filename}
+      data-markdown-editor={isMarkdownFilename(filename) || undefined}
       aria-label={placeholder}
     />
   );
+}
+
+function isMarkdownFilename(filename: string | undefined): boolean {
+  return !!filename && /\.(?:md|mdx)$/i.test(filename);
 }

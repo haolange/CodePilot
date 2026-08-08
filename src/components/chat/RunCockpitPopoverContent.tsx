@@ -27,6 +27,7 @@ import { useCallback, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { useTranslation } from "@/hooks/useTranslation";
 import type { TranslationKey } from "@/i18n";
+import type { SessionPermissionProfile } from "@/lib/permission/profile";
 import { useClaudeStatus } from "@/hooks/useClaudeStatus";
 import { ContextContentFooter } from "@/components/ai-elements/context";
 import { ContextBreakdownList } from "@/components/chat/context-breakdown/ContextBreakdownList";
@@ -67,7 +68,7 @@ export interface RunCockpitPopoverContentProps {
   /** Resolved upstream model ID for context-window lookup display. */
   upstreamModelId?: string;
   /** Active chat's permission profile. */
-  permissionProfile: "default" | "full_access";
+  permissionProfile: SessionPermissionProfile;
   /** Step 4c round 4 — session-level runtime pin. Same semantics as
    *  before; suppresses global pinned/runtime-fallback signals because
    *  the user has explicitly opted out of the global default. */
@@ -112,7 +113,7 @@ export function RunCockpitPopoverContent({
     state.cliEnabled,
     cliConnected,
   );
-  const isNonAnthropicProvider = providerId === "openai-oauth";
+  const isNonAnthropicProvider = providerId === "openai-oauth" || providerId === "xai-oauth";
   // Round 4 — session-level runtime override. When the user has
   // explicitly pinned a runtime via the composer's RuntimeSelector,
   // this surface must reflect THAT runtime, not the global setting.
@@ -277,6 +278,9 @@ export function RunCockpitPopoverContent({
         <span
           className={cn(
             "min-w-0 flex-1 truncate text-right",
+            // Only the bypass reads as an alarm. auto_review is elevated but
+            // reviewed — colouring it red would tell the user it's the same
+            // risk as full access.
             permissionProfile === "full_access"
               ? "text-status-error-foreground"
               : "text-foreground",
@@ -284,7 +288,9 @@ export function RunCockpitPopoverContent({
         >
           {permissionProfile === "full_access"
             ? t("runStatus.permissionFullAccess" as TranslationKey)
-            : t("runStatus.permissionDefault" as TranslationKey)}
+            : permissionProfile === "auto_review"
+              ? t("runStatus.permissionAutoReview" as TranslationKey)
+              : t("runStatus.permissionDefault" as TranslationKey)}
         </span>
       </div>
     </div>
@@ -330,9 +336,13 @@ export function RunCockpitPopoverContent({
     // below, the Progress bar duplicated the same information visually.
     // Inline the header text (no Progress bar) so Context section shows
     // exactly one bar — the dot-matrix.
+    // hasFullCtx (the prop) already requires a trusted window; clamp ≤100%
+    // so a trusted-but-momentarily-exceeded window (post-compaction) never
+    // renders ">100%" (#632).
+    const clampedRatio = Math.min(1, Math.max(0, usage.ratio));
     const headerPercentText =
       usage.contextWindow && usage.contextWindow > 0
-        ? `${(usage.ratio * 100).toFixed(usage.ratio < 0.1 ? 1 : 0)}%`
+        ? `${(clampedRatio * 100).toFixed(clampedRatio < 0.1 ? 1 : 0)}%`
         : "";
     const headerTokensText = `${formatTokensCompact(usage.used)} / ${formatTokensCompact(usage.contextWindow ?? 0)}`;
     // UI review 2026-05-19: previously the popover divided children with

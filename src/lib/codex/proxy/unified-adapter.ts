@@ -39,6 +39,7 @@ import { translateNonStreamResponse } from './translate-response';
 import { encodeEvent, encodeDone, makeFailureStream } from './sse';
 import { makeErrorResult, classifyUpstreamError } from './errors';
 import { createCodePilotBuiltinTools } from './builtin-bridge';
+import { isManagedCodexSubagentSession } from '@/lib/codex/subagent';
 import { adaptForCodexProxy } from '@/lib/harness/runtime-adapter';
 import { platformCommandGuidance } from '@/lib/platform';
 import type { ResponsesAdapter } from './adapter';
@@ -47,11 +48,42 @@ import type {
   ResponsesRequestBody,
   ProxyResult,
 } from './types';
+import { buildXaiProviderOptions } from '@/lib/xai-provider-options';
+import { buildCodexSubagentRunContext } from '@/lib/subagent-run-context';
+import { anthropic } from '@ai-sdk/anthropic';
+import { openai } from '@ai-sdk/openai';
+import type { AiSdkConfig } from '@/lib/provider-resolver';
+import type { ClassifiedNonFunctionTool } from './types';
+import {
+  translateCodexNamespaceTools,
+  type CodexNamespaceToolRoute,
+} from './namespace-tools';
+import {
+  buildXaiHostedSearchTools,
+  mergeHostedTools,
+  XAI_X_SEARCH_SYSTEM_GUIDANCE,
+} from '@/lib/xai-hosted-search';
+import { emitBuiltinEvent } from '@/lib/harness/builtin-event-bus';
+import { makeToolCompleted, makeToolStarted } from '@/lib/runtime/event-adapter';
+import type { ProviderCallScene } from '@/lib/provider-call-policy';
+import { sanitizeClaudeModelOptions } from '@/lib/claude-model-options';
+import { buildAnthropicProviderOptions } from '@/lib/agent-loop-anthropic-wire';
 
 /** JSON value type matching ai-sdk's SharedV3ProviderOptions inner. */
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 type JsonObject = { [key: string]: JsonValue };
 type AiProviderOptions = Record<string, JsonObject>;
+
+function harnessPromptFromResponsesBody(body: ResponsesRequestBody): string {
+  return body.input
+    .filter((item) => item.type === 'message' && item.role === 'user')
+    .flatMap((item) => item.type === 'message'
+      ? item.content
+        .filter((block) => block.type === 'input_text')
+        .map((block) => block.type === 'input_text' ? block.text : '')
+      : [])
+    .join('\n');
+}
 
 /**
  * Build the unified adapter. The family parameter is accepted but
@@ -68,19 +100,29 @@ export function createUnifiedAdapter(family: string): ResponsesAdapter {
     // 1. Resolve the LanguageModel via the same factory native uses.
     //    Pass the RAW targetProviderId from the inbound header — NOT
     //    `resolved.provider?.id` — so virtual providers like
-    //    `openai-oauth` (which have `resolved.provider === undefined`)
+    //    `openai-oauth` / `xai-oauth` (which have
+    //    `resolved.provider === undefined`)
     //    flow through to ai-provider.ts's per-virtual-id branches
     //    (createOpenAI with Codex endpoint + OAuth fetch, etc.).
     //    Dropping the id here was the original Phase 5b P0 bug: the
     //    proxy route accepted openai-oauth then silently fell back to
     //    the default provider inside createModel.
     let languageModel: LanguageModel;
+    let modelConfig: AiSdkConfig;
+    let isThirdPartyProxy = false;
+    const callScene: ProviderCallScene = isManagedCodexSubagentSession(input.sessionId)
+      ? 'delegated_interactive'
+      : 'interactive_chat';
     try {
       const created = createModel({
+        callScene,
         providerId: input.targetProviderId,
         model: input.body.model,
+        runtime: 'codex_runtime',
       });
       languageModel = created.languageModel;
+      modelConfig = created.config;
+      isThirdPartyProxy = created.isThirdPartyProxy;
     } catch (err) {
       const classified = classifyUpstreamError(err);
       return makeErrorResult(classified.code, classified.message, {
@@ -131,7 +173,29 @@ export function createUnifiedAdapter(family: string): ResponsesAdapter {
         : 'invalid_request';
       return makeErrorResult(code, message, { family });
     }
-    const tools: ToolSet | undefined = mergeToolSets(codexTools, bridge.tools);
+    const namespaceTools = translateCodexNamespaceTools(input.body.passthroughTools);
+    let hostedSearchTools: ToolSet;
+    let tools: ToolSet | undefined;
+    try {
+      hostedSearchTools = buildCodexHostedSearchTools(
+        input.body.passthroughTools,
+        modelConfig,
+        isThirdPartyProxy,
+        callScene,
+      );
+      tools = mergeToolSets(
+        codexTools,
+        namespaceTools.tools,
+        bridge.tools,
+        hostedSearchTools,
+      );
+    } catch (err) {
+      return makeErrorResult(
+        'invalid_request',
+        err instanceof Error ? err.message : String(err),
+        { family },
+      );
+    }
 
     // Phase 5d Phase 3 (2026-05-17) — capability prompt assembly +
     // stopWhen / builtinToolNames hints routed through the Runtime
@@ -143,10 +207,11 @@ export function createUnifiedAdapter(family: string): ResponsesAdapter {
     // mounted so the compiler can't disagree with which tools the
     // model sees (workspace-gated memory tools drop out of both
     // sides naturally when `workspacePath` is empty). The suppression
-    // set passed to translate-stream stays as `bridge.toolNames`
-    // (the authoritative "what ai-sdk actually executed" surface) —
-    // the adapter's `builtinToolNames` hint is the catalog-derived
-    // mirror and could differ if a future catalog drift sneaks in.
+    // Runtime prompt/step hints remain adapter-owned. Stream suppression is
+    // deliberately the union of that catalog hint and the concrete tools
+    // executed in this adapter (`bridge.toolNames` + hosted tools): an
+    // executed bridge call must never be echoed to app-server, even when the
+    // capability catalog has no entry for it (for example Sub-agent spawn).
     const bridgeMounted = bridge.toolNames.size > 0;
     // Phase 5e review fix P1 #2 (2026-05-18) — scan User + External
     // Harness extensions and pass through the adapter so the model
@@ -163,6 +228,9 @@ export function createUnifiedAdapter(family: string): ResponsesAdapter {
     let externalExtensions: ReturnType<
       typeof import('@/lib/harness/external-framework-harness').scanExternalFrameworkExtensions
     > = [];
+    let canonicalHarness: import(
+      '@/lib/harness-home/runtime/repository-projection'
+    ).CanonicalRuntimeHarness | undefined;
     try {
       const { scanUserCodePilotExtensions } = await import(
         '@/lib/harness/user-codepilot-extensions'
@@ -180,6 +248,29 @@ export function createUnifiedAdapter(family: string): ResponsesAdapter {
         activeFramework: 'codex',
       });
     } catch { /* best effort */ }
+    try {
+      const { loadConfiguredHarnessHome } = await import(
+        '@/lib/harness-home/runtime/configured'
+      );
+      const configured = loadConfiguredHarnessHome('codex_runtime', {
+        userPrompt: harnessPromptFromResponsesBody(input.body),
+        projectId: input.workspacePath || undefined,
+      });
+      if (configured.status === 'loaded') {
+        canonicalHarness = configured.harness;
+      } else if (configured.status === 'unavailable') {
+        console.warn('[harness-home] Canonical projection unavailable', {
+          runtimeId: 'codex_runtime',
+          root: configured.root,
+          reason: configured.reason,
+        });
+      }
+    } catch (error) {
+      console.warn('[harness-home] Canonical projection failed', {
+        runtimeId: 'codex_runtime',
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
 
     const adapted = adaptForCodexProxy({
       sessionId: input.sessionId || 'codex-anonymous',
@@ -192,31 +283,96 @@ export function createUnifiedAdapter(family: string): ResponsesAdapter {
         : new Set<string>(),
       userExtensions,
       externalExtensions,
+      canonicalHarness,
     });
+    // Both bridge tools and provider-hosted tools are completed inside this
+    // adapter. They must never be echoed back to Codex as function calls:
+    // app-server owns neither name and would answer "unsupported call".
+    const bridgeOwnedToolNames = new Set([
+      ...adapted.builtinToolNames,
+      ...bridge.toolNames,
+    ]);
+    const providerExecutedToolNames = new Set([
+      ...Object.keys(hostedSearchTools),
+    ]);
     // #28: append the platform shell-dialect hint (no-op off Windows-PowerShell)
     // so Codex emits PowerShell-compatible commands on Windows.
-    const bridgePrompt = [adapted.systemPromptInstructions, platformCommandGuidance()]
+    let subagentRunContext = '';
+    if (bridge.toolNames.has('codepilot_list_subagent_runs')) {
+      try {
+        subagentRunContext = buildCodexSubagentRunContext(input.sessionId);
+      } catch (error) {
+        console.warn('[codex.proxy.subagent-runs] Failed to load durable lifecycle snapshot', {
+          sessionId: input.sessionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        subagentRunContext = [
+          'CodePilot managed Sub-agent lifecycle storage is currently unavailable.',
+          'Do not claim that a Sub-agent is running or completed, and do not infer progress from update_plan, assistant narration, elapsed time, or workspace files.',
+          'Tell the user the status cannot be verified and ask them to retry after local storage recovers.',
+        ].join('\n');
+      }
+    }
+    const managedDelegationInstruction = bridge.toolNames.has('codepilot_spawn_subagent')
+      ? [
+          'CodePilot managed delegation rule: codepilot_spawn_subagent is the only Sub Agent entry point in this proxied Codex thread.',
+          'Call it directly once per requested child. Do not call or simulate multi_agent_v1, spawn_agent, wait_agent, resume_agent, or close_agent around it.',
+          'A native Codex worker inherits the wrong Provider/Model route here and would create an extra, misleading Agent run.',
+        ].join(' ')
+      : '';
+    const bridgePrompt = [
+      adapted.systemPromptInstructions,
+      subagentRunContext,
+      managedDelegationInstruction,
+      Object.prototype.hasOwnProperty.call(hostedSearchTools, 'x_search')
+        ? XAI_X_SEARCH_SYSTEM_GUIDANCE
+        : '',
+      platformCommandGuidance(),
+    ]
       .filter((s) => s.length > 0)
       .join('\n\n');
 
     // Splice the compiler prompt into the request body's
-    // `instructions`. `buildMessages` below reads
-    // `body.instructions` and prepends it as a `system` message, so
-    // mutating the body here is what guarantees the prompt reaches
-    // the `messages[]` channel that non-Responses providers see.
+    // `instructions`. `buildPrompt` below merges `body.instructions`
+    // (plus any system/developer input items) into the AI SDK 7
+    // `instructions` OPTION — ai@7 forbids system messages inside
+    // `messages`, so the option is the only channel for system text
+    // and the SDK forwards it per provider (system message for chat
+    // skins, top-level instructions for Responses).
     const bodyWithBridgePrompt = bridgePrompt.length > 0
       ? { ...input.body, instructions: combineInstructions(input.body.instructions, bridgePrompt) }
       : input.body;
 
     let messages: ModelMessage[];
+    let instructions: string | undefined;
     try {
-      messages = buildMessages(bodyWithBridgePrompt);
+      ({ instructions, messages } = buildPrompt(bodyWithBridgePrompt));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       return makeErrorResult('invalid_request', message, { family });
     }
 
-    const providerOptions = buildProviderOptions(bodyWithBridgePrompt);
+    const providerOptions = buildProviderOptions(
+      bodyWithBridgePrompt,
+      {
+        ...(modelConfig.sdkType === 'anthropic' || modelConfig.sdkType === 'claude-code-compat'
+          ? {
+              anthropic: {
+                model: modelConfig.modelId,
+                isThirdPartyProxy,
+                verifiedEffortLevels: modelConfig.verifiedAnthropicEffortLevels,
+              },
+            }
+          : {}),
+        ...(modelConfig.verifiedResponsesEffortLevels
+          ? {
+              responses: {
+                verifiedEffortLevels: modelConfig.verifiedResponsesEffortLevels,
+              },
+            }
+          : {}),
+      },
+    );
     const wantsStream = input.body.stream !== false;
 
     // Phase 5d Phase 3 review fix #1 (2026-05-17) — Path inputs read
@@ -232,14 +388,18 @@ export function createUnifiedAdapter(family: string): ResponsesAdapter {
         responseId,
         body: bodyWithBridgePrompt,
         languageModel,
+        instructions,
         messages,
         tools,
-        builtinToolNames: adapted.builtinToolNames,
+        builtinToolNames: bridgeOwnedToolNames,
         stopWhen: adapted.stopWhen,
         stepCount: adapted.stepCount,
+        providerExecutedToolNames,
         providerOptions,
         signal: input.signal,
         family,
+        namespaceToolRoutes: namespaceTools.routes,
+        sessionId: input.sessionId,
       });
     }
 
@@ -247,14 +407,18 @@ export function createUnifiedAdapter(family: string): ResponsesAdapter {
       responseId,
       body: bodyWithBridgePrompt,
       languageModel,
+      instructions,
       messages,
       tools,
-      builtinToolNames: adapted.builtinToolNames,
+      builtinToolNames: bridgeOwnedToolNames,
       stopWhen: adapted.stopWhen,
       stepCount: adapted.stepCount,
+      providerExecutedToolNames,
       providerOptions,
       signal: input.signal,
       family,
+      namespaceToolRoutes: namespaceTools.routes,
+      sessionId: input.sessionId,
     });
   };
 }
@@ -266,9 +430,41 @@ export function createUnifiedAdapter(family: string): ResponsesAdapter {
  * "no tools" signal (it distinguishes `tools: undefined` from
  * `tools: {}` in some places).
  */
-function mergeToolSets(codex: ToolSet | undefined, bridge: ToolSet): ToolSet | undefined {
-  const merged: ToolSet = { ...(codex ?? {}), ...bridge };
+function mergeToolSets(
+  codex: ToolSet | undefined,
+  namespace: ToolSet,
+  bridge: ToolSet,
+  hosted: ToolSet = {},
+): ToolSet | undefined {
+  const clientTools: ToolSet = { ...(codex ?? {}), ...namespace, ...bridge };
+  const merged = mergeHostedTools(clientTools, hosted);
   return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+/**
+ * Codex describes provider-hosted search as a non-function `web_search`
+ * tool. The proxy used to preserve that descriptor for diagnostics and then
+ * drop it, so both parent and managed child could see a search affordance
+ * that the selected provider never received. Translate it only for SDK
+ * families with a real hosted-search implementation.
+ */
+export function buildCodexHostedSearchTools(
+  passthrough: readonly ClassifiedNonFunctionTool[] | undefined,
+  config: Pick<AiSdkConfig, 'sdkType' | 'useResponsesApi'>,
+  isThirdPartyProxy = false,
+  callScene: ProviderCallScene = 'interactive_chat',
+): ToolSet {
+  if (config.sdkType === 'xai') {
+    return buildXaiHostedSearchTools(config, callScene);
+  }
+  if (!passthrough?.some(tool => tool.rawType === 'web_search')) return {};
+  if (config.sdkType === 'openai' && config.useResponsesApi) {
+    return { web_search: openai.tools.webSearch() };
+  }
+  if (config.sdkType === 'anthropic' && !isThirdPartyProxy) {
+    return { web_search: anthropic.tools.webSearch_20250305() };
+  }
+  return {};
 }
 
 /**
@@ -317,6 +513,9 @@ interface PathInput {
   responseId: string;
   body: ResponsesRequestBody;
   languageModel: LanguageModel;
+  /** System text for the AI SDK 7 `instructions` option — ai@7 rejects
+   *  system messages inside `messages`, so this is the only channel. */
+  instructions: string | undefined;
   messages: ModelMessage[];
   tools: ToolSet | undefined;
   /** Names belonging to the bridge — Codex doesn't need their
@@ -325,6 +524,11 @@ interface PathInput {
    *  from `adaptForCodexProxy().builtinToolNames` so the value is
    *  the catalog-derived single source, not a bridge-local copy. */
   builtinToolNames: ReadonlySet<string>;
+  /** Hosted provider tools (for example xAI x_search) are also
+   *  executed upstream, but are deliberately kept separate from
+   *  `builtinToolNames`: the latter is owned by the Runtime
+   *  Capability Adapter and must remain its exact output. */
+  providerExecutedToolNames: ReadonlySet<string>;
   /** AI SDK multi-step ceiling decision. Sourced from
    *  `adaptForCodexProxy().stopWhen`; the compiler decides this based
    *  on whether any built-in capability is enabled. */
@@ -336,6 +540,8 @@ interface PathInput {
   providerOptions: AiProviderOptions | undefined;
   signal: AbortSignal;
   family: string;
+  namespaceToolRoutes: ReadonlyMap<string, CodexNamespaceToolRoute>;
+  sessionId: string;
 }
 
 /**
@@ -362,12 +568,33 @@ function buildStopWhen(
 }
 
 function streamPath(args: PathInput): ProxyResult {
-  const { responseId, body, languageModel, messages, tools, builtinToolNames, stopWhen, stepCount, providerOptions, signal, family } = args;
+  const {
+    responseId,
+    body,
+    languageModel,
+    instructions,
+    messages,
+    tools,
+    builtinToolNames,
+    providerExecutedToolNames,
+    stopWhen,
+    stepCount,
+    providerOptions,
+    signal,
+    family,
+    namespaceToolRoutes,
+    sessionId,
+  } = args;
+  const suppressedToolNames = new Set([
+    ...builtinToolNames,
+    ...providerExecutedToolNames,
+  ]);
 
   let result: ReturnType<typeof streamText>;
   try {
     result = streamText({
       model: languageModel,
+      ...(instructions ? { instructions } : {}),
       messages,
       tools,
       providerOptions,
@@ -398,7 +625,28 @@ function streamPath(args: PathInput): ProxyResult {
           responseId,
           body,
           source: result.fullStream,
-          builtinToolNames,
+          builtinToolNames: suppressedToolNames,
+          providerExecutedToolNames,
+          namespaceToolRoutes,
+          onProviderToolEvent: (event) => {
+            if (!sessionId) return;
+            const base = { runtimeId: 'codex_runtime' as const, sessionId };
+            emitBuiltinEvent(
+              sessionId,
+              event.type === 'started'
+                ? makeToolStarted(base, {
+                    toolId: event.toolId,
+                    name: event.name,
+                    input: event.input,
+                  })
+                : makeToolCompleted(base, {
+                    toolId: event.toolId,
+                    output: event.output,
+                    error: event.error,
+                    sources: event.sources,
+                  }),
+            );
+          },
         });
         for await (const event of events) {
           controller.enqueue(encodeEvent(event));
@@ -432,10 +680,30 @@ function streamPath(args: PathInput): ProxyResult {
 }
 
 async function nonStreamPath(args: PathInput): Promise<ProxyResult> {
-  const { responseId, body, languageModel, messages, tools, builtinToolNames, stopWhen, stepCount, providerOptions, signal, family } = args;
+  const {
+    responseId,
+    body,
+    languageModel,
+    instructions,
+    messages,
+    tools,
+    builtinToolNames,
+    providerExecutedToolNames,
+    stopWhen,
+    stepCount,
+    providerOptions,
+    signal,
+    family,
+    namespaceToolRoutes,
+  } = args;
+  const suppressedToolNames = new Set([
+    ...builtinToolNames,
+    ...providerExecutedToolNames,
+  ]);
   try {
     const result = await generateText({
       model: languageModel,
+      ...(instructions ? { instructions } : {}),
       messages,
       tools,
       providerOptions,
@@ -459,7 +727,8 @@ async function nonStreamPath(args: PathInput): Promise<ProxyResult> {
         totalUsage: result.totalUsage,
         usage: result.usage,
       },
-      builtinToolNames,
+      builtinToolNames: suppressedToolNames,
+      namespaceToolRoutes,
     });
     return { kind: 'json', body: responseBody };
   } catch (err) {
@@ -471,13 +740,36 @@ async function nonStreamPath(args: PathInput): Promise<ProxyResult> {
   }
 }
 
-/** Prepend the `instructions` system message if Codex supplied one. */
-function buildMessages(body: ResponsesRequestBody): ModelMessage[] {
+/**
+ * Split the prompt for AI SDK 7: system text must travel via the
+ * `instructions` OPTION — ai@7 rejects `role: 'system'` inside `messages`
+ * ("System messages are not allowed in the prompt or messages fields.
+ * Use the instructions option instead."). Merged into `instructions`
+ * in order: Codex's top-level `body.instructions`, then any
+ * system/developer items translated out of `body.input` (translate-input
+ * emits those as role:'system'; they are extracted here at the single
+ * choke point before streamText/generateText). Exported for unit tests.
+ */
+export function buildPrompt(body: ResponsesRequestBody): {
+  instructions: string | undefined;
+  messages: ModelMessage[];
+} {
   const translated = translateResponsesInput(body.input);
+  const systemParts: string[] = [];
   if (body.instructions && body.instructions.length > 0) {
-    return [{ role: 'system', content: body.instructions }, ...translated];
+    systemParts.push(body.instructions);
   }
-  return translated;
+  const messages = translated.filter((m) => {
+    if (m.role === 'system') {
+      systemParts.push(typeof m.content === 'string' ? m.content : JSON.stringify(m.content));
+      return false;
+    }
+    return true;
+  });
+  return {
+    instructions: systemParts.length > 0 ? systemParts.join('\n\n') : undefined,
+    messages,
+  };
 }
 
 /**
@@ -496,8 +788,34 @@ function buildMessages(body: ResponsesRequestBody): ModelMessage[] {
 /** Exported for unit testing — see codex-proxy-translators.test.ts. */
 export function buildProviderOptions(
   body: ResponsesRequestBody,
+  context?: {
+    /**
+     * Present only when the resolved AI SDK model uses the Anthropic wire.
+     * The resolved upstream model (not the Codex-facing selector) is required
+     * so adaptive-thinking and per-model effort gates use the same identity as
+     * Native / Claude Code Runtime.
+     */
+    anthropic?: {
+      model: string;
+      isThirdPartyProxy: boolean;
+      verifiedEffortLevels?: readonly ('low' | 'medium' | 'high' | 'xhigh' | 'max')[];
+    };
+    /** Present only for a preset-verified native Responses transport. */
+    responses?: {
+      verifiedEffortLevels: readonly ('low' | 'medium' | 'high' | 'xhigh' | 'max')[];
+    };
+  },
 ): AiProviderOptions | undefined {
   const out: AiProviderOptions = {};
+
+  // @ai-sdk/openai only recognizes its own model catalog. A verified
+  // third-party Responses model (DeepSeek V4 Flash) would otherwise be
+  // classified as non-reasoning and the SDK would drop reasoning.effort
+  // before fetch. The preset-gated context is the evidence for overriding
+  // that heuristic.
+  if (context?.responses) {
+    out.openai = { forceReasoning: true };
+  }
 
   // Phase 5b smoke follow-up (2026-05-15) — Codex's `/responses`
   // endpoint (chatgpt.com/backend-api/codex/responses) REQUIRES a
@@ -523,15 +841,42 @@ export function buildProviderOptions(
   // `store: false` so this is safe to set unconditionally on every
   // openai-flavoured call we make.
   out.openai = { ...(out.openai ?? {}), store: body.store ?? false };
+  // xAI Responses has its own `store` contract. @ai-sdk/xai defaults it to
+  // true; CodePilot does not use previousResponseId, so the shared xAI helper
+  // explicitly disables upstream retention for this channel.
+  out.xai = buildXaiProviderOptions(body.reasoning?.effort);
 
   const effort = body.reasoning?.effort;
   if (effort) {
-    // Anthropic thinking — only enabled for medium/high/max budgets.
-    // Mapping mirrors how CodePilot's native runtime maps effort →
-    // budget (see src/lib/effort.ts for the canonical table).
+    // Anthropic: Codex expresses reasoning as an effort tier. Older proxy code
+    // translated that into manual `{type:'enabled', budgetTokens}`, which is a
+    // hard 400 on the adaptive family (Opus 4.7+/Fable 5/Sonnet 5). When the
+    // resolved provider is Anthropic, run the SAME sanitizer and wire builder
+    // as Native so the three Runtime paths cannot disagree on model contracts.
     const anthropicThinking = mapEffortToAnthropicThinking(effort);
-    const openaiReasoning = mapEffortToOpenAI(effort);
-    if (anthropicThinking) {
+    const openaiReasoning = mapEffortToOpenAI(
+      effort,
+      context?.responses?.verifiedEffortLevels,
+    );
+    if (context?.anthropic) {
+      const sanitized = sanitizeClaudeModelOptions({
+        model: context.anthropic.model,
+        thinking: anthropicThinking,
+        effort: effort === 'minimal' ? undefined : effort,
+      });
+      const wire = buildAnthropicProviderOptions({
+        isThirdPartyProxy: context.anthropic.isThirdPartyProxy,
+        model: context.anthropic.model,
+        sanitized,
+        verifiedEffortLevels: context.anthropic.verifiedEffortLevels,
+      });
+      if (wire.anthropic) {
+        out.anthropic = wire.anthropic as JsonObject;
+      }
+    } else if (anthropicThinking) {
+      // Non-Anthropic SDKs ignore this legacy companion bag. Keep it for
+      // existing direct unit callers and unknown provider families; production
+      // Anthropic calls always take the shared-sanitizer branch above.
       out.anthropic = { thinking: { type: anthropicThinking.type, budgetTokens: anthropicThinking.budgetTokens } };
     }
     if (openaiReasoning) {
@@ -543,7 +888,7 @@ export function buildProviderOptions(
 }
 
 function mapEffortToAnthropicThinking(
-  effort: 'minimal' | 'low' | 'medium' | 'high' | 'max',
+  effort: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max',
 ): { type: 'enabled'; budgetTokens: number } | undefined {
   switch (effort) {
     case 'low':
@@ -552,6 +897,7 @@ function mapEffortToAnthropicThinking(
       return { type: 'enabled', budgetTokens: 4096 };
     case 'high':
       return { type: 'enabled', budgetTokens: 16384 };
+    case 'xhigh':
     case 'max':
       return { type: 'enabled', budgetTokens: 32000 };
     case 'minimal':
@@ -561,8 +907,18 @@ function mapEffortToAnthropicThinking(
 }
 
 function mapEffortToOpenAI(
-  effort: 'minimal' | 'low' | 'medium' | 'high' | 'max',
-): 'minimal' | 'low' | 'medium' | 'high' | undefined {
+  effort: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max',
+  verifiedLevels?: readonly ('low' | 'medium' | 'high' | 'xhigh' | 'max')[],
+): 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | undefined {
+  if (verifiedLevels) {
+    if (verifiedLevels.includes(effort as 'low' | 'medium' | 'high' | 'xhigh' | 'max')) {
+      return effort as 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+    }
+    // DeepSeek documents xhigh as an alias of high. Keep that one explicit
+    // compatibility mapping; unknown tiers remain omitted rather than guessed.
+    if (effort === 'xhigh' && verifiedLevels.includes('high')) return 'high';
+    return undefined;
+  }
   switch (effort) {
     case 'minimal':
       return 'minimal';
@@ -571,6 +927,7 @@ function mapEffortToOpenAI(
     case 'medium':
       return 'medium';
     case 'high':
+    case 'xhigh':
     case 'max':
       return 'high';
     default:

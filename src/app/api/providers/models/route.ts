@@ -1,26 +1,18 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getAllProviders, getDefaultProviderId, setDefaultProviderId, getProvider, getAllModelsForProvider, getSetting } from '@/lib/db';
 import { getContextWindow } from '@/lib/model-context';
+import { isFirstPartyAnthropicEndpoint } from '@/lib/ai-provider';
 import { getDefaultModelsForProvider, getEffectiveProviderProtocol, findPresetForLegacy, ENV_CLAUDE_CODE_MODELS } from '@/lib/provider-catalog';
 import type { Protocol } from '@/lib/provider-catalog';
 import type { ErrorResponse, ProviderModelGroup } from '@/types';
-import { getOAuthStatus } from '@/lib/openai-oauth-manager';
+import { listManagedVirtualProviderModelGroups } from '@/lib/managed-virtual-provider-models';
 import {
   getProviderCompat,
   getModelCompat,
   isOpenRouterAnthropicSkinUrl,
 } from '@/lib/runtime-compat';
 import { isChatRuntimeParam, resolveChatRuntimeParam, type ChatRuntime } from '@/lib/chat-runtime';
-
-// OpenAI models available through ChatGPT Plus/Pro OAuth (Codex API)
-// Reasoning effort defaults to 'medium' server-side (not user-configurable)
-const OPENAI_OAUTH_MODELS = [
-  { value: 'gpt-5.5', label: 'GPT-5.5' },
-  { value: 'gpt-5.4', label: 'GPT-5.4' },
-  { value: 'gpt-5.4-mini', label: 'GPT-5.4-Mini' },
-  { value: 'gpt-5.3-codex', label: 'GPT-5.3-Codex' },
-  { value: 'gpt-5.3-codex-spark', label: 'GPT-5.3-Codex-Spark' },
-];
+import { buildCodexProviderModelGroup } from '@/lib/codex/models';
 
 // Default Claude model options (for the built-in 'env' provider).
 // Capability metadata ensures `xhigh` appears in the effort dropdown even
@@ -53,8 +45,144 @@ interface ModelEntry {
   value: string;
   label: string;
   upstreamModelId?: string;
+  supportsEffort?: boolean;
+  supportedEffortLevels?: string[];
+  effortNoteKey?: string;
+  supportsAdaptiveThinking?: boolean;
+  contextWindow?: number;
   capabilities?: Record<string, unknown>;
   variants?: Record<string, unknown>;
+}
+
+interface DbModelEntry extends ModelEntry {
+  /** True only for an untouched row originally materialized from the catalog. */
+  catalogManaged: boolean;
+}
+
+/**
+ * The composer consumes effort fields at the model row's top level, while
+ * DB/catalog/Codex sources may carry them under `capabilities`. Normalize at
+ * the final API boundary so virtual groups added after the DB-provider loop
+ * (notably `codex_account`) cannot silently miss the selector contract.
+ */
+export function normalizeModelCapabilitySurface(model: ModelEntry): ModelEntry {
+  const caps = model.capabilities ?? {};
+  const {
+    supportsEffort: directSupportsEffort,
+    supportedEffortLevels: directEffortLevels,
+    effortNoteKey: directEffortNoteKey,
+    supportsAdaptiveThinking: directAdaptiveThinking,
+    contextWindow: directContextWindow,
+    ...base
+  } = model;
+  const supportsEffort = typeof directSupportsEffort === 'boolean'
+    ? directSupportsEffort
+    : typeof caps.supportsEffort === 'boolean'
+      ? caps.supportsEffort
+      : undefined;
+  const supportedEffortLevels = Array.isArray(directEffortLevels)
+    && directEffortLevels.every((level): level is string => typeof level === 'string')
+    ? directEffortLevels
+    : Array.isArray(caps.supportedEffortLevels)
+        && caps.supportedEffortLevels.every((level): level is string => typeof level === 'string')
+      ? caps.supportedEffortLevels
+      : undefined;
+  const effortNoteKey = typeof directEffortNoteKey === 'string'
+    ? directEffortNoteKey
+    : typeof caps.effortNoteKey === 'string'
+      ? caps.effortNoteKey
+      : undefined;
+  const supportsAdaptiveThinking = typeof directAdaptiveThinking === 'boolean'
+    ? directAdaptiveThinking
+    : typeof caps.supportsAdaptiveThinking === 'boolean'
+      ? caps.supportsAdaptiveThinking
+      : undefined;
+  const contextWindow = typeof directContextWindow === 'number'
+    ? directContextWindow
+    : typeof caps.contextWindow === 'number'
+      ? caps.contextWindow
+      : undefined;
+  return {
+    ...base,
+    ...(supportsEffort !== undefined ? { supportsEffort } : {}),
+    ...(supportedEffortLevels !== undefined ? { supportedEffortLevels } : {}),
+    ...(effortNoteKey !== undefined ? { effortNoteKey } : {}),
+    ...(supportsAdaptiveThinking !== undefined ? { supportsAdaptiveThinking } : {}),
+    ...(contextWindow !== undefined ? { contextWindow } : {}),
+  };
+}
+
+function sameModelIdentity(a: ModelEntry, b: ModelEntry): boolean {
+  const aIds = new Set([a.value, a.upstreamModelId].filter((id): id is string => !!id));
+  return [b.value, b.upstreamModelId].some(id => !!id && aIds.has(id));
+}
+
+/**
+ * The SDK's `supportedModels()` result is an additional runtime surface, not
+ * an authoritative replacement for CodePilot's canonical env catalog.
+ *
+ * In Claude Code 2.1.220 the SDK reports only five convenience entries
+ * (`default`, `opus[1m]`, `claude-fable-5[1m]`, `sonnet`, `haiku`). Replacing
+ * the catalog with that list made explicit, successfully-routed selections
+ * such as `opus-5 → claude-opus-5` disappear after the first response. The
+ * composer then auto-corrected the missing row to `default`, so the visible
+ * model changed even though `chat_sessions.model` and the wire route remained
+ * Opus 5.
+ *
+ * Keep canonical rows stable and append genuinely new SDK convenience
+ * entries. When identities overlap, the canonical row wins: a short SDK alias
+ * can describe a newer moving target (for example `sonnet` currently describes
+ * Sonnet 5) while CodePilot deliberately pins its canonical `sonnet` row to
+ * Sonnet 4.6 to avoid silently migrating saved sessions.
+ */
+export function mergeEnvCatalogWithSdkModels(
+  catalogModels: readonly ModelEntry[],
+  sdkModels: readonly ModelEntry[],
+): ModelEntry[] {
+  const merged = [...catalogModels];
+  for (const sdkModel of sdkModels) {
+    if (!merged.some(existing => sameModelIdentity(existing, sdkModel))) {
+      merged.push(sdkModel);
+    }
+  }
+  return merged;
+}
+
+/**
+ * User-edited DB rows remain authoritative on disk. For the read-only picker
+ * feed, fill only missing system metadata by matching the catalog's canonical
+ * upstream id. This covers Kimi's real `kimi-for-coding` row shadowing its
+ * legacy `sonnet` alias without overwriting a custom label or explicit false.
+ */
+function enrichDbModelForRead(model: DbModelEntry, catalog: ModelEntry[]): ModelEntry {
+  const { catalogManaged, ...surface } = model;
+  const matched = catalog.find(entry => sameModelIdentity(surface, entry));
+  if (!matched) return surface;
+  const labelIsRawId = surface.label === surface.value || surface.label === surface.upstreamModelId;
+
+  // Catalog rows are a cache of shipped defaults, not user-authored facts.
+  // When a release updates a capability (Kimi max-only → low/high/max), an
+  // existing installation must see the current catalog without recreating
+  // the provider or manually aligning the DB. User/API rows keep the old
+  // merge direction below, so explicit false/custom allowlists still win.
+  if (catalogManaged) {
+    return {
+      ...surface,
+      label: matched.label,
+      upstreamModelId: matched.upstreamModelId || surface.upstreamModelId,
+      capabilities: matched.capabilities,
+    };
+  }
+  return {
+    ...matched,
+    ...surface,
+    label: labelIsRawId ? matched.label : surface.label,
+    upstreamModelId: surface.upstreamModelId || matched.upstreamModelId,
+    capabilities: {
+      ...(matched.capabilities ?? {}),
+      ...(surface.capabilities ?? {}),
+    },
+  };
 }
 
 /**
@@ -109,7 +237,17 @@ export async function GET(request: NextRequest) {
         provider_id: 'env',
         provider_name: 'Claude Code',
         provider_type: 'anthropic',
+        preset_key: '',
+        protocol: 'anthropic',
         compat: 'claude_code_ready',
+        // #632 item 1 — env is the Claude Code (Anthropic) group, but it can
+        // route through a third-party proxy via settings.anthropic_base_url /
+        // process.env.ANTHROPIC_BASE_URL (same precedence as
+        // resolveEffectiveAnthropicBaseUrl). Trust the SDK-reported
+        // context_window only when that effective endpoint is first-party.
+        reportedContextWindowTrusted: isFirstPartyAnthropicEndpoint(
+          getSetting('anthropic_base_url') || process.env.ANTHROPIC_BASE_URL || undefined,
+        ),
         ...(!envHasDirectCredentials ? { sdkProxyOnly: true } : {}),
         // Use upstreamModelId for context-window lookup so the bare `opus`
         // alias doesn't get clamped to the 200K Bedrock/Vertex value.
@@ -120,14 +258,17 @@ export async function GET(request: NextRequest) {
       });
     }
 
-    // If SDK has discovered models, use them for the env group
+    // If SDK has discovered models, add its runtime-only convenience entries
+    // without deleting CodePilot's explicit canonical routes. The SDK list is
+    // intentionally incomplete (for example it may omit `opus-5` after a
+    // successful `claude-opus-5` turn), so it must never replace this group.
     const envGroup = groups.find(g => g.provider_id === 'env');
     if (envGroup) {
       try {
         const { getCachedModels } = await import('@/lib/agent-sdk-capabilities');
         const sdkModels = getCachedModels('env');
         if (sdkModels.length > 0) {
-          envGroup.models = sdkModels.map(m => {
+          const sdkModelEntries = sdkModels.map(m => {
             // SDK sometimes returns short aliases (e.g. 'opus') — map to
             // the concrete upstream so context window and downstream
             // sanitizer checks agree with the env provider's resolver.
@@ -144,6 +285,7 @@ export async function GET(request: NextRequest) {
               ...(cw != null ? { contextWindow: cw } : {}),
             };
           });
+          envGroup.models = mergeEnvCatalogWithSdkModels(envGroup.models, sdkModelEntries);
         }
       } catch {
         // SDK capabilities not available, keep defaults
@@ -157,6 +299,7 @@ export async function GET(request: NextRequest) {
         provider.provider_type,
         provider.protocol,
         provider.base_url,
+        provider.preset_key,
       );
 
       // Skip media-only providers in chat model selector
@@ -168,7 +311,7 @@ export async function GET(request: NextRequest) {
       // 1) Read provider_models — the *enabled* rows feed the picker, but we
       //    also need the *full* row set as a suppression list so disabled
       //    rows aren't re-added by the catalog fallback below.
-      const dbModels: { value: string; label: string; upstreamModelId?: string; capabilities?: Record<string, unknown>; variants?: Record<string, unknown> }[] = [];
+      const dbModels: DbModelEntry[] = [];
       const dbHiddenIds = new Set<string>();
       let dbHasAnyRow = false;
       // Track the most-recent `last_refreshed_at` across rows so the Provider
@@ -196,6 +339,10 @@ export async function GET(request: NextRequest) {
             upstreamModelId: m.upstream_model_id || undefined,
             capabilities: caps,
             variants: vars,
+            catalogManaged: m.source === 'catalog'
+              && m.user_edited === 0
+              && m.enable_source !== 'manual_enabled'
+              && m.enable_source !== 'manual_hidden',
           });
         }
       } catch { /* table may not exist in old DBs */ }
@@ -203,22 +350,26 @@ export async function GET(request: NextRequest) {
       // 2) Catalog defaults — but skip any id the user has explicitly hidden
       //    in the Models page, otherwise the picker silently re-adds them.
       const catalogModels = getDefaultModelsForProvider(protocol, provider.base_url, provider.provider_type);
-      const catalogRaw = catalogModels
-        .filter(m => !dbHiddenIds.has(m.modelId))
+      const catalogAllRaw = catalogModels
         .map(m => ({
           value: m.modelId,
           label: m.displayName,
           upstreamModelId: m.upstreamModelId,
           capabilities: m.capabilities as Record<string, unknown> | undefined,
         }));
+      const catalogRaw = catalogAllRaw.filter(m => !dbHiddenIds.has(m.value));
 
       if (dbHasAnyRow) {
         // User has materialized rows for this provider — DB enabled set is
-        // authoritative. Only catalog ids that are NEITHER in the DB nor
-        // hidden show through (covers brand-new catalog additions the user
-        // hasn't seen yet).
-        const dbIds = new Set(dbModels.map(m => m.value));
-        rawModels = [...dbModels, ...catalogRaw.filter(m => !dbIds.has(m.value))];
+        // authoritative. Enrich the read surface by canonical/upstream
+        // identity, then append only genuinely new catalog models. Exact-id
+        // hidden rows still suppress the catalog tail; enrichment never
+        // mutates provider_models.
+        const enrichedDbModels = dbModels.map(m => enrichDbModelForRead(m, catalogAllRaw));
+        rawModels = [
+          ...enrichedDbModels,
+          ...catalogRaw.filter(catalogModel => !dbModels.some(dbModel => sameModelIdentity(dbModel, catalogModel))),
+        ];
       } else {
         rawModels = [...catalogRaw];
       }
@@ -298,6 +449,7 @@ export async function GET(request: NextRequest) {
         const effortLift = {
           ...(caps.supportsEffort != null ? { supportsEffort: caps.supportsEffort as boolean } : {}),
           ...(caps.supportedEffortLevels != null ? { supportedEffortLevels: caps.supportedEffortLevels as string[] } : {}),
+          ...(caps.effortNoteKey != null ? { effortNoteKey: caps.effortNoteKey as string } : {}),
           ...(caps.supportsAdaptiveThinking != null ? { supportsAdaptiveThinking: caps.supportsAdaptiveThinking as boolean } : {}),
         };
         return {
@@ -308,7 +460,7 @@ export async function GET(request: NextRequest) {
       });
 
       // Detect SDK-proxy-only providers via preset match
-      const preset = findPresetForLegacy(provider.base_url, provider.provider_type, protocol);
+      const preset = findPresetForLegacy(provider.base_url, provider.provider_type, protocol, provider.preset_key);
       const sdkProxyOnly = preset?.sdkProxyOnly === true;
 
       // total_count is the user-visible "synced model count" on Provider cards.
@@ -323,30 +475,41 @@ export async function GET(request: NextRequest) {
         provider_id: provider.id,
         provider_name: provider.name,
         provider_type: provider.provider_type,
+        preset_key: provider.preset_key,
+        protocol: provider.protocol,
         ...(sdkProxyOnly ? { sdkProxyOnly: true } : {}),
         total_count: totalCount,
         last_refreshed_at: lastRefreshedAt,
-        compat: getProviderCompat({
-          provider_type: provider.provider_type,
-          base_url: provider.base_url,
-        }),
+        compat: getProviderCompat(provider),
+        // #632 item 1 — only an anthropic-protocol provider on a third-party
+        // base_url reports the Claude SDK's bogus ~200K default context_window.
+        // Non-anthropic protocols (Codex's real modelContextWindow, etc.) report
+        // their own window, so leave those trusted.
+        reportedContextWindowTrusted:
+          protocol !== 'anthropic' || isFirstPartyAnthropicEndpoint(provider.base_url || undefined),
         models,
       });
     }
 
-    // Add OpenAI OAuth virtual provider when authenticated
-    try {
-      const oauthStatus = getOAuthStatus();
-      if (oauthStatus.authenticated) {
-        groups.push({
-          provider_id: 'openai-oauth',
-          provider_name: `OpenAI${oauthStatus.plan ? ` (${oauthStatus.plan})` : ''}`,
-          provider_type: 'openai-oauth',
-          compat: 'codepilot_only',
-          models: OPENAI_OAUTH_MODELS,
-        });
-      }
-    } catch { /* OpenAI OAuth module not available */ }
+    // Authenticated virtual providers share one catalog with managed
+    // Sub-agent route discovery. Do not hand-add a provider here: doing so
+    // caused v0.60.0 to show Grok in the picker while rejecting it as a child.
+    for (const virtual of listManagedVirtualProviderModelGroups()) {
+      groups.push({
+        provider_id: virtual.providerId,
+        provider_name: virtual.providerName,
+        provider_type: virtual.providerType,
+        preset_key: virtual.presetKey,
+        protocol: virtual.protocol,
+        compat: virtual.compat,
+        models: virtual.models.map(model => ({
+          value: model.modelId,
+          label: model.displayName,
+          ...(model.upstreamModelId ? { upstreamModelId: model.upstreamModelId } : {}),
+          ...(model.capabilities ? { capabilities: model.capabilities } : {}),
+        })),
+      });
+    }
 
     // Phase 5 Phase 2 (2026-05-13) — Codex Account virtual provider.
     //
@@ -366,7 +529,6 @@ export async function GET(request: NextRequest) {
     //     Codex entirely — saves an unnecessary RPC.
     if (runtimeFilter === 'codex_runtime') {
       try {
-        const { buildCodexProviderModelGroup } = await import('@/lib/codex/models');
         const codexGroup = await buildCodexProviderModelGroup({ timeoutMs: 2500 });
         if (codexGroup) groups.push(codexGroup);
       } catch {
@@ -374,7 +536,6 @@ export async function GET(request: NextRequest) {
       }
     } else if (!runtimeFilter) {
       try {
-        const { buildCodexProviderModelGroup } = await import('@/lib/codex/models');
         // cacheOnly — never spawn from the full-catalog path.
         const codexGroup = await buildCodexProviderModelGroup({ cacheOnly: true });
         if (codexGroup) groups.push(codexGroup);
@@ -422,11 +583,12 @@ export async function GET(request: NextRequest) {
       const isEnvProvider = g.provider_id === 'env';
       const annotatedModels = g.models
         .map(m => {
+          const normalized = normalizeModelCapabilitySurface(m);
           const cap = getModelCompat({
-            modelId: m.value,
-            upstreamModelId: m.upstreamModelId,
+            modelId: normalized.value,
+            upstreamModelId: normalized.upstreamModelId,
             providerCompat,
-            capabilities: m.capabilities as Parameters<typeof getModelCompat>[0]['capabilities'],
+            capabilities: normalized.capabilities as Parameters<typeof getModelCompat>[0]['capabilities'],
           });
           if (cap.media) return null;
           let supportedRuntimes = cap.supportedRuntimes;
@@ -440,7 +602,7 @@ export async function GET(request: NextRequest) {
             };
           }
           return {
-            ...m,
+            ...normalized,
             supportedRuntimes,
             unsupportedReasonByRuntime,
           };

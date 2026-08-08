@@ -11,12 +11,14 @@ import {
   type Protocol,
   type AuthStyle,
   type CatalogModel,
+  type ProviderEffortLevel,
   type RoleModels,
   inferProtocolFromLegacy,
   inferAuthStyleFromLegacy,
   getDefaultModelsForProvider,
   getEffectiveProviderProtocol,
   findPresetForLegacy,
+  getVerifiedProviderWireCapabilities,
   ENV_CLAUDE_CODE_MODELS,
 } from './provider-catalog';
 import {
@@ -37,6 +39,15 @@ import {
   isOpenRouterAnthropicSkinUrl,
 } from './runtime-compat';
 import type { ChatRuntime } from './chat-runtime';
+import {
+  assertProviderCallAllowed,
+  getProviderUsagePolicy,
+  isInteractiveSceneAllowed,
+  type ProviderCallScene,
+} from './provider-call-policy';
+import {
+  getManagedVirtualProviderDefinition,
+} from './managed-virtual-provider-models';
 
 // ── Resolution result ───────────────────────────────────────────
 
@@ -67,6 +78,8 @@ export interface ResolvedProvider {
   settingSources: string[];
   /** Internal: true when resolved as OpenAI OAuth (Codex API) virtual provider */
   _openaiOAuth?: boolean;
+  /** Internal: true when resolved as the xAI OAuth virtual provider. */
+  _xaiOAuth?: boolean;
   /**
    * Phase 5 review round 4 (2026-05-13) — true when resolved as the
    * Codex Account virtual provider. CodexRuntime takes over the
@@ -97,6 +110,8 @@ export interface ResolvedProvider {
 // ── Public API ──────────────────────────────────────────────────
 
 export interface ResolveOptions {
+  /** Required by every credential-bearing call; inspection-only callers may omit. */
+  callScene?: ProviderCallScene;
   /** Explicit provider ID from request (highest priority) */
   providerId?: string;
   /** Session's stored provider ID */
@@ -200,6 +215,11 @@ export function canonicalAnthropicAliasUpstream(modelId: string | undefined | nu
   return ANTHROPIC_ALIAS_UPSTREAM[modelId];
 }
 
+function finishResolution(resolved: ResolvedProvider, callScene: ProviderCallScene | undefined): ResolvedProvider {
+  if (callScene) assertProviderCallAllowed(resolved.provider, callScene);
+  return resolved;
+}
+
 export function resolveProvider(opts: ResolveOptions = {}): ResolvedProvider {
   const effectiveProviderId = opts.providerId || opts.sessionProviderId || '';
 
@@ -211,7 +231,10 @@ export function resolveProvider(opts: ResolveOptions = {}): ResolvedProvider {
 
   // Special virtual provider: OpenAI OAuth (Codex API)
   if (effectiveProviderId === 'openai-oauth') {
-    return buildOpenAIOAuthResolution(opts);
+    return finishResolution(buildOpenAIOAuthResolution(opts), opts.callScene);
+  }
+  if (effectiveProviderId === 'xai-oauth') {
+    return finishResolution(buildXaiOAuthResolution(opts), opts.callScene);
   }
 
   // Phase 5 review round 4 (2026-05-13) — Codex Account is a virtual
@@ -221,7 +244,7 @@ export function resolveProvider(opts: ResolveOptions = {}): ResolvedProvider {
   // Codex Runtime takes over the actual upstream call via its own
   // app-server thread/turn flow; this resolver just needs to NOT 409.
   if (effectiveProviderId === 'codex_account') {
-    return buildCodexAccountResolution(opts);
+    return finishResolution(buildCodexAccountResolution(opts), opts.callScene);
   }
 
   if (effectiveProviderId && effectiveProviderId !== 'env') {
@@ -277,7 +300,38 @@ export function resolveProvider(opts: ResolveOptions = {}): ResolvedProvider {
   }
   // effectiveProviderId === 'env' → provider stays undefined
 
-  return buildResolution(provider, opts);
+  return finishResolution(buildResolution(provider, opts), opts.callScene);
+}
+
+/**
+ * Fail-closed resolution: return the resolution for EXACTLY this provider id, or
+ * `null`. Never falls back to the default / active provider.
+ *
+ * `resolveProvider` is deliberately forgiving — a stale or deleted session
+ * provider silently becomes the user's default one, which is right for "answer
+ * the user's question" but WRONG for any call that carries the user's text to a
+ * vendor of its own accord. If the provider a session was pinned to is gone,
+ * a background caller must do nothing, not quietly re-target another vendor:
+ * title generation must not ship the first user message to a different company
+ * than the one the chat was started with.
+ *
+ * Virtual providers ('env', 'openai-oauth', 'xai-oauth', 'codex_account') are matched on the
+ * marker the resolver sets for them, since they have no DB row to compare ids
+ * against.
+ *
+ * @returns the resolution whose identity is provably the requested one, else null.
+ */
+export function resolveExactProvider(
+  providerId: string,
+  callScene?: ProviderCallScene,
+): ResolvedProvider | null {
+  if (!providerId) return null;
+  const resolved = resolveProvider({ providerId, callScene });
+  if (providerId === 'openai-oauth') return resolved._openaiOAuth ? resolved : null;
+  if (providerId === 'xai-oauth') return resolved._xaiOAuth ? resolved : null;
+  if (providerId === 'codex_account') return resolved._codexAccount ? resolved : null;
+  if (providerId === 'env') return resolved.provider === undefined ? resolved : null;
+  return resolved.provider?.id === providerId ? resolved : null;
 }
 
 /**
@@ -357,6 +411,7 @@ export function toClaudeCodeEnv(
     'CLAUDE_CODE_SKIP_VERTEX_AUTH',
     'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
     'CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK',
+    'CLAUDE_CODE_SUBAGENT_MODEL',
     'CLAUDE_CODE_EFFORT_LEVEL',
     'ENABLE_TOOL_SEARCH',
     'AWS_REGION',
@@ -481,11 +536,48 @@ export function toClaudeCodeEnv(
   return env;
 }
 
+/**
+ * The Anthropic base URL the Claude Code SDK subprocess will actually talk to,
+ * computed by mirroring `toClaudeCodeEnv`'s THREE states exactly so the two
+ * never drift (the gate that consumes this must reflect the real send target):
+ *
+ *   - DB provider WITH credentials (`provider && hasCredentials`): toClaudeCodeEnv
+ *     clears every ANTHROPIC_* var then injects this provider's base_url. An empty
+ *     base_url leaves it unset → SDK falls back to official api.anthropic.com
+ *     (return undefined).
+ *   - DB provider WITHOUT credentials (`provider && !hasCredentials`): toClaudeCodeEnv
+ *     runs NEITHER branch — its provider branch is gated on `hasCredentials`, its
+ *     env branch on `!provider` — so it neither clears nor injects ANTHROPIC_*. The
+ *     SDK inherits ONLY the ambient `process.env.ANTHROPIC_BASE_URL`; provider.base_url
+ *     is NOT injected and settings is NOT consulted. Mirror that (a third-party env
+ *     override here must still untrust the window — Codex P2, 2026-06-20).
+ *   - env / legacy / cc-switch (`!provider`): SDK inherits the ambient base URL —
+ *     `settings.anthropic_base_url` first (mirrors the `!resolved.provider` branch),
+ *     then `process.env.ANTHROPIC_BASE_URL`.
+ *
+ * Returning undefined means "official first-party endpoint". Callers gate the
+ * TRUST of the SDK-reported `modelUsage.contextWindow` on this (#632): a third
+ * party proxy reaching here reports the SDK's generic ~200K default, which must
+ * NOT be shown as a real capacity. See `isFirstPartyAnthropicEndpoint`.
+ */
+export function resolveEffectiveAnthropicBaseUrl(
+  resolved: ResolvedProvider,
+): string | undefined {
+  if (resolved.provider && resolved.hasCredentials) {
+    return resolved.provider.base_url || undefined;
+  }
+  if (resolved.provider) {
+    // provider selected but no credentials → SDK inherits ambient env only.
+    return process.env.ANTHROPIC_BASE_URL || undefined;
+  }
+  return getSetting('anthropic_base_url') || process.env.ANTHROPIC_BASE_URL || undefined;
+}
+
 // ── AI SDK config builder ───────────────────────────────────────
 
 export interface AiSdkConfig {
   /** Which AI SDK factory to use */
-  sdkType: 'anthropic' | 'openai' | 'google' | 'bedrock' | 'vertex' | 'claude-code-compat';
+  sdkType: 'anthropic' | 'openai' | 'xai' | 'google' | 'bedrock' | 'vertex' | 'claude-code-compat';
   /** API key to pass to the SDK (mutually exclusive with authToken for Anthropic) */
   apiKey: string | undefined;
   /** Auth token (Bearer) for Anthropic auth_token providers (mutually exclusive with apiKey) */
@@ -500,6 +592,16 @@ export interface AiSdkConfig {
   processEnvInjections: Record<string, string>;
   /** Use OpenAI Responses API instead of Chat Completions (for Codex API) */
   useResponsesApi?: boolean;
+  /** Authentication mode for a Responses transport. */
+  responsesApiAuth?: 'codex_oauth' | 'api_key';
+  /** Vendor-verified effort tiers for an Anthropic-compatible wire. */
+  verifiedAnthropicEffortLevels?: readonly ProviderEffortLevel[];
+  /** Vendor-verified effort tiers for a native Responses wire. */
+  verifiedResponsesEffortLevels?: readonly ProviderEffortLevel[];
+  /** Whether the selected Responses endpoint accepts reasoning summaries. */
+  supportsResponsesReasoningSummary?: boolean;
+  /** Resolve bearer credentials per request from the atomic xAI OAuth bundle. */
+  useXaiOAuth?: boolean;
 }
 
 /**
@@ -509,6 +611,7 @@ export interface AiSdkConfig {
 export function toAiSdkConfig(
   resolved: ResolvedProvider,
   modelOverride?: string,
+  options: { runtime?: ChatRuntime } = {},
 ): AiSdkConfig {
   // Resolve the upstream model ID (the actual API model name).
   // If modelOverride is given (from caller), check if it maps to a different upstream ID
@@ -594,6 +697,9 @@ export function toAiSdkConfig(
   }
 
   const headers = resolved.headers;
+  const verifiedWire = provider
+    ? getVerifiedProviderWireCapabilities(provider, modelId)
+    : {};
 
   // OpenAI OAuth (Codex API) — special path using OAuth Bearer token.
   // The actual OAuth token is resolved in ai-provider.ts at model creation time
@@ -611,6 +717,46 @@ export function toAiSdkConfig(
       headers,
       processEnvInjections,
       useResponsesApi: true,
+      responsesApiAuth: 'codex_oauth',
+    };
+  }
+
+  if (resolved._xaiOAuth) {
+    return {
+      sdkType: 'xai',
+      apiKey: undefined,
+      authToken: undefined,
+      baseUrl: 'https://api.x.ai/v1',
+      modelId,
+      headers,
+      processEnvInjections,
+      useXaiOAuth: true,
+    };
+  }
+
+  // A provider preset may declare a model-specific native Responses
+  // transport for Codex Runtime. This is capability-driven rather than a
+  // hostname special case: only an identity-resolved preset + explicitly
+  // listed model can take this path. DeepSeek V4 Flash is the first verified
+  // declaration; other DeepSeek models and aggregator copies keep the normal
+  // Anthropic/OpenAI-compatible route.
+  if (
+    options.runtime === 'codex_runtime'
+    && provider
+    && verifiedWire.codexResponses
+  ) {
+    return {
+      sdkType: 'openai',
+      apiKey: provider.api_key || undefined,
+      authToken: undefined,
+      baseUrl: verifiedWire.codexResponses.baseUrl,
+      modelId,
+      headers,
+      processEnvInjections,
+      useResponsesApi: true,
+      responsesApiAuth: 'api_key',
+      verifiedResponsesEffortLevels: verifiedWire.codexResponses.supportedEffortLevels,
+      supportsResponsesReasoningSummary: verifiedWire.codexResponses.supportsReasoningSummary,
     };
   }
 
@@ -680,6 +826,9 @@ export function toAiSdkConfig(
         modelId,
         headers,
         processEnvInjections,
+        ...(verifiedWire.anthropicEffortLevels
+          ? { verifiedAnthropicEffortLevels: verifiedWire.anthropicEffortLevels }
+          : {}),
       };
     }
 
@@ -730,6 +879,17 @@ export function toAiSdkConfig(
         apiKey: provider?.api_key || undefined,
         authToken: undefined,
         baseUrl: provider?.base_url || undefined,
+        modelId,
+        headers,
+        processEnvInjections,
+      };
+
+    case 'xai':
+      return {
+        sdkType: 'xai',
+        apiKey: provider?.api_key || undefined,
+        authToken: undefined,
+        baseUrl: provider?.base_url || 'https://api.x.ai/v1',
         modelId,
         headers,
         processEnvInjections,
@@ -820,15 +980,6 @@ export function toAiSdkConfig(
 
 // ── Internal helpers ────────────────────────────────────────────
 
-// OpenAI Codex API models available through ChatGPT Plus/Pro OAuth
-const OPENAI_CODEX_MODELS: CatalogModel[] = [
-  { modelId: 'gpt-5.5', displayName: 'GPT-5.5' },
-  { modelId: 'gpt-5.4', displayName: 'GPT-5.4' },
-  { modelId: 'gpt-5.4-mini', displayName: 'GPT-5.4-Mini' },
-  { modelId: 'gpt-5.3-codex', displayName: 'GPT-5.3-Codex' },
-  { modelId: 'gpt-5.3-codex-spark', displayName: 'GPT-5.3-Codex-Spark' },
-];
-
 /**
  * Build resolution for the virtual OpenAI OAuth provider.
  * Uses OAuth Bearer token + Codex API endpoint.
@@ -867,13 +1018,14 @@ function buildCodexAccountResolution(opts: ResolveOptions): ResolvedProvider {
 }
 
 function buildOpenAIOAuthResolution(opts: ResolveOptions): ResolvedProvider {
-  const model = opts.model || opts.sessionModel || 'gpt-5.5';
+  const definition = getManagedVirtualProviderDefinition('openai-oauth');
+  const model = opts.model || opts.sessionModel || definition.models[0].modelId;
 
-  const catalogEntry = OPENAI_CODEX_MODELS.find(m => m.modelId === model);
+  const catalogEntry = definition.models.find(m => m.modelId === model);
 
   return {
     provider: undefined,
-    protocol: 'openai-compatible',
+    protocol: definition.protocol,
     authStyle: 'api_key',
     model,
     upstreamModel: model,
@@ -882,10 +1034,30 @@ function buildOpenAIOAuthResolution(opts: ResolveOptions): ResolvedProvider {
     envOverrides: {},
     roleModels: { default: model },
     hasCredentials: true, // OAuth token checked at call time
-    availableModels: OPENAI_CODEX_MODELS,
+    availableModels: definition.models,
     settingSources: [],
     _openaiOAuth: true, // marker for toAiSdkConfig
   } as ResolvedProvider;
+}
+
+function buildXaiOAuthResolution(opts: ResolveOptions): ResolvedProvider {
+  const definition = getManagedVirtualProviderDefinition('xai-oauth');
+  const model = opts.model || opts.sessionModel || definition.models[0].modelId;
+  return {
+    provider: undefined,
+    protocol: definition.protocol,
+    authStyle: 'api_key',
+    model,
+    upstreamModel: model,
+    modelDisplayName: definition.models.find(item => item.modelId === model)?.displayName || model,
+    headers: {},
+    envOverrides: {},
+    roleModels: { default: definition.models[0].modelId },
+    hasCredentials: true,
+    availableModels: definition.models,
+    settingSources: [],
+    _xaiOAuth: true,
+  };
 }
 
 function buildResolution(
@@ -944,7 +1116,20 @@ function buildResolution(
 
   // Parse JSON fields
   const headers = safeParseJson(provider.headers_json);
-  const envOverrides = safeParseJson(provider.env_overrides_json || provider.extra_env);
+  const preset = findPresetForLegacy(
+    provider.base_url,
+    provider.provider_type,
+    protocol,
+    provider.preset_key,
+  );
+  // Preset defaults evolve with vendor integrations (for example DeepSeek's
+  // official Flash sub-agent recommendation). Existing provider rows may
+  // predate those defaults, so read them as a layered config rather than a
+  // one-time creation snapshot. Explicit stored values remain authoritative.
+  const envOverrides = {
+    ...(preset?.defaultEnvOverrides ?? {}),
+    ...safeParseJson(provider.env_overrides_json || provider.extra_env),
+  };
   let roleModels = safeParseJson(provider.role_models_json) as RoleModels;
 
   // Fall back to catalog preset's defaultRoleModels when DB has no role mappings.
@@ -952,7 +1137,6 @@ function buildResolution(
   // ANTHROPIC_MODEL / ANTHROPIC_DEFAULT_*_MODEL env vars even when role_models_json
   // was saved as '{}' by the preset connect dialog.
   if (!roleModels.default && !roleModels.sonnet) {
-    const preset = findPresetForLegacy(provider.base_url, provider.provider_type, protocol);
     if (preset?.defaultRoleModels) {
       roleModels = { ...preset.defaultRoleModels, ...roleModels };
     }
@@ -1031,10 +1215,7 @@ function buildResolution(
   // Pre-compute provider compat + a model-id index so the runtime guard
   // below can check capabilities in O(1). Only built when a runtime is
   // requested — keeps the no-runtime path the same shape as before.
-  const providerCompat = getProviderCompat({
-    provider_type: provider.provider_type,
-    base_url: provider.base_url,
-  });
+  const providerCompat = getProviderCompat(provider);
   const modelIndex: Map<string, CatalogModel> = opts.runtime
     ? new Map(availableModels.map(m => [m.modelId, m]))
     : new Map();
@@ -1247,13 +1428,14 @@ function inferProtocolFromProvider(provider: ApiProvider): Protocol {
     provider.provider_type,
     provider.protocol,
     provider.base_url,
+    provider.preset_key,
   );
 }
 
 function inferAuthStyleFromProvider(provider: ApiProvider): AuthStyle {
   // Check preset match first — pass protocol to avoid cross-protocol fuzzy mismatches
   const protocol = inferProtocolFromProvider(provider);
-  const preset = findPresetForLegacy(provider.base_url, provider.provider_type, protocol);
+  const preset = findPresetForLegacy(provider.base_url, provider.provider_type, protocol, provider.preset_key);
   if (preset) return preset.authStyle;
 
   return inferAuthStyleFromLegacy(provider.provider_type, provider.extra_env);
@@ -1333,6 +1515,7 @@ export interface AuxiliaryRoutingContext {
     id: string;
     roleModels: RoleModels;
     isSdkProxyOnly: boolean;
+    isInteractiveOnly: boolean;
   }>;
   /** Per-task env override — env_override tier only applies when BOTH are set. */
   envOverride?: { providerId?: string; modelId?: string };
@@ -1383,7 +1566,7 @@ export function routeAuxiliaryModel(
 
   // Tier 4: Scan other providers for first non-sdkProxyOnly with small or haiku.
   for (const other of ctx.others) {
-    if (other.isSdkProxyOnly) continue;
+    if (other.isSdkProxyOnly || other.isInteractiveOnly) continue;
     if (other.roleModels.small) {
       return {
         providerId: other.id,
@@ -1448,12 +1631,13 @@ export function resolveAuxiliaryModel(
       main.provider.base_url,
       main.provider.provider_type,
       main.protocol,
+      main.provider.preset_key,
     );
     isMainSdkProxyOnly = preset?.sdkProxyOnly ?? false;
   }
 
   // Enumerate other providers and compute their roleModels + sdkProxyOnly.
-  const others: Array<{ id: string; roleModels: RoleModels; isSdkProxyOnly: boolean }> = [];
+  const others: Array<{ id: string; roleModels: RoleModels; isSdkProxyOnly: boolean; isInteractiveOnly: boolean }> = [];
   if (main.provider) {
     try {
       const allProviders = getAllProviders();
@@ -1463,12 +1647,13 @@ export function resolveAuxiliaryModel(
         // whenever raw protocol isn't a valid Protocol union member, so a
         // stray 'random-garbage' row can't silently drive preset / role-model
         // lookup into a different code path than the main provider got.
-        const protocol = getEffectiveProviderProtocol(p.provider_type, p.protocol, p.base_url);
-        const preset = findPresetForLegacy(p.base_url, p.provider_type, protocol);
+        const protocol = getEffectiveProviderProtocol(p.provider_type, p.protocol, p.base_url, p.preset_key);
+        const preset = findPresetForLegacy(p.base_url, p.provider_type, protocol, p.preset_key);
         others.push({
           id: p.id,
           roleModels: computeEffectiveRoleModels(p, preset, protocol),
           isSdkProxyOnly: preset?.sdkProxyOnly ?? false,
+          isInteractiveOnly: preset?.usagePolicy === 'interactive_only',
         });
       }
     } catch (err) {
@@ -1483,14 +1668,18 @@ export function resolveAuxiliaryModel(
   const envKey = task.toUpperCase();
   const envProvider = process.env[`AUXILIARY_${envKey}_PROVIDER`];
   const envModel = process.env[`AUXILIARY_${envKey}_MODEL`];
+  const envOverrideProvider = envProvider ? getProvider(envProvider) : undefined;
+  const envOverrideAllowed = !envOverrideProvider
+    || getProviderUsagePolicy(envOverrideProvider) !== 'interactive_only'
+    || (!!opts.callScene && isInteractiveSceneAllowed(opts.callScene));
 
   return routeAuxiliaryModel(task, {
     main,
     isMainSdkProxyOnly,
     others,
     envOverride: {
-      providerId: envProvider,
-      modelId: envModel,
+      providerId: envOverrideAllowed ? envProvider : undefined,
+      modelId: envOverrideAllowed ? envModel : undefined,
     },
   });
 }
@@ -1603,7 +1792,7 @@ export interface SessionRuntimeIntent {
  */
 export function resolveProviderForSession(
   intent: SessionRuntimeIntent,
-  extras: Pick<ResolveOptions, 'useCase' | 'runtime'> = {},
+  extras: Pick<ResolveOptions, 'useCase' | 'runtime' | 'callScene'> = {},
 ): ResolvedProvider {
   const sessionProviderId = intent.provider_id;
   const requestProviderId = intent.requestProviderId;
@@ -1629,6 +1818,7 @@ export function resolveProviderForSession(
     effectiveProviderId
     && effectiveProviderId !== 'env'
     && effectiveProviderId !== 'openai-oauth'
+    && effectiveProviderId !== 'xai-oauth'
     && effectiveProviderId !== 'codex_account'
     && !getProvider(effectiveProviderId)
   ) {
@@ -1643,6 +1833,7 @@ export function resolveProviderForSession(
       sessionModel: intent.model || undefined,
       useCase: extras.useCase,
       runtime: extras.runtime,
+      callScene: extras.callScene,
     });
     return { ...fallback, invalidReason: 'provider-missing' };
   }
@@ -1654,5 +1845,6 @@ export function resolveProviderForSession(
     sessionModel: intent.model || undefined,
     useCase: extras.useCase,
     runtime: extras.runtime,
+    callScene: extras.callScene,
   });
 }

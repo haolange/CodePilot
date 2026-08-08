@@ -11,6 +11,13 @@ import { snapshotToCompilerInputs } from '@/lib/harness/context-accounting';
 export interface ContextUsageData {
   modelName: string;
   contextWindow: number | null;
+  /**
+   * True only when `contextWindow` came from an SDK/upstream-reported value
+   * (not the static catalog fallback). UI must gate percentage / remaining /
+   * unused displays on this — an untrusted denominator produced the ">100%"
+   * and 假百分比 in #632. When false, show absolute used + kind composition only.
+   */
+  contextWindowTrusted: boolean;
   /** Actual token usage from the last API response */
   used: number;
   /** Ratio of actual usage to context window */
@@ -71,6 +78,19 @@ export function useContextUsage(
      *  opus = 1M, Bedrock/Vertex opus = 200K). */
     upstreamModelId?: string;
     /**
+     * #632 item 1 — whether the session's provider reports a TRUSTWORTHY
+     * context window. The SDK-reported `token_usage.context_window` is a real
+     * denominator only for a first-party Anthropic endpoint (or a non-Anthropic
+     * runtime that reports its own window, e.g. Codex's modelContextWindow). A
+     * third-party Anthropic-compatible proxy (GLM / Bailian / Kimi / …) reports
+     * the SDK's generic ~200K default. Existing sessions already have that bogus
+     * value persisted, so the renderer must gate trust here — the server write
+     * gate only protects new turns. `false` → SDK windows are NOT trusted (show
+     * used-tokens only). undefined / true → trust (back-compat). Source:
+     * ProviderModelGroup.reportedContextWindowTrusted.
+     */
+    reportedContextWindowTrusted?: boolean;
+    /**
      * Phase 5: SDK-authoritative snapshot from Query.getContextUsage().
      * When fresh (<60s), its totalTokens / maxTokens win over the
      * char-based estimator.
@@ -108,6 +128,14 @@ export function useContextUsage(
       upstream: options?.upstreamModelId,
     });
 
+    // #632 item 1 — an SDK-reported window (token_usage.context_window) is only
+    // a trustworthy denominator when the provider vouches for it. `false` (a
+    // third-party Anthropic-compat proxy like GLM) means the persisted window is
+    // the SDK's generic ~200K default → don't render a % against it, even for
+    // EXISTING sessions whose bogus window is already in the DB. undefined/true
+    // → trust (back-compat; the server write gate prevents new bogus windows).
+    const reportedWindowTrusted = options?.reportedContextWindowTrusted !== false;
+
     // Phase 5 — prefer a fresh SDK snapshot over the char:token estimator.
     // Freshness window matches the plan (60s). Beyond that, the estimator
     // takes over and the `source` flag flips so the UI can signal the
@@ -123,12 +151,16 @@ export function useContextUsage(
       const used = snap.totalTokens;
       const max = snap.maxTokens || catalogContextWindow || used;
       const ratio = max ? used / max : 0;
+      // Trusted only when the SDK snapshot itself reported a real maxTokens
+      // (#632) — a fallback to catalog/used is not a trustworthy denominator.
+      const snapWindowTrusted = (snap.maxTokens ?? 0) > 0 && reportedWindowTrusted;
       // No estimated-next-turn from the snapshot — we assume next turn is
       // similar to current (snapshot is authoritative on "used now" but
       // can't project future output).
       return {
         modelName,
         contextWindow: max,
+        contextWindowTrusted: snapWindowTrusted,
         used,
         ratio,
         estimatedNextTurn: used,
@@ -148,7 +180,7 @@ export function useContextUsage(
             cacheCreationTokens: 0,
             outputTokens: 0,
           },
-          contextWindow: max,
+          contextWindow: snapWindowTrusted ? max : undefined,
           pending: options?.pending,
         }),
       };
@@ -175,6 +207,15 @@ export function useContextUsage(
         ?? latestSdkContextWindow
         ?? catalogContextWindow;
 
+      // v0.56.x Phase 2 (#632) — the window is only a TRUSTED denominator
+      // when the SDK / upstream actually reported it. The static
+      // `catalogContextWindow` fallback is a guess; rendering a percentage /
+      // remaining / unused against it is what produced the ">100%" and
+      // 假百分比 the user reported (a stale or wrong guess + post-compaction
+      // used jumps). When untrusted we surface absolute used + kind
+      // composition only (no %, no remaining, no unused, no fabricated total).
+      const contextWindowTrusted = (sdkContextWindow != null || latestSdkContextWindow != null) && reportedWindowTrusted;
+
       const outputTokens = baseline.outputTokens;
       // Build breakdown first — its usedTokens may promote past baseline.used
       // when provider proxies (Native/Codex+GLM) report input_tokens=0 but
@@ -187,7 +228,9 @@ export function useContextUsage(
           cacheCreationTokens: baseline.cacheCreationTokens,
           outputTokens,
         },
-        contextWindow: contextWindow ?? undefined,
+        // Untrusted window → omit it so the breakdown / dot-matrix fall back
+        // to a used-relative composition view instead of a fabricated capacity.
+        contextWindow: contextWindowTrusted ? (contextWindow ?? undefined) : undefined,
         pending: options?.pending,
         // Phase 1 (Context Accounting Runtime Contract, 2026-05-20):
         // feed compiler inputs from the Runtime-produced snapshot.
@@ -214,6 +257,7 @@ export function useContextUsage(
       return {
         modelName,
         contextWindow,
+        contextWindowTrusted,
         used,
         ratio,
         estimatedNextTurn,
@@ -238,6 +282,10 @@ export function useContextUsage(
     return {
       modelName,
       contextWindow: latestSdkContextWindow ?? catalogContextWindow,
+      // Trusted only if an SDK window was actually seen during the walk AND the
+      // provider vouches for it (#632) — catalog fallback alone, or a third-party
+      // proxy's SDK default, is not a trustworthy denominator.
+      contextWindowTrusted: latestSdkContextWindow != null && reportedWindowTrusted,
       used: 0,
       ratio: 0,
       estimatedNextTurn: 0,
@@ -250,9 +298,11 @@ export function useContextUsage(
       hasSummary: options?.hasSummary || false,
       source: 'none' as const,
       breakdown: buildContextUsageBreakdown({
-        contextWindow: (latestSdkContextWindow ?? catalogContextWindow) ?? undefined,
+        contextWindow: latestSdkContextWindow != null && reportedWindowTrusted
+          ? (latestSdkContextWindow ?? catalogContextWindow) ?? undefined
+          : undefined,
         pending: options?.pending,
       }),
     };
-  }, [messages, modelName, options?.context1m, options?.hasSummary, options?.upstreamModelId, options?.snapshot, options?.pending]);
+  }, [messages, modelName, options?.context1m, options?.hasSummary, options?.upstreamModelId, options?.snapshot, options?.pending, options?.reportedContextWindowTrusted]);
 }

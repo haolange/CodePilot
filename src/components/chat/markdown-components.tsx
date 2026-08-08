@@ -26,11 +26,21 @@
  * plug it in without restyling.
  */
 
-import type { ComponentProps, ReactNode } from "react";
-import { useCallback, useRef, useState } from "react";
+import type { ComponentProps } from "react";
+import { useCallback, useRef } from "react";
+import type { BundledLanguage } from "shiki";
 import { cn } from "@/lib/utils";
 import { CodePilotIcon } from "@/components/ui/semantic-icon";
 import { showToast } from "@/hooks/useToast";
+import { CodeBlockContent } from "@/components/ai-elements/code-block";
+import {
+  BASE_MARKDOWN_COMPONENTS,
+  MarkdownInlineCode,
+  isMarkdownFenceBlock,
+  markdownChildrenToText,
+  markdownFenceLanguage,
+  type MarkdownCodeProps,
+} from "@/components/markdown/markdown-contract";
 
 // Shared card-action-button class — same geometry as Widget toolbar.
 // `justify-center` is intentional: icon-only variants (h-7 w-7 px-0)
@@ -39,20 +49,6 @@ import { showToast } from "@/hooks/useToast";
 // fix after user feedback.
 const cardActionBtn =
   "h-7 px-2 gap-1 inline-flex items-center justify-center rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-muted transition-colors disabled:opacity-40 disabled:pointer-events-none";
-
-// Recursively flatten React children to plain text. Used for "copy as
-// plaintext" fallbacks where we don't need full markdown round-trip.
-function childrenToText(children: ReactNode): string {
-  if (children == null || children === false) return "";
-  if (typeof children === "string" || typeof children === "number") return String(children);
-  if (Array.isArray(children)) return children.map(childrenToText).join("");
-  if (typeof children === "object" && children !== null && "props" in children) {
-    // ReactElement
-    const props = (children as { props?: { children?: ReactNode } }).props;
-    return childrenToText(props?.children);
-  }
-  return "";
-}
 
 // ---------------------------------------------------------------------------
 // Table → Widget-style card with action buttons
@@ -122,180 +118,101 @@ function ChatTable({ children, className, ...props }: ComponentProps<"table">) {
   );
 }
 
-function ChatTHead(props: ComponentProps<"thead">) {
-  return <thead className="border-b border-border/60 bg-muted/40 [&_th]:px-3 [&_th]:py-2 [&_th]:text-left [&_th]:font-medium" {...props} />;
-}
-function ChatTBody(props: ComponentProps<"tbody">) {
-  return <tbody className="[&_tr]:border-b [&_tr]:border-border/30 [&_tr:last-child]:border-0 [&_td]:px-3 [&_td]:py-2 [&_td]:align-top" {...props} />;
-}
-
 // ---------------------------------------------------------------------------
-// Code block — Widget-style card with copy button
+// Code block — Widget-style card, Shiki-highlighted via the Web Worker
 // ---------------------------------------------------------------------------
-// streamdown's `code` plugin highlights via Shiki and ships its own
-// `<pre>`. We only override `pre` so the OUTER chrome matches the
-// Widget card; the inner highlighted code is left to the plugin.
+// Chat code-fence highlighting fix: the previous cut mapped `code` to a plain
+// inline pill for BOTH inline and fenced code and `pre` to the card chrome.
+// Because react-markdown/streamdown render a fenced block as `<pre><code>`,
+// overriding `code` with an inline pill made real chat code fences render as
+// un-highlighted text and NEVER reach `highlightCode()` → the Shiki Worker
+// (they were "swallowed" as inline code). Streamdown's own block renderer —
+// the only thing that consults `plugins.code` / `createSharedCodePlugin` — was
+// bypassed by the override.
+//
+// Fix: split `code` into a dispatcher (`ChatCode`) that keeps inline code as
+// the pill but renders fenced blocks as a self-contained Widget-card block
+// (`ChatCodeFenceBlock`). The block body reuses `CodeBlockContent`, which routes
+// tokenization through the exact same `highlightCode()` seam as the rest of the
+// app: Shiki Worker on the hot path, main-thread engine as fallback, raw code
+// shown immediately so a block is never blank. `pre` becomes a pass-through
+// (streamdown's own default) because the card now owns the whole block.
 
-function ChatPre({ children, className, ...props }: ComponentProps<"pre">) {
-  const preRef = useRef<HTMLPreElement>(null);
+/**
+ * Inline-vs-block classification, mirroring streamdown's own heuristic
+ * (`node.position.start.line === node.position.end.line` ⇒ inline). A fenced
+ * block always spans its opening/closing delimiters, so its position is
+ * multi-line; a language class or an embedded newline are robust fallbacks
+ * when `node.position` is absent. Exported for the routing regression test.
+ */
+export function isChatFenceBlock(args: {
+  node?: { position?: { start?: { line?: number }; end?: { line?: number } } };
+  className?: string;
+  text: string;
+}): boolean {
+  return isMarkdownFenceBlock(args);
+}
 
-  // Inspect the code child for a language hint — streamdown puts the
-  // language as `data-language` on the code element when its shiki
-  // plugin runs. Fall back to "code" so the badge always shows.
-  const langGuess = (() => {
-    if (!Array.isArray(children) && typeof children === "object" && children && "props" in children) {
-      const props = (children as { props?: Record<string, unknown> }).props;
-      const dl = props?.["data-language"];
-      if (typeof dl === "string") return dl;
-      const cls = props?.className;
-      if (typeof cls === "string") {
-        const m = cls.match(/language-([a-z0-9+#-]+)/i);
-        if (m) return m[1];
-      }
-    }
-    return "";
-  })();
-
+/**
+ * Fenced code block rendered as a Widget-style card. Chrome (rounded-xl muted
+ * card, language badge, single copy button) matches the previous ChatPre; the
+ * body is `CodeBlockContent`, which highlights through the Shiki Worker seam
+ * (with main-thread fallback) and surfaces `data-language` for the block.
+ */
+function ChatCodeFenceBlock({ code, language }: { code: string; language: string }) {
   const handleCopy = useCallback(async () => {
-    const pre = preRef.current;
-    if (!pre) return;
-    const txt = pre.innerText;
     try {
-      await navigator.clipboard.writeText(txt);
+      await navigator.clipboard.writeText(code);
       showToast({ type: "success", message: "已复制" });
     } catch {
       showToast({ type: "error", message: "复制失败" });
     }
-  }, []);
+  }, [code]);
 
-  // Same header-bar layout as ChatTable — keeps the action buttons
-  // out of the code area so long single-line code can use the full
-  // card width without hiding behind the copy button.
-  // Round 14: header bar uses `bg-muted/30` to mark itself off from
-  // the code area; the explicit `border-b` between header and pre
-  // was redundant (color shift already does the separation) and
-  // showed as an extra hairline that didn't read well.
   return (
-    <div className="my-4 rounded-xl bg-muted/20 overflow-hidden">
+    <div
+      className="my-4 rounded-xl bg-muted/20 overflow-hidden"
+      data-language={language || "text"}
+      data-codepilot-chat-code-block=""
+    >
       <div className="flex items-center justify-between gap-2 bg-muted/30 px-3 py-1">
         <span className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground/70">
-          {langGuess || "code"}
+          {language || "code"}
         </span>
-        <button type="button" onClick={handleCopy} className={cn(cardActionBtn, "h-7 w-7 px-0")} aria-label="Copy code" title="复制代码">
+        <button
+          type="button"
+          onClick={handleCopy}
+          className={cn(cardActionBtn, "h-7 w-7 px-0")}
+          aria-label="Copy code"
+          title="复制代码"
+        >
           <CodePilotIcon name="copy" size="sm" aria-hidden />
         </button>
       </div>
-      <pre
-        ref={preRef}
-        className={cn("overflow-x-auto px-4 py-3 text-sm font-mono leading-relaxed", className)}
-        {...props}
-      >
-        {children}
-      </pre>
+      <CodeBlockContent code={code} language={(language || "text") as BundledLanguage} />
     </div>
   );
 }
 
-// Inline code (single backtick). Don't apply card chrome — just a
-// muted pill so it stands out in prose.
-function ChatInlineCode({ className, ...props }: ComponentProps<"code">) {
-  return (
-    <code
-      className={cn(
-        "rounded bg-muted px-1.5 py-0.5 font-mono text-[0.875em] text-foreground",
-        className,
-      )}
-      {...props}
-    />
-  );
+// The `code` component override. Inline code stays a muted pill; fenced blocks
+// render as the highlighted Widget-card block above (worker-backed).
+function ChatCode({ node, className, children, ...props }: MarkdownCodeProps) {
+  const text = markdownChildrenToText(children);
+  if (!isChatFenceBlock({ node, className, text })) {
+    return (
+      <MarkdownInlineCode className={className} {...props}>
+        {children}
+      </MarkdownInlineCode>
+    );
+  }
+  return <ChatCodeFenceBlock code={text} language={markdownFenceLanguage(className)} />;
 }
 
-// ---------------------------------------------------------------------------
-// Typography — heading / paragraph / list / blockquote / hr / link
-// ---------------------------------------------------------------------------
-
-function ChatH1(props: ComponentProps<"h1">) {
-  return <h1 className="mt-6 mb-3 text-2xl font-semibold tracking-tight" {...props} />;
-}
-function ChatH2(props: ComponentProps<"h2">) {
-  return <h2 className="mt-5 mb-3 text-xl font-semibold tracking-tight" {...props} />;
-}
-function ChatH3(props: ComponentProps<"h3">) {
-  return <h3 className="mt-4 mb-2 text-lg font-semibold" {...props} />;
-}
-function ChatH4(props: ComponentProps<"h4">) {
-  return <h4 className="mt-3 mb-2 text-base font-semibold" {...props} />;
-}
-function ChatParagraph(props: ComponentProps<"p">) {
-  return <p className="my-3 leading-7" {...props} />;
-}
-function ChatUl(props: ComponentProps<"ul">) {
-  return <ul className="my-3 ml-5 list-disc space-y-1.5 marker:text-muted-foreground/60" {...props} />;
-}
-function ChatOl(props: ComponentProps<"ol">) {
-  return <ol className="my-3 ml-5 list-decimal space-y-1.5 marker:text-muted-foreground/60" {...props} />;
-}
-function ChatLi(props: ComponentProps<"li">) {
-  return <li className="pl-1.5 leading-7" {...props} />;
-}
-function ChatBlockquote(props: ComponentProps<"blockquote">) {
-  return (
-    <blockquote
-      className="my-4 border-l-4 border-border pl-4 py-1 text-muted-foreground italic"
-      {...props}
-    />
-  );
-}
-function ChatHr(props: ComponentProps<"hr">) {
-  return <hr className="my-6 border-border/50" {...props} />;
-}
-function ChatLink(props: ComponentProps<"a">) {
-  return (
-    <a
-      className="text-primary underline underline-offset-4 decoration-primary/30 hover:decoration-primary"
-      target={props.href?.startsWith("http") ? "_blank" : undefined}
-      rel={props.href?.startsWith("http") ? "noopener noreferrer" : undefined}
-      {...props}
-    />
-  );
-}
-function ChatStrong(props: ComponentProps<"strong">) {
-  return <strong className="font-semibold text-foreground" {...props} />;
-}
-
-// `img` — center + rounded; keeps images sane in the chat column.
-function ChatImg(props: ComponentProps<"img">) {
-  return (
-    <img
-      className="my-3 max-w-full rounded-lg border border-border/40"
-      loading="lazy"
-      {...props}
-    />
-  );
-}
-
-// Touch every used elementToString reference so eslint doesn't complain
-// in case dead-code elimination misses it; remove if all consumers
-// migrate to the DOM-based copy fallback above.
-void childrenToText;
-
+// `pre` is now a pass-through: ChatCode renders the entire fenced-block card,
+// so `pre` only needs to hand the block through — matching streamdown's own
+// default `pre` (which is likewise a pass-through).
 export const CHAT_MARKDOWN_COMPONENTS = {
-  h1: ChatH1,
-  h2: ChatH2,
-  h3: ChatH3,
-  h4: ChatH4,
-  p: ChatParagraph,
-  ul: ChatUl,
-  ol: ChatOl,
-  li: ChatLi,
-  blockquote: ChatBlockquote,
-  hr: ChatHr,
-  a: ChatLink,
-  strong: ChatStrong,
-  img: ChatImg,
+  ...BASE_MARKDOWN_COMPONENTS,
   table: ChatTable,
-  thead: ChatTHead,
-  tbody: ChatTBody,
-  pre: ChatPre,
-  code: ChatInlineCode,
+  code: ChatCode,
 } as const;

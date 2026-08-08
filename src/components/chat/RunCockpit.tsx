@@ -38,6 +38,7 @@
 import dynamic from "next/dynamic";
 import type { LanguageModelUsage } from "ai";
 import type { Message } from "@/types";
+import type { SessionPermissionProfile } from "@/lib/permission/profile";
 import { useTranslation } from "@/hooks/useTranslation";
 import type { TranslationKey } from "@/i18n";
 import { useContextUsage } from "@/hooks/useContextUsage";
@@ -108,7 +109,7 @@ interface RunCockpitProps {
     capturedAt: number;
   };
   /** Active chat's permission profile. */
-  permissionProfile?: "default" | "full_access";
+  permissionProfile?: SessionPermissionProfile;
   /** Pre-send token estimate for currently attached @ mention chips.
    *  Surfaced as a "+10K 待加" suffix in the trigger label so the user
    *  can preview the cost. Resets to 0 after send. */
@@ -127,6 +128,14 @@ interface RunCockpitProps {
    *  global pinned/runtime-fallback signals when the user has
    *  explicitly opted out of the global default for this session. */
   sessionRuntimePin?: string;
+  /**
+   * #632 item 1 — whether this session's provider reports a trustworthy
+   * context window (false only for a third-party Anthropic-compatible proxy
+   * like GLM). Forwarded to useContextUsage so an existing third-party session
+   * stops rendering a fake "200K" capacity. Resolved by the parent from the
+   * provider group's `reportedContextWindowTrusted`.
+   */
+  reportedContextWindowTrusted?: boolean;
 }
 
 export function RunCockpit({
@@ -141,12 +150,14 @@ export function RunCockpit({
   pendingContextTokens = 0,
   pendingContextSubTotals,
   sessionRuntimePin,
+  reportedContextWindowTrusted,
 }: RunCockpitProps = {}) {
   const { t } = useTranslation();
   const usage = useContextUsage(messages, modelName, {
     context1m,
     hasSummary,
     upstreamModelId,
+    reportedContextWindowTrusted,
     snapshot: contextUsageSnapshot,
     pending: pendingContextSubTotals
       ? {
@@ -163,10 +174,18 @@ export function RunCockpit({
       ? ` +${formatTokensCompact(pendingContextTokens)}`
       : "";
 
-  const hasFullCtx = usage.hasData && (usage.contextWindow ?? 0) > 0;
+  // v0.56.x Phase 2 (#632) — only show a percentage when the context window
+  // is a TRUSTED (SDK/upstream-reported) denominator. Catalog fallback →
+  // hasFullCtx=false → fall through to the absolute used-tokens display.
+  const hasFullCtx = usage.hasData && usage.contextWindowTrusted && (usage.contextWindow ?? 0) > 0;
   const ringPercent = hasFullCtx ? Math.min(1, Math.max(0, usage.ratio)) : 0;
+  // Clamp the displayed percentage to ≤100% — a trusted window can still be
+  // momentarily exceeded by `used` (e.g. right after compaction); never show >100%.
+  const clampedRatio = Math.min(1, Math.max(0, usage.ratio));
+  // Trusted window → show "percent + used" together (e.g. "56.6% 452K") per
+  // user spec; untrusted → used absolute only. No standalone "remaining" number.
   const ratioText = hasFullCtx
-    ? `${(usage.ratio * 100).toFixed(usage.ratio < 0.1 ? 1 : 0)}%${pendingSuffix}`
+    ? `${(clampedRatio * 100).toFixed(1)}% ${formatTokensCompact(usage.used)}${pendingSuffix}`
     : usage.hasData
       ? `${formatTokensCompact(usage.used)}${pendingSuffix}`
       : pendingContextTokens > 0
@@ -191,13 +210,19 @@ export function RunCockpit({
       aria-label={t("runStatus.triggerLabel" as TranslationKey)}
       className="h-7 gap-1.5 rounded-md px-2 text-[11px] font-medium text-muted-foreground transition-colors"
     >
-      <ContextDotMatrix
-        breakdown={usage.breakdown}
-        cellCount={10}
-        rows={1}
-        minCellsPerKind={0}
-        className="w-[44px] shrink-0"
-      />
+      {/* v0.56.x #632 follow-up — the mini capacity bar only makes sense
+          against a TRUSTED window. When untrusted (catalog fallback / none)
+          we'd be drawing a "used / remaining" gauge against a guess, so hide
+          it and let the trigger show only the absolute used-token text. */}
+      {hasFullCtx && (
+        <ContextDotMatrix
+          breakdown={usage.breakdown}
+          cellCount={10}
+          rows={1}
+          minCellsPerKind={0}
+          className="w-[44px] shrink-0"
+        />
+      )}
       <span className="truncate">{ratioText}</span>
     </Button>
   );
@@ -222,7 +247,6 @@ export function RunCockpit({
           reasoningTokens: undefined,
         },
         totalTokens: usage.used + usage.outputTokens,
-        cachedInputTokens: usage.cacheReadTokens,
       }
     : undefined;
 

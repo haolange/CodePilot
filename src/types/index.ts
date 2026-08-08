@@ -2,6 +2,25 @@
 // Database Models
 // ==========================================
 
+import type { TitleOrigin } from '@/lib/conversation-title';
+import type { SessionPermissionProfile } from '@/lib/permission/profile';
+import type { PermissionReviewNotice } from '@/lib/permission/review-event';
+import type {
+  DelegatedAgentArtifact,
+  DelegatedAgentResult,
+  DelegatedAgentSource,
+  DelegatedAgentUsage,
+  DelegatedAgentWarning,
+  SubagentDispatchState,
+  SubagentExecutionStatus,
+  SubagentLifecycleEventType,
+  SubagentRunPhase,
+  SubagentStatusError,
+} from '@/lib/subagent-status';
+
+export type { TitleOrigin };
+export type { SessionPermissionProfile };
+
 /**
  * Phase 3 Step 4 — chat session origin. Default `'user'` for normal
  * user-opened conversations; `'task'` for sessions created by the
@@ -17,6 +36,13 @@ export type ChatSessionSource = 'user' | 'task';
 export interface ChatSession {
   id: string;
   title: string;
+  /**
+   * Provenance of `title` — who wrote it and therefore who may overwrite it.
+   * See `TitleOrigin` in `src/lib/conversation-title.ts` for the state machine;
+   * `src/lib/db.ts#updateSessionTitle` is the only writer. Optional here because
+   * rows read back from a pre-migration DB snapshot may predate the column.
+   */
+  title_origin?: TitleOrigin;
   created_at: string;
   updated_at: string;
   model: string;
@@ -73,7 +99,7 @@ export interface ChatSession {
   runtime_status: string;
   runtime_updated_at: string;
   runtime_error: string;
-  permission_profile?: 'default' | 'full_access';
+  permission_profile?: SessionPermissionProfile;
   context_summary?: string;
   context_summary_updated_at?: string;
 }
@@ -206,6 +232,12 @@ export interface Message {
   content: string; // JSON string of MessageContentBlock[] for structured content
   created_at: string;
   token_usage: string | null; // JSON string of TokenUsage
+  /**
+   * Durable lifecycle of the assistant transcript row. Older/synthetic rows may
+   * omit it and are treated as completed. A `streaming` row is an incremental
+   * checkpoint, not proof that the turn finished successfully.
+   */
+  stream_status?: 'streaming' | 'completed' | 'interrupted' | 'error';
   is_heartbeat_ack?: number; // 1 = heartbeat ack (prunable from transcript), 0 = normal
   /**
    * Phase 3 Step 4 — link this message to a `task_run_logs` row. When
@@ -223,6 +255,150 @@ export interface Message {
    * because some code paths synthesize Message-like objects without DB origin.
    */
   _rowid?: number;
+}
+
+/**
+ * Durable lifecycle fact for a managed Sub-agent attempt.
+ *
+ * `terminal` is stored as SQLite INTEGER so callers must compare it with 1,
+ * not use plan text or the presence of a tool result as a completion signal.
+ */
+export interface SubagentRunRecord {
+  id: string;
+  logical_run_id: string;
+  attempt_number: number;
+  parent_session_id: string;
+  runtime: 'codepilot_runtime' | 'claude_code' | 'codex_runtime';
+  tool_name: string;
+  agent_name: string;
+  provider_id: string;
+  requested_model: string;
+  effective_provider_id: string;
+  effective_model: string;
+  workflow_id: string;
+  task_key: string;
+  dependencies_json: string;
+  dispatch_state: SubagentDispatchState;
+  prompt: string;
+  status: SubagentExecutionStatus;
+  phase: SubagentRunPhase;
+  terminal: 0 | 1;
+  result_text: string;
+  result_json: string;
+  current_activity: string;
+  last_activity_at: string;
+  error_json: string;
+  created_at: string;
+  updated_at: string;
+  completed_at: string;
+}
+
+export interface StartSubagentRunInput {
+  id: string;
+  /** Reuse this opaque id only when retrying the same logical task. */
+  logicalRunId?: string;
+  parentSessionId: string;
+  runtime: SubagentRunRecord['runtime'];
+  toolName: string;
+  agentName: string;
+  providerId?: string;
+  requestedModel?: string;
+  workflowId?: string;
+  taskKey?: string;
+  dependencyTaskKeys?: string[];
+  prompt?: string;
+}
+
+export interface SettleSubagentRunInput {
+  status: Exclude<SubagentExecutionStatus, 'running'>;
+  resultText?: string;
+  effectiveProviderId?: string;
+  effectiveModel?: string;
+  error?: SubagentStatusError;
+  sources?: DelegatedAgentSource[];
+  artifacts?: DelegatedAgentArtifact[];
+  warnings?: DelegatedAgentWarning[];
+  usage?: DelegatedAgentUsage;
+}
+
+export interface CheckpointSubagentRunInput {
+  resultText?: string;
+  effectiveProviderId?: string;
+  effectiveModel?: string;
+  currentActivity?: string;
+}
+
+export interface SubagentRunEventRecord {
+  id: string;
+  run_id: string;
+  logical_run_id: string;
+  sequence: number;
+  /** Monotonic database change cursor; advances when a coalesced row updates. */
+  cursor: number;
+  event_type: SubagentLifecycleEventType;
+  activity: string;
+  tool_name: string;
+  payload_json: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RecordSubagentRunEventInput {
+  type: SubagentLifecycleEventType;
+  activity?: string;
+  toolName?: string;
+  payload?: Record<string, unknown>;
+  /** Repeated partial/activity events with the same key update in place. */
+  coalesceKey?: string;
+}
+
+export interface SubagentRunAttemptSnapshot {
+  id: string;
+  logicalRunId: string;
+  attemptNumber: number;
+  runtime: SubagentRunRecord['runtime'];
+  toolName: string;
+  agentName: string;
+  providerId?: string;
+  requestedModel?: string;
+  effectiveProviderId?: string;
+  effectiveModel?: string;
+  workflowId?: string;
+  taskKey?: string;
+  dependencyTaskKeys: string[];
+  dispatchState: SubagentDispatchState;
+  status: SubagentExecutionStatus;
+  phase: SubagentRunPhase;
+  terminal: boolean;
+  prompt: string;
+  resultText?: string;
+  result?: DelegatedAgentResult;
+  currentActivity?: string;
+  lastActivityAt?: string;
+  error?: SubagentStatusError;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+}
+
+export interface SubagentRunDetailsResponse {
+  source: 'sqlite.subagent_runs';
+  logicalRunId: string;
+  /** Pass this value back as after_cursor to fetch only later event changes. */
+  nextEventCursor: number;
+  attempts: SubagentRunAttemptSnapshot[];
+  events: Array<{
+    id: string;
+    attemptId: string;
+    sequence: number;
+    cursor: number;
+    type: SubagentLifecycleEventType;
+    activity?: string;
+    toolName?: string;
+    payload?: Record<string, unknown>;
+    createdAt: string;
+    updatedAt: string;
+  }>;
 }
 
 // Media content block (MCP-compatible: image/audio/video in tool results)
@@ -244,7 +420,26 @@ export interface MediaBlock {
     prompt?: string;
     /** Provider/model identifier (e.g. 'codex-image'). */
     model?: string;
+    /** Typed Asset inputs used to produce this result, when the producer knows them. */
+    parentAssetIds?: string[];
+    /**
+     * `imageGeneration` creates a durable Asset. `imageView` is only a chat
+     * preview and must not create another Gallery record for the same bytes.
+     */
+    persistence?: 'durable_asset' | 'preview_only';
   };
+}
+
+/**
+ * A provider-reported URL source used to support a model response.
+ * `trust: external` is intentionally carried into persistence/UI so retrieved
+ * post text can never be confused with CodePilot instructions.
+ */
+export interface ExternalSource {
+  id: string;
+  url: string;
+  title?: string;
+  trust: 'external';
 }
 
 // Structured message content blocks (stored as JSON in messages.content)
@@ -252,7 +447,7 @@ export type MessageContentBlock =
   | { type: 'text'; text: string }
   | { type: 'thinking'; thinking: string }
   | { type: 'tool_use'; id: string; name: string; input: unknown }
-  | { type: 'tool_result'; tool_use_id: string; content: string; is_error?: boolean; media?: MediaBlock[] }
+  | { type: 'tool_result'; tool_use_id: string; content: string; is_error?: boolean; media?: MediaBlock[]; sources?: ExternalSource[] }
   | { type: 'code'; language: string; code: string };
 
 // Helper to parse message content - returns blocks or wraps plain text
@@ -280,10 +475,14 @@ export interface ApiProvider {
   id: string;
   name: string;
   provider_type: string; // legacy: 'anthropic' | 'openrouter' | 'bedrock' | 'vertex' | 'custom'
+  /** Stable catalog identity selected by the user. Empty only for legacy/ambiguous rows. */
+  preset_key: string;
   /** Wire protocol — new field, takes precedence over provider_type for dispatch */
-  protocol: string; // 'anthropic' | 'openai-compatible' | 'openrouter' | 'bedrock' | 'vertex' | 'google' | 'gemini-image' | 'openai-image'
+  protocol: string; // 'anthropic' | 'openai-compatible' | 'xai' | 'openrouter' | 'bedrock' | 'vertex' | 'google' | 'gemini-image' | 'openai-image'
   base_url: string;
   api_key: string;
+  /** Safe storage metadata only; never contains key material or ciphertext. */
+  api_key_storage?: string;
   is_active: number; // SQLite boolean: 0 or 1
   sort_order: number;
   extra_env: string; // JSON string of Record<string, string> (legacy, prefer env_overrides_json)
@@ -304,6 +503,8 @@ export interface ProviderModelGroup {
   provider_id: string;       // provider DB id, or 'env' for environment variables
   provider_name: string;
   provider_type: string;
+  preset_key: string;
+  protocol: string;
   /** True if this provider only supports Claude Code SDK wire protocol, not standard Messages API */
   sdkProxyOnly?: boolean;
   /** Total models known for this provider (enabled + hidden in provider_models,
@@ -318,6 +519,16 @@ export interface ProviderModelGroup {
   /** Provider-layer runtime compat. Computed from preset + protocol; a single
    * source of truth across Provider Card / Models page / chat picker. */
   compat?: ProviderRuntimeCompat;
+  /**
+   * #632 item 1 — whether a `token_usage.context_window` persisted for a
+   * session on this provider reflects a REAL capacity. `false` only for an
+   * anthropic-protocol provider on a third-party base_url: the Claude Agent
+   * SDK reports a generic ~200K default there (the GLM "200K" the user
+   * reported). Non-anthropic runtimes (Codex's modelContextWindow, etc.)
+   * report their own real window, so they stay trusted. Undefined = trusted
+   * (back-compat; consumers must gate on `=== false`, not falsiness).
+   */
+  reportedContextWindowTrusted?: boolean;
   models: Array<{
     value: string;           // internal/UI model ID
     label: string;           // display name
@@ -326,6 +537,8 @@ export interface ProviderModelGroup {
     description?: string;
     supportsEffort?: boolean;
     supportedEffortLevels?: string[];
+    /** i18n key for the effort menu's mapping note (see CatalogModel.capabilities). */
+    effortNoteKey?: string;
     supportsAdaptiveThinking?: boolean;
     capabilities?: Record<string, unknown>;
     variants?: Record<string, unknown>;
@@ -500,6 +713,8 @@ export interface ProviderModel {
 
 export interface CreateProviderRequest {
   name: string;
+  /** Required for preset-backed create flows; generic/legacy callers pass ''. */
+  preset_key?: string;
   provider_type?: string;
   protocol?: string;
   base_url?: string;
@@ -514,6 +729,14 @@ export interface CreateProviderRequest {
 
 export interface UpdateProviderRequest {
   name?: string;
+  /** Omit to preserve identity. Send only for an explicit user preset switch. */
+  preset_key?: string;
+  /**
+   * Request catalog-managed model reconciliation for an explicit preset
+   * choice. Merely adopting a stable identity on a legacy row must not imply
+   * permission to rewrite its catalog rows.
+   */
+  reconcile_catalog?: boolean;
   provider_type?: string;
   protocol?: string;
   base_url?: string;
@@ -690,12 +913,14 @@ export interface TokenUsage {
   /**
    * Context window the SDK reports for the model that handled this turn.
    * Source: `SDKResultMessage.modelUsage[<key>].contextWindow` (Claude
-   * Agent SDK ≥ 0.2.111). Optional because (a) older DB rows don't have
-   * it and (b) some adapters / fallback paths don't populate it. When
-   * present, `useContextUsage` prefers it over the static
-   * `model-context.ts` lookup so models the catalog doesn't know about
-   * (GLM / Bailian / Volcengine / MiniMax / Kimi / etc.) still get a
-   * proper percent + Context bar in RunCockpit.
+   * Agent SDK ≥ 0.2.111) — but it's the SDK's BUNDLED-catalog value, not the
+   * provider's API. #632: claude-client only persists this for a first-party
+   * Anthropic endpoint; for third-party Anthropic-compatible proxies (GLM /
+   * Bailian / Volcengine / MiniMax / Kimi via custom base_url) the SDK reports
+   * a generic ~200K default, so this field is left ABSENT there and RunCockpit
+   * shows used-tokens only (no fabricated %). Also absent for older DB rows and
+   * adapters that don't populate modelUsage. When present, `useContextUsage`
+   * treats it as the trusted window over the static `model-context.ts` lookup.
    */
   context_window?: number;
   /** Max output tokens reported by the SDK alongside contextWindow. */
@@ -707,6 +932,28 @@ export interface TokenUsage {
    * proxy returns its upstream model id).
    */
   usage_model_id?: string;
+  /**
+   * Measured Claude Code turn latency. Persisted from Claude Agent SDK events
+   * and result fields; absent for older rows and other runtimes. Values that
+   * the SDK did not report stay absent rather than being displayed as fake 0s.
+   */
+  runtime_latency?: {
+    source: 'claude-agent-sdk';
+    /** SDK `SDKPartialAssistantMessage.ttft_ms`. */
+    ttft_ms?: number;
+    /** SDK result duration (whole SDK query). */
+    duration_ms?: number;
+    /** SDK result upstream API duration. */
+    duration_api_ms?: number;
+    /** CodePilot wall clock from stream start through the result. */
+    wall_ms?: number;
+    /** Number of real SDK `api_retry` events observed. */
+    api_retry_count: number;
+    /** SDK result subtype, e.g. success / error_during_execution. */
+    terminal_type: string;
+    resume_attempted: boolean;
+    resume_fallback: boolean;
+  };
 }
 
 // ==========================================
@@ -720,7 +967,7 @@ export interface CreateSessionRequest {
   working_directory?: string;
   mode?: string;
   provider_id?: string;
-  permission_profile?: string;
+  permission_profile?: SessionPermissionProfile;
 }
 
 export interface SendMessageRequest {
@@ -878,6 +1125,12 @@ export interface FilePreviewResponse {
   preview: FilePreview;
 }
 
+export interface FileInspectResponse {
+  kind: 'file' | 'directory' | 'other';
+  /** Canonical path after server-side realpath + scope validation. */
+  realPath: string;
+}
+
 // --- Task API Responses ---
 
 export interface TasksResponse {
@@ -913,6 +1166,12 @@ export type SSEEventType =
   | 'result'             // final result with usage stats
   | 'error'              // error occurred
   | 'permission_request' // permission approval needed
+  | 'permission_resolved' // permission auto-resolved server-side (timeout) — A5 Step 2
+  | 'permission_review'  // canonical review decision made WITHOUT a prompt —
+                         // currently the auto_review classifier denying a tool
+                         // (reviewerSource: 'sdk-reviewer'). Distinct from
+                         // permission_resolved, which closes a prompt the user
+                         // was actually shown. See lib/permission/review-event.ts.
   | 'mode_changed'       // SDK permission mode changed (e.g. plan → code)
   | 'task_update'        // SDK TodoWrite task sync
   | 'keep_alive'         // SDK keep-alive heartbeat (resets idle timer)
@@ -948,15 +1207,28 @@ export interface PermissionRequestEvent {
   permissionRequestId: string;
   toolName: string;
   toolInput: Record<string, unknown>;
+  /** Managed child attribution; the DB owner remains the parent chat session. */
+  agentRunId?: string;
+  childSessionId?: string;
+  agentName?: string;
   suggestions?: PermissionSuggestion[];
   decisionReason?: string;
   blockedPath?: string;
   toolUseId: string;
   description?: string;
+  /**
+   * HMAC approval token issued by the server at request-creation time
+   * (src/lib/permission-approval-token.ts). The renderer must echo it back
+   * in PermissionResponseRequest; /api/chat/permission rejects responses
+   * whose token is missing, tampered, or bound to a different request.
+   */
+  approvalToken?: string;
 }
 
 export interface PermissionResponseRequest {
   permissionRequestId: string;
+  /** Echo of PermissionRequestEvent.approvalToken — required by the route. */
+  approvalToken?: string;
   decision: {
     behavior: 'allow';
     updatedPermissions?: PermissionSuggestion[];
@@ -1080,6 +1352,12 @@ export interface AssistantWorkspaceFiles {
 export interface AssistantWorkspaceFilesV2 extends AssistantWorkspaceFiles {
   rootDir?: string;
   heartbeatMd?: string;
+  /** The selected rules file is also discoverable as cwd/CLAUDE.md. */
+  rulesFileNativeClaude?: boolean;
+  /** The selected rules file is also discoverable as cwd/AGENTS.md. */
+  rulesFileNativeCodex?: boolean;
+  /** Native mirror files that CodePilot refused to overwrite. */
+  rulesMirrorConflicts?: string[];
 }
 
 // ==========================================
@@ -1223,6 +1501,13 @@ export interface FileAttachment {
   size: number;
   data: string; // base64 encoded content
   filePath?: string; // persisted disk path (for messages reloaded from DB)
+  /** #628 — real in-tree source path for an @-mention of a project file
+   *  (cwd-relative). When set AND server-validated inside cwd, the chat route
+   *  references the real file instead of writing a `.codepilot-uploads` copy, so
+   *  the AI's Read/Edit lands on the user's actual file. Absent for true uploads
+   *  (no in-tree path) — those still get copied. Never trusted server-side: it is
+   *  re-resolved + containment-checked against the working dir. */
+  originPath?: string;
 }
 
 // Check if a MIME type is an image
@@ -1305,6 +1590,70 @@ export interface MediaContextEvent {
   sync_mode: 'manual' | 'auto_batch';
   synced_at: string | null;
   created_at: string;
+}
+
+export type AssetLifecycleState = 'active' | 'trashed';
+export type AssetIntegrityState = 'valid' | 'missing' | 'modified';
+export type AssetLineageRelation =
+  | 'derived_from'
+  | 'input_reference'
+  | 'variant_of';
+
+export interface AssetRecord {
+  id: string;
+  kind: string;
+  producer_id: string;
+  stable_path: string;
+  content_hash: string;
+  mime_type: string;
+  byte_size: number;
+  width: number | null;
+  height: number | null;
+  duration_ms: number | null;
+  preview_path: string;
+  harness_id: string;
+  project_id: string;
+  session_id: string | null;
+  message_id: string | null;
+  runtime_id: string;
+  provider_id: string;
+  model_id: string;
+  prompt: string;
+  method_ref: string;
+  trust_tier: string;
+  source_scope: string;
+  license: string;
+  source_url: string;
+  curation_state: 'unreviewed' | 'selected' | 'rejected';
+  rating: number | null;
+  tags: string;
+  lifecycle_state: AssetLifecycleState;
+  integrity_state: AssetIntegrityState;
+  integrity_reason: string;
+  metadata: string;
+  materialization_key: string;
+  source_media_generation_id: string | null;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+}
+
+export interface AssetLineageRecord {
+  parent_asset_id: string;
+  child_asset_id: string;
+  relation: AssetLineageRelation;
+  metadata: string;
+  created_at: string;
+}
+
+export interface AssetReferenceRecord {
+  id: string;
+  asset_id: string;
+  consumer_type: string;
+  consumer_id: string;
+  metadata: string;
+  created_at: string;
+  released_at: string | null;
 }
 
 export interface BatchConfig {
@@ -1411,6 +1760,7 @@ export interface ToolResultInfo {
   content: string;
   is_error?: boolean;
   media?: MediaBlock[];
+  sources?: ExternalSource[];
 }
 
 export type StreamPhase = 'active' | 'completed' | 'error' | 'stopped';
@@ -1425,7 +1775,18 @@ export interface SessionStreamSnapshot {
   streamingToolOutput: string;
   statusText: string | undefined;
   pendingPermission: PermissionRequestEvent | null;
-  permissionResolved: 'allow' | 'deny' | null;
+  // 'timeout' = auto-denied because the user never responded within the
+  // 5-minute window (codebase-health A5 Step 2). Rendered distinctly from a
+  // manual 'deny' so the user knows they didn't click it.
+  permissionResolved: 'allow' | 'deny' | 'timeout' | null;
+  /**
+   * Review decisions made without prompting the user — today, the auto_review
+   * classifier denying a tool. Distinct from `pendingPermission` (a question
+   * for the user) and `permissionResolved` (the answer to one). Carries
+   * `reviewerSource` so the UI can say who decided. See
+   * lib/permission/review-event.ts.
+   */
+  reviewNotices: PermissionReviewNotice[];
   tokenUsage: TokenUsage | null;
   startedAt: number;
   completedAt: number | null;
@@ -1497,6 +1858,8 @@ export type ConversationHistoryItem = {
 
 export interface ClaudeStreamOptions {
   prompt: string;
+  /** Mandatory credential-use classification; unknown callers fail closed. */
+  callScene: import('@/lib/provider-call-policy').ProviderCallScene;
   sessionId: string;
   sdkSessionId?: string; // SDK session ID for resuming conversations
   model?: string;
@@ -1545,10 +1908,30 @@ export interface ClaudeStreamOptions {
   thinking?: { type: 'adaptive' } | { type: 'enabled'; budgetTokens?: number } | { type: 'disabled' };
   /** Effort level for the query (Opus 4.7 adds 'xhigh') */
   effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+  /**
+   * Sampling params for the query. Threaded into the shared sanitizer so the
+   * adaptive family's "non-default temperature/top_p/top_k returns 400"
+   * contract is enforced on the REAL request, and any drop is announced
+   * (Codex review P2, 2026-07-18). No UI surface populates these today, so
+   * live behavior is unchanged; see the AgentLoopOptions counterpart.
+   */
+  temperature?: number;
+  topP?: number;
+  topK?: number;
   /** Output format for structured responses */
   outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> };
   /** Custom agent definitions */
-  agents?: Record<string, { description: string; prompt?: string; tools?: string[]; disallowedTools?: string[] }>;
+  agents?: Record<string, {
+    description: string;
+    prompt: string;
+    tools?: string[];
+    disallowedTools?: string[];
+    /** Omitted or "inherit" keeps the parent; full IDs/aliases may override per run. */
+    model?: string;
+    maxTurns?: number;
+    background?: boolean;
+    permissionMode?: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan' | 'dontAsk';
+  }>;
   /** Agent name for the main thread */
   agent?: string;
   /** Enable file checkpointing for rewind support */
@@ -1578,6 +1961,15 @@ export interface ClaudeStreamOptions {
    * for normal user chats and ai_task / reminder runs.
    */
   agentMode?: 'heartbeat';
+  /**
+   * Session-lock ownership token (the per-request `lockId` minted in the chat
+   * route via crypto.randomBytes). Plumbed through so this turn's Query is
+   * registered under the token that owns the session lock, and unregister is
+   * gated on it — the I1 ownership gate that keeps a superseded turn's late
+   * teardown from evicting the turn that took over. Optional/additive: legacy
+   * callers that omit it register/unregister under `undefined` as before.
+   */
+  lockId?: string;
 }
 
 // ==========================================
@@ -1805,7 +2197,10 @@ export type TaskRunStatus =
   | 'succeeded'
   | 'failed'
   | 'waiting_for_permission'
-  | 'cancelled';
+  | 'cancelled'
+  | 'skipped_empty'
+  | 'skipped_reconcile_drift'
+  | 'blocked';
 
 export const TASK_RUN_STATUS_VALUES: ReadonlyArray<TaskRunStatus> = [
   'running',
@@ -1813,6 +2208,9 @@ export const TASK_RUN_STATUS_VALUES: ReadonlyArray<TaskRunStatus> = [
   'failed',
   'waiting_for_permission',
   'cancelled',
+  'skipped_empty',
+  'skipped_reconcile_drift',
+  'blocked',
 ];
 
 export function isTaskRunStatus(value: unknown): value is TaskRunStatus {
@@ -1887,13 +2285,8 @@ export interface ScheduledTask {
  */
 export type NotificationChannel =
   | 'renderer-toast'
-  // `electron-native` covers BOTH the renderer-driven IPC path
-  // (window visible → useNotificationPoll calls electronAPI.notification.show)
-  // AND the bg-poller path (window hidden → main process drains the
-  // queue and shows OS native). v6 P1 fix unified them: the OS-level
-  // surface is identical from the user's POV, and tracking it as one
-  // row prevents "permanent queued" leftovers in delivery log when
-  // the window-hidden path acked under a separate channel name.
+  // `electron-native` is exclusively claimed and displayed by Electron Main,
+  // independent of BrowserWindow visibility.
   // The retired `electron-bg-native` literal is intentionally NOT
   // listed here so a future regression can't smuggle it back in.
   | 'electron-native'
@@ -1927,6 +2320,8 @@ export interface NotificationEvent {
   event_id: string;
   task_id?: string;
   session_id?: string;
+  action_type?: string | null;
+  action_payload?: string | null;
   source: 'codepilot' | 'external';
   title: string;
   body: string;
@@ -1943,4 +2338,9 @@ export interface NotificationDelivery {
   error?: string | null;
   created_at: string;
   acked_at?: string | null;
+  claim_owner?: string | null;
+  claimed_at?: string | null;
+  attempt_count?: number;
+  last_attempt_at?: string | null;
+  next_attempt_at?: string | null;
 }

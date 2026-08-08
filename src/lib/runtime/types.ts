@@ -7,6 +7,7 @@
  */
 
 import type { MCPServerConfig } from '@/types';
+import type { ProviderCallScene } from '../provider-call-policy';
 
 /**
  * The single contract all Agent Runtimes must fulfil.
@@ -47,6 +48,7 @@ export interface AgentRuntime {
 export interface RuntimeStreamOptions {
   // ── Core (all runtimes) ──
   prompt: string;
+  callScene: ProviderCallScene;
   sessionId: string;
   model?: string;
   systemPrompt?: string;
@@ -62,6 +64,15 @@ export interface RuntimeStreamOptions {
   thinking?: { type: 'adaptive' } | { type: 'enabled'; budgetTokens?: number } | { type: 'disabled' };
   effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   context1m?: boolean;
+  /**
+   * Sampling params. Universal concept, mapped per runtime: both Anthropic
+   * runtimes route them through `sanitizeClaudeModelOptions` (the adaptive
+   * family 400s on non-default values) and announce anything that ends up
+   * unsent — SAMPLING_PARAMS_IGNORED (Codex review P2, 2026-07-18).
+   */
+  temperature?: number;
+  topP?: number;
+  topK?: number;
 
   // ── MCP (universal protocol, all runtimes should support) ──
   mcpServers?: Record<string, MCPServerConfig>;

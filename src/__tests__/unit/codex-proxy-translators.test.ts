@@ -15,6 +15,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { translateResponsesInput } from '@/lib/codex/proxy/translate-input';
+import { buildPrompt } from '@/lib/codex/proxy/unified-adapter';
 import { translateResponsesTools } from '@/lib/codex/proxy/translate-tools';
 import { translateStream } from '@/lib/codex/proxy/translate-stream';
 import { translateNonStreamResponse } from '@/lib/codex/proxy/translate-response';
@@ -343,6 +344,60 @@ describe('translateStream — ai-sdk fullStream → Codex Responses SSE (SDK fix
     );
     assert.equal((events[0] as { type: string }).type, 'response.created');
     assert.equal((events[1] as { type: string }).type, 'response.completed');
+  });
+
+  it('suppresses provider x_search from Codex while forwarding lifecycle and citations', async () => {
+    const lifecycle: Array<Record<string, unknown>> = [];
+    const events = await collectStream(
+      translateStream({
+        responseId: 'resp_x',
+        body: baseBody,
+        source: source([
+          { type: 'start' } as never,
+          { type: 'tool-input-start', id: 'xs_1', toolName: 'x_search' } as never,
+          {
+            type: 'tool-call',
+            toolCallId: 'xs_1',
+            toolName: 'x_search',
+            input: {},
+            providerExecuted: true,
+          } as never,
+          {
+            type: 'tool-result',
+            toolCallId: 'xs_1',
+            toolName: 'x_search',
+            output: { query: 'CodePilot', posts: [] },
+            providerExecuted: true,
+          } as never,
+          {
+            type: 'source',
+            sourceType: 'url',
+            id: 'source-1',
+            url: 'https://x.com/example/status/1',
+            title: 'Example post',
+          } as never,
+          { type: 'finish', finishReason: 'stop', totalUsage: {} } as never,
+        ]),
+        builtinToolNames: new Set(['x_search']),
+        providerExecutedToolNames: new Set(['x_search']),
+        onProviderToolEvent: event => lifecycle.push(event as unknown as Record<string, unknown>),
+      }),
+    );
+
+    assert.equal(
+      events.some(event => (event as { type: string }).type === 'response.output_item.done'),
+      false,
+      'provider-hosted calls must not leak to Codex as client-executed function calls',
+    );
+    assert.equal(lifecycle[0]?.type, 'started');
+    assert.equal(lifecycle[1]?.type, 'completed');
+    assert.equal(lifecycle[2]?.type, 'completed', 'late source enriches the same completed call');
+    assert.deepEqual(lifecycle[2]?.sources, [{
+      id: 'source-1',
+      url: 'https://x.com/example/status/1',
+      title: 'Example post',
+      trust: 'external',
+    }]);
   });
 
   it('emits output_item.added + output_text.delta + output_item.done(message) for a text block (SDK contract)', async () => {
@@ -741,5 +796,149 @@ describe('buildProviderOptions — forwards instructions + store for the Codex /
     assert.equal((opts!.openai as Record<string, unknown>).reasoningEffort, 'high');
     assert.equal(opts!.openai!.store, false, 'store must still be set when other openai options are present');
     assert.ok(opts!.anthropic);
+  });
+
+  it('uses adaptive thinking + effort for Opus 5 instead of the legacy manual budget shape', () => {
+    const opts = buildProviderOptions({
+      model: 'opus-5',
+      input: [],
+      reasoning: { effort: 'high' },
+    }, {
+      anthropic: {
+        model: 'claude-opus-5',
+        isThirdPartyProxy: false,
+      },
+    });
+
+    assert.deepEqual(opts!.anthropic, {
+      thinking: { type: 'adaptive', display: 'summarized' },
+      effort: 'high',
+    });
+    assert.equal(
+      (opts!.anthropic!.thinking as Record<string, unknown>).budgetTokens,
+      undefined,
+      'manual budget tokens are rejected by the adaptive family',
+    );
+    assert.equal((opts!.openai as Record<string, unknown>).reasoningEffort, 'high');
+  });
+
+  it('preserves xhigh for an official adaptive Anthropic model', () => {
+    const opts = buildProviderOptions({
+      model: 'opus-5',
+      input: [],
+      reasoning: { effort: 'xhigh' },
+    }, {
+      anthropic: {
+        model: 'claude-opus-5',
+        isThirdPartyProxy: false,
+      },
+    });
+    assert.deepEqual(opts!.anthropic, {
+      thinking: { type: 'adaptive', display: 'summarized' },
+      effort: 'xhigh',
+    });
+  });
+
+  it('does not forward Codex xhigh to Sonnet 4.6, which supports max but not xhigh', () => {
+    const opts = buildProviderOptions({
+      model: 'sonnet',
+      input: [],
+      reasoning: { effort: 'xhigh' },
+    }, {
+      anthropic: {
+        model: 'claude-sonnet-4-6',
+        isThirdPartyProxy: false,
+      },
+    });
+    assert.equal(
+      (opts!.anthropic as Record<string, unknown>).effort,
+      undefined,
+      'a user Codex config can supply xhigh even though CodePilot hides it; the proxy boundary must still reject the tier',
+    );
+    assert.deepEqual((opts!.anthropic as Record<string, unknown>).thinking, {
+      type: 'enabled',
+      budgetTokens: 32000,
+    });
+  });
+
+  it('removes manual budget thinking for every adaptive-family model', () => {
+    for (const model of [
+      'claude-opus-4-7',
+      'claude-opus-4-8',
+      'claude-fable-5',
+      'claude-sonnet-5',
+      'claude-opus-5',
+    ]) {
+      const opts = buildProviderOptions({
+        model,
+        input: [],
+        reasoning: { effort: 'high' },
+      }, {
+        anthropic: {
+          model,
+          isThirdPartyProxy: false,
+        },
+      });
+      assert.deepEqual(opts!.anthropic, {
+        thinking: { type: 'adaptive', display: 'summarized' },
+        effort: 'high',
+      }, model);
+    }
+  });
+
+  it('does not send invalid manual thinking to an adaptive model through a third-party proxy', () => {
+    const opts = buildProviderOptions({
+      model: 'opus-5',
+      input: [],
+      reasoning: { effort: 'high' },
+    }, {
+      anthropic: {
+        model: 'claude-opus-5',
+        isThirdPartyProxy: true,
+      },
+    });
+    assert.equal(opts!.anthropic, undefined);
+  });
+});
+
+// ai@7 迁移回归（2026-07-03 用户实测抓到）：ai@7 禁止 messages 里出现
+// role:'system'（"Use the instructions option instead"），旧 buildMessages 把
+// body.instructions prepend 成 system message，Codex Runtime 发"你好"即抛错。
+// buildPrompt 必须把一切 system 文本抽到 instructions 选项。
+describe('buildPrompt — ai@7 system-in-messages regression', () => {
+  it('instructions + 用户消息：system 文本走 instructions，messages 零 system（“你好”回归）', () => {
+    const { instructions, messages } = buildPrompt({
+      model: 'gpt-5.5-codex',
+      instructions: 'You are Codex.',
+      input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: '你好' }] }],
+    });
+    assert.equal(instructions, 'You are Codex.');
+    assert.equal(messages.length, 1);
+    assert.ok(messages.every((m) => m.role !== 'system'), 'messages must carry NO system role');
+    assert.equal(messages[0].role, 'user');
+  });
+
+  it('input 里的 system/developer 项也被抽出合并进 instructions（body.instructions 在前）', () => {
+    const { instructions, messages } = buildPrompt({
+      model: 'gpt-5.5-codex',
+      instructions: 'top-level',
+      input: [
+        { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'dev note' }] },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] },
+      ],
+    });
+    assert.ok(instructions!.startsWith('top-level'), 'body.instructions comes first');
+    assert.ok(instructions!.includes('dev note'), 'developer item merged into instructions');
+    assert.ok(messages.every((m) => m.role !== 'system'));
+    assert.equal(messages.length, 1);
+  });
+
+  it('无任何 system 来源时 instructions 为 undefined', () => {
+    const { instructions, messages } = buildPrompt({
+      model: 'gpt-5.5-codex',
+      input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] }],
+    });
+    assert.equal(instructions, undefined);
+    assert.equal(messages.length, 1);
   });
 });

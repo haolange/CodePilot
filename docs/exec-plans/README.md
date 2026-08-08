@@ -2,7 +2,7 @@
 
 中大型功能的执行计划，包含分阶段目标、进度状态和决策日志。
 
-> **重构已完成并随 v0.55.0 / v0.55.1 发布。** 原重构总控板已归档为 [completed/refactor-closeout.md](completed/refactor-closeout.md)（重构收口历史）。当前在推进的计划见下方「Active — 当前推进」表（`issue-tracker` / `development-harness-optimization` / `codex-stop-recovery`）；ClaudeCode / Codex **只从 `active/` 领任务**，不从 `completed/` / `deferred/` / `superseded/` 自行开支线。
+> **重构已完成并随 v0.55.0 / v0.55.1 发布。** 原重构总控板已归档为 [completed/refactor-closeout.md](completed/refactor-closeout.md)（重构收口历史）。当前在推进的计划以维护中的「Active — 当前推进」表为准；ClaudeCode / Codex **只从 `active/` 领任务**，不从 `completed/` / `deferred/` / `superseded/` 自行开支线。
 >
 > **查历史细节：`completed/refactor-phase-*.md` + `completed/phase-4-markdown-artifact.md` + `completed/phase-5*.md`**——总控板里的"历史归档"列直接 link 过去。Phase 1（模型同步与渠道扩展）/ Phase 2（Runtime 与会话执行）/ Phase 3（后台常驻、定时任务、通知）/ Phase 4（Markdown 数据层 + Artifact 表现层）/ Phase 5（Codex Runtime + Harness 架构）已完成的计划文本与全部决策日志按 Phase 归档，不要去 active 总控板里翻。
 
@@ -41,7 +41,7 @@
 | Signal | 记录触发信号：review finding、用户反馈、CDP 截图、测试失败、日志证据 | finding / issue / plan note |
 | Triage | 判断根因、影响范围、是否阻断用户路径、是否已有同类历史 | 修复范围 + 优先级 |
 | Fix | 做最小必要改动；Claude Code 不得借小修复扩成无关重构 | commit / patch summary |
-| Verify | 跑相关测试；UI 改动必须 CDP 验证；说明验证场景 | test output / CDP notes |
+| Verify | 跑相关测试；UI 改动必须实际验证（CDP 仅作深度诊断备用，验证强度按 [CLAUDE.md](../../CLAUDE.md) 测试分层 Tier 0/1/2）；说明验证场景 | test output / 验证记录 |
 | Guardrail | 同类问题第二次出现，或涉及 schema/runtime/default/log/security，必须沉淀防线 | guardrail doc / tech-debt tracker / plan update |
 
 **Claude Code 交付说明必须包含：**
@@ -49,7 +49,7 @@
 - 上下文：用户原始诉求、讨论过程、关键判断、被否掉的方案和原因。不要只贴最终结论；尤其是跨 Runtime / provider / permission / schema / security 的任务，必须让下一个读计划的人知道为什么这么做。
 - 根因：为什么会出错。
 - 改动：按文件或模块说明改了什么。
-- 验证：跑了哪些测试 / CDP 路径。
+- 验证：跑了哪些测试 / smoke / 浏览器或 CDP 路径（如有）。
 - 防回归：新增测试、文档、guardrail，或说明为什么暂不需要。
 
 **Codex review 规则：**
@@ -101,9 +101,29 @@
 
 | 文件 | 主题 | 状态 |
 |------|------|------|
+| [active/production-observation-remediation-2026-08-07.md](active/production-observation-remediation-2026-08-07.md) | **0.65 生产观察修复闭环**：补 Sentry IP/Geo null tombstone、Electron 启动 session、Windows 外链 Promise 失败反馈，以及 Native 残缺 tool-call 历史的诚实配对修复 | 🔄 Phase 0 完成，Phase 1–4 实施中；新 stable packaged/Sentry cohort 待发布后验收 |
+| [active/windows-review-remediation-2026-08-07.md](active/windows-review-remediation-2026-08-07.md) | **Windows 适配独立审查修复闭环**：修复 Provider secret 迁移启动阻断、无 `rg` 正则回退卡死、macOS `//`/`/mnt` 路径误判与非 Windows PowerShell 恢复文案；P2 逐项修复或登记 | 🟡 Code complete + Tests pass + Review passed；Windows packaged smoke 待执行 |
+| [active/harness-home-user-owned-core.md](active/harness-home-user-owned-core.md) | **Harness Home Umbrella**：用户所有的 Assistant files/services、跨 Runtime Capability Packages 与 Assets；普通文件始终可读，助理自动服务显式激活，能力通过 Broker 相互调用，不再建设独立审美/workflow 系统 | 🔄 Program A/B foundation 与默认助理切片已落地；当前 Program C 按用户纠正重写，待 Claude 审查 |
+| [active/default-assistant-heartbeat-system-notification.md](active/default-assistant-heartbeat-system-notification.md) | **P0 默认助理 → 心跳 → 系统通知纵向闭环**：新用户默认用户自有助理目录、老路径 no-touch、零会话侧栏入口、heartbeat desired/actual 自愈、Electron Main 单 owner 的 durable native notification、系统提示音与点击回会话 | 🟡 Code complete + Tests pass + Review passed（本地范围）；三平台 packaged native/sound/click smoke 待用户验收与发布门禁 |
+| [active/harness-home-core-adapters.md](active/harness-home-core-adapters.md) | **Program A — Harness Core / Repository / Adapter Kits**：file-backed canonical repository、单写者/事务写/外部编辑对账、SecretStore、L0/L1 HarnessAdapter conformance、L2/L3 RuntimeAdapter 与 CodePilot Full Reference | 🟡 A1–A4 code/tests + recursive neutrality/repository hardening 完成；真实凭据 Tier 2 smoke 待最终验收 |
+| [active/harness-home-asset-library.md](active/harness-home-asset-library.md) | **Program B — Producer-backed Asset Library**：复用 Gallery/media pipeline，按真实 producer 注册 kind，完成 backfill、lineage、typed reference、HTML bundle materialization 与 trust/CSP；无 producer 的 component/document 不进首版 schema/UI | 🟡 B0–B3、Codex media 去重、真实本地 Browser smoke 与 review hardening 完成；packaged/human UI gate 待最终验收 |
+| [active/harness-home-context-capability-routing.md](active/harness-home-context-capability-routing.md) | **Program C — Assistant 服务激活与统一能力包**：窄 assistant binding 只门控 Memory 自动服务/Heartbeat，不限制目录文件；Skill/MCP/CLI/builtin/renderer/model adapter 归入一个 Capability Package，通过 Broker 相互调用；`creative` 验证可视化效果、policy 与图像/视频模型扩展，推荐页后移 | 📋 按用户纠正与竞品调研重写完成，待 Claude Code 审查；P0 服务激活 → P1 Package/Broker → P2 creative |
+| [active/same-runtime-multi-model-subagents.md](active/same-runtime-multi-model-subagents.md) | **同 Runtime 多模型 Sub-agent MVP**：当前会话模型保持父 Agent；三 Runtime exact Provider+Model child；logical run/attempt、settling、结构化结果与 lifecycle 详情 | ✅ 三 Runtime managed 依赖链 code/tests/smoke 完成；identity-bearing native collab、entitlement cache、individual cancel 与可靠性长尾待续 |
+| [active/qwen-token-plan-and-grok-access.md](active/qwen-token-plan-and-grok-access.md) | **千问 Token Plan 与 Grok 4.5 接入**：把百炼 Coding Plan、千问 Token Plan 个人版/团队版建模为三个稳定套餐，修复同 URL identity 串线并增加交互式使用 gate；xAI 同时接 API Key + Grok 4.5 Responses 和兼容 SuperGrok browser/device OAuth；Phase 7 补齐两类凭据、两种 Runtime 的原生 X Search | 🟡 Phase 0–5 与 0.59.1 发布完成；Phase 7 code/tests 完成、xAI OAuth × CodePilot/Codex Runtime 两组合真实 `x_search` 通过，packaged managed Grok child 双 Runtime 复验通过；两个 API Key 组合待跑 |
+| [active/markdown-live-preview-and-file-tree.md](active/markdown-live-preview-and-file-tree.md) | **Markdown Live Preview 统一样式 × 文件树 Explorer 化 × 文件类型图标**：CodeMirror 单页 Live Preview、跨 owner mutation transaction、Explorer 右键/F2/Trash、material-icon-theme 静态 FileTypeIcon 已实现；macOS packaged Trash 可恢复；用户已验收中文 IME、暗色选中态、深色主题及原生磨砂，整窗材质按反馈从 `menu` 调轻为 `under-window` | ✅ v0.62.0 已发布，Mac/Windows CI 打包与 packaged server 门禁通过；仅保留用户的 Windows 发布后实机验证待办 |
+| [active/codebase-health-audit-2026-06.md](active/codebase-health-audit-2026-06.md) | **代码健康审计与修复计划（2026-06）**：6 路并行审计（流式核心 / Codex / DB+API / 前端 / Electron+构建 / 测试覆盖）产出 bug、性能、安全加固、测试补洞四个 Phase；关键发现已现场核验并逐条标注核验状态与验证分层；v2 已按 Codex 静态审查订正 7 处事实偏差与执行边界 | 🔄 Phase A 已完成（A1–A6），B/C/D 待实施（Codex 负责审查/用例设计） |
+| [active/codex-cli-discovery-refresh.md](active/codex-cli-discovery-refresh.md) | **Codex CLI 发现与刷新修复**：适配当前 `ChatGPT.app` 内置 CLI，保留旧 `Codex.app`，修复进程级路径缓存与设置页假刷新，并让实际 selected binary/version 与登录失败可见 | 🟡 production UI、签名 arm64 `.app`/DMG/ZIP 与 packaged Codex status smoke 已完成；仅真实双安装终验待完成 |
+| [completed/windows-runtime-path-compatibility.md](completed/windows-runtime-path-compatibility.md) | **Windows Runtime / 路径兼容性收口**：修复中文/空格/合法特殊字符工作目录、原生 Shell 与搜索回退、Bridge/后台任务 CWD 分叉、Codex 桌面包误判及 Windows 开发脚本 | ✅ 已完成（真实计费会话未执行） |
+| [active/windows-codex-loopback-proxy.md](active/windows-codex-loopback-proxy.md) | **Windows Codex Loopback Proxy 502 修复**：保留外网 system proxy，同时在 Electron server 与 Codex app-server 两道 child env 强制 loopback bypass，修正 Windows proxy key 优先级并增加专用 502 诊断 | 🟡 Code complete + Tests pass；真实 Windows + Clash packaged smoke 待跑 |
+| [active/v0.56.x-stability-trust.md](active/v0.56.x-stability-trust.md) | **v0.56.x Stability / Trust 总计划**：从 Notion GPT Pro 产品审查、当前 GitHub Issues / PR 治理状态、用户最新体验反馈汇总出的稳定性 umbrella plan；先收 codebase-health Phase A，再治理 session/context/stream/composer、文件引用安全、安装更新、CI 与 GitHub triage | 🚧 Phase 0/1 ✅ 已完成；Phase 2 进行中（Composer/Context 主链路 #1–#5 闭环；#629 已关闭 🟢、#635 代码层完成 🟡（待真实 smoke）、#632 假% 已修 item3 待续；stream 终态原因码 / 压缩回滚 / 诊断字段待续）；Phase 3 主问题 #628 已关闭 🟢；Phase 7 已细化为 GitHub 旧 issue 清库存 + 保守机器人治理批次，待 Claude Code 执行；Codex 持续核验 |
 | [active/codex-stop-recovery.md](active/codex-stop-recovery.md) | **Codex Stop Recovery / 终止后恢复发送**：调研并修复 Codex Runtime 下 Stop 只切断前端 stream、未必调用 Codex app-server `turn/interrupt`，导致后台 collect / session lock / runtime status 未收口，下一条同会话指令无法拉起的问题；外部 Codex issues 只作症状旁证，不采信其根因推测 | 📋 待 Claude Code 接手修复 |
-| [active/development-harness-optimization.md](active/development-harness-optimization.md) | **开发流程 Harness 优化讨论稿（v2）**：Codex 初稿 + ClaudeCode 按用户"可审核"约束重组。事实层面补 3 项 Codex 漏说的已有资产（guardrails/ 4 份模块契约 / lint:colors / tech-debt-tracker）；方向上 Skill 化暂缓、主推自动检查脚本（docs drift / hook 配置）+ 测试矩阵补洞；每个 Step 必须以"用户能看到什么 / 不做什么 / 怎么验收"开头 | 📋 讨论中；待用户对齐 Step 1-3，再决定是否进入 Step 4-6 |
+| [active/development-harness-optimization.md](active/development-harness-optimization.md) | **开发流程 Harness 优化（v2 + 2026-06-28 对账）**：Codex 初稿 + ClaudeCode 按用户"可审核"约束重组。方向上 Skill 化暂缓、主推自动检查脚本（docs drift / hook 配置）+ guardrails 八类必读 + Smoke Ledger 模板 + 测试矩阵补洞；2026-06-28 新增 Step 0 规则体系瘦身（顶层规则分工 / Ruler-compatible / 测试分层 / 简化汇报协议），并对账校准各 Step 真实状态；每个 Step 以"用户能看到什么 / 不做什么 / 怎么验收"开头 | 🔄 进行中（2026-06-28 对账 + Step 0/5 落地 + Step 6 核实）：Step 0-3 ✅、Step 4 🔄 部分（on-touch）、Step 5 ✅、Step 6 ✅（核实已覆盖）；仅剩 Step 4 持续填充 |
+| [active/documentation-authority-lifecycle-reset.md](active/documentation-authority-lifecycle-reset.md) | **文档可信度与生命周期收口**：解决历史细文档被 Agent 当成当前事实的问题；建立 current/reference/historical 三层权威，先试点压缩 handover 与应急文档，再补历史降权、事件驱动复核和审查基线合同 | 📋 待启动（Phase 0 清单与风险分级） |
+| [active/model-capability-reasoning-refresh.md](active/model-capability-reasoning-refresh.md) | **模型目录与推理强度统一适配**：GLM-5.2、Kimi for Coding、GPT-5.6、Claude Sonnet 5 / Opus 5、DeepSeek V4 Flash 0731，以及 ClinePass / OpenCode Go 聚合边界；按模型与网关真实 capability 驱动输入框右侧强度选择，不显示伪档位 | 🚧 Phase 0/1/2 完成；Phase 3/4 进行中。DeepSeek 模型 ID 不变，第一方 Flash 的 Codex Responses 与 CodePilot Anthropic effort 已真实 smoke，聚合渠道不继承未验证能力；packaged UI、Claude Code subprocess 与其余 provider effort smoke 待继续 |
+| [active/runtime-permission-modes.md](active/runtime-permission-modes.md) | **跨 Runtime 权限模式**：在“按规则询问 / 完全访问”之间加入真正的“替我审批”；Claude/Codex 接上游 auto reviewer，Native AI SDK 先做 fail-closed POC，不把 tool approval 或 bypass 冒充代审 | 🚧 Claude/Codex code + contract tests 已闭合；Codex 已有 Runtime 分流、版本门与响应回显，真实 approve/deny/MCP smoke 仍待完成 |
+| [active/automatic-chat-titles.md](active/automatic-chat-titles.md) | **自动会话命名**：先统一两套首消息截断与 UI 刷新，再以同 session provider 后台生成语义标题；provenance/CAS 保证手动、系统、导入标题不被覆盖 | ✅ Phase 0–2 code/tests 完成，真实凭据 smoke 待跑；Codex 仅有 name/set 写入原语，无内置 auto-title API，首版 fallback |
 | [active/issue-tracker.md](active/issue-tracker.md) | **统一问题跟踪**：所有 Bug / Feature Request / Sentry 监控的活动看板 | 持续维护 |
+| [active/sentry-telemetry-reliability.md](active/sentry-telemetry-reliability.md) | **Sentry 遥测可信度与错误分诊**：隔离官方 stable、development 与 Fork，统一 Browser/Next/Electron 初始化和匿名 opt-out，建立脱敏 allow-list、Outcome 分类、默认 stack / normalized fingerprint 双轨分组与三层 source-map 发布闭环；先阻断安装包携带 map，SDK 升级独立可回滚，真实产品缺陷在 72h 干净数据后分拆移交 | 🚧 v0.64.0 / v0.65.0 已正式发布，Phase 6 进行中；source map/native/package 已实证，4xx/DNS/NoOutput/in-band 与 ToolLoop rejected-promise review findings 已 code complete 且本地 gates 通过；只读 credential 已验证，待新 stable 真实 smoke 与单 release cohort 复核 |
 | [active/log-bloat-codex-runtime-crash.md](active/log-bloat-codex-runtime-crash.md) | **日志暴涨与 Codex Runtime 闪退调研**：确认 12.5G 主日志不正常，主因是 Codex app-server INFO tracing 洪水、无 size-based rotation、主进程 `serverErrors` 无界累积；闪退与该链路高相关但需 live approval smoke 和 crash breadcrumb 定案 | 🔴 待 Claude Code 修复 logging 上限 + Codex tracing 降噪 |
 | [active/mimo-ultraspeed-openai-compatible-provider.md](active/mimo-ultraspeed-openai-compatible-provider.md) | **MiMo UltraSpeed + OpenAI-compatible 三方 API**：小米 MiMo API 渠道补 `mimo-v2.5-pro-ultraspeed`；恢复通用 OpenAI-compatible provider，限定 CodePilot Runtime + Codex Runtime 可用，并先处理历史 migration 删除 openai-compatible provider 的 P0 阻断 | 📋 待 Claude Code 接手实现 |
 | [active/post-0.55.1-issue-triage.md](active/post-0.55.1-issue-triage.md) | **0.55.1 后 Issues 调研与 Claude Code 接手优先级**：核对 #606/#612/#613/#614/#615/#616/#617/#618/#619/#620/#621 以及 #554/#577；确认 MiMo 回退已随 0.55 修复，当前重点为截图被吞、Ollama 误要求 Claude Code、Codex/Opus 模型列表不稳定、概率串会话 | 📋 待 Claude Code 按 P0/P1 接手 |
@@ -121,6 +141,7 @@
 | [superseded/context-storage-migration.md](superseded/context-storage-migration.md) | 上下文共享与存储迁移（`message_parts` / `session_runtime_state` / 压缩摘要） | Phase 6（上下文可视化）+ Phase 2 |
 | [superseded/agent-runtime-abstraction-revision.md](superseded/agent-runtime-abstraction-revision.md) | Runtime 可插拔抽象层（薄接口、Native / SDK / 未来 Codex / Gemini） | Phase 2（Runtime 与会话执行）+ Phase 5（Codex Runtime） |
 | [superseded/agent-trust-ownership-refactor.md](superseded/agent-trust-ownership-refactor.md) | Agent Trust & Ownership Refactor（剩余 Run Cockpit + session-level Runtime + 事件日志） | Phase 2（Runtime 与会话执行）+ Phase 3 |
+| [superseded/harness-home-design-method.md](superseded/harness-home-design-method.md) | CodePilot Design Method / Taste Memory / Creative Orchestration 独立产品化；foundation 已落地，剩余 Method v0/golden/human-gate 不再推进 | [active/harness-home-context-capability-routing.md](active/harness-home-context-capability-routing.md) P2：`creative` Capability Package + media model layer |
 
 ### Deferred（暂缓，未来可能重启）— `deferred/`
 
@@ -142,6 +163,8 @@
 
 | 文件 | 主题 | 完成日期 |
 |------|------|----------|
+| [completed/windows-runtime-recovery-hardening.md](completed/windows-runtime-recovery-hardening.md) | **Windows Runtime 诊断、恢复与凭据加固**：统一 Path Identity 与三 Runtime Doctor，展示 Codex sandbox 真实阶段；desktop_only 恢复入口经 Windows DEV 用户验收；Provider key 从明文 SQLite 迁到 safeStorage 保护的版本化密文；跨机真实凭据与 standalone sandbox 矩阵保留为复查清单 | 2026-08-07 |
+| [completed/codex-thread-storage-isolation.md](completed/codex-thread-storage-isolation.md) | **Codex 会话存储隔离**：CodePilot-owned `CODEX_HOME` / SQLite、只迁移 `codex_codepilot` 历史、Harness live mirror 与凭据降级模式可观察；真实 app-server resume/索引 smoke 通过 | 2026-08-03 |
 | [completed/document-system-governance.md](completed/document-system-governance.md) | **文档体系治理**：基于 2026-06-05 文档健康审计清理 active 语义污染，建立 deferred / superseded 目录，归档合并与 preview 旧计划，升级 docs drift 防线（结构化 banner + 归档桶内部链接完整性），并修复归档桶 21 处失效相对链接 | 2026-06-05 |
 | [completed/refactor-closeout.md](completed/refactor-closeout.md) | **重构收口总控板（历史归档）**：6 大主线 Phase 0-8 收口；重构主体随 v0.55.0 / v0.55.1 发布 | 2026-06-04 |
 | [completed/main-merge-readiness.md](completed/main-merge-readiness.md) | **重构分支合并主分支**：integration 演练 + 4 冲突手解 + 回归，main ff-only 合并并发布 | 2026-06-04 |
@@ -152,7 +175,7 @@
 | [completed/post-refactor-cleanup.md](completed/post-refactor-cleanup.md) | **重构收尾后遗留清理**：Opus 4.8 接入 + Sonnet 4.6 别名 (#23) / Mac 通知链路确认 (#34) / pin 误报修复 (#27) / Plan 模式 Widget (#26) / Windows shell 默认 PowerShell (#28) / pre-commit enforce + 测试 flake 根治 (#30) / design.md 横切三节 (E)；13 React Compiler error 拆 #35；Preview 打包属独立下一阶段 | 2026-05-31 |
 | [completed/phase-8-codex-mcp-context-injection.md](completed/phase-8-codex-mcp-context-injection.md) | **Phase 8 Codex MCP / Memory 注入**：`config.mcp_servers` 注入链路 + 5 项核心能力（Memory / Widget / Tasks+Notify / Dashboard / CLI）在 Codex Account 下真账号 smoke 通过 + 按能力区分的 elicitation 审批策略（read 自动 / write 弹审批）+ Codex 原生图片入库对齐素材库；Image/Media 与用户自定义 MCP 用户决定 defer | 2026-05-29 |
 | [completed/phase-7-icon-system.md](completed/phase-7-icon-system.md) | **Phase 7 图标体系与表意校准**：CodePilot semantic icon layer（一概念一 glyph）+ HugeIcons 主库 + LobeHub 品牌图标保留 + Brain/Lightning/Terminal 冲突裁决 + eslint guardrail；96 文件迁到 CodePilotIcon | 2026-05-29 |
-| [completed/phase-7c-card-primitive.md](completed/phase-7c-card-primitive.md) | **Phase 7c 浮动卡片 layout primitive**：CardFrame / CardSurface / ResizeGutter 三个单职责组件收敛四张浮动卡片的 shadow / clip-path / gutter 几何；sidebar 改 row-level card、AssistantPanel 接入、真实 DOM gutter 几何 e2e；验收证据见 [handover/macos-visual-profile.md](handover/macos-visual-profile.md) Phase 7c 章节 | 2026-05-26 |
+| [completed/phase-7c-card-primitive.md](completed/phase-7c-card-primitive.md) | **Phase 7c 浮动卡片 layout primitive**：CardFrame / CardSurface / ResizeGutter 三个单职责组件收敛四张浮动卡片的 shadow / clip-path / gutter 几何；sidebar 改 row-level card、AssistantPanel 接入、真实 DOM gutter 几何 e2e；验收证据见 [handover/macos-visual-profile.md](../handover/macos-visual-profile.md) Phase 7c 章节 | 2026-05-26 |
 | [completed/phase-6-context-visualization.md](completed/phase-6-context-visualization.md) | Phase 6 上下文用量可视化：点阵式 Context Breakdown、来源分解、剩余上下文、三 Runtime context-accounting smoke；真实数据契约见 [context-accounting-runtime-contract.md](completed/context-accounting-runtime-contract.md) | 2026-05-20 |
 | [completed/context-accounting-runtime-contract.md](completed/context-accounting-runtime-contract.md) | Context Accounting Runtime Contract：三 Runtime context_breakdown 持久化、ToolInvocation 抽象、真实 smoke evidence 与 Phase 6 数据源收口 | 2026-05-20 |
 | [completed/phase-5-codex-runtime.md](completed/phase-5-codex-runtime.md) | Phase 5 Codex Runtime 接入：Codex app-server / Codex Account / Runtime adapter / approval + file events / provider proxy translator / OpenRouter + OAuth 收口 / installed_idle 状态文案 | 2026-05-19 |

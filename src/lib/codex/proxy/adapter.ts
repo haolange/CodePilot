@@ -13,8 +13,8 @@
  *      JSON Response (Responses non-stream object).
  *
  * Phase 5b shipped a single `createUnifiedAdapter` implementation that
- * serves all three CodePilot families (OpenAI-compatible, Anthropic-
- * compatible / ClaudeCode-compatible, CodePlan / 套餐型). The wire-
+ * serves the CodePilot families (OpenAI-compatible, xAI Responses,
+ * Anthropic-compatible / ClaudeCode-compatible, CodePlan / 套餐型). The wire-
  * format divergence between families lives INSIDE ai-sdk's per-tier
  * SDK selection (createAnthropic / createOpenAI / claude-code-compat
  * / etc.), so the proxy doesn't need a per-family translator — the
@@ -45,6 +45,8 @@ import { getProviderCompatFromApi } from '@/lib/runtime-compat';
 import { makeErrorResult, classifyUpstreamError } from './errors';
 import { createUnifiedAdapter } from './unified-adapter';
 import type { ProviderRuntimeCompat } from '@/types';
+import type { Protocol } from '@/lib/provider-catalog';
+import { listManagedVirtualProviderDefinitions } from '@/lib/managed-virtual-provider-models';
 import type {
   ProxyHandlerInput,
   ProxyResult,
@@ -64,6 +66,10 @@ import type {
  *                  `createOpenAI` model with a custom fetch + OAuth
  *                  token injection (see ai-provider.ts `useResponsesApi`).
  *
+ *   xai-oauth      xAI account OAuth login. Wire format is xAI Responses;
+ *                  `createModel` injects a freshly resolved OAuth bearer
+ *                  through the official-host-gated custom fetch.
+ *
  *   codex_account  Codex Account login. Wire format goes through
  *                  Codex's own app-server thread/turn flow, NOT through
  *                  the proxy. If this id reaches the proxy that's a
@@ -72,24 +78,32 @@ import type {
  *                  Defensive entry so the failure surfaces clearly
  *                  rather than as a stale `provider_not_found`.
  *
- * Mirror of the surfaces in `src/app/api/providers/models/route.ts`
- * lines ~315–347. Any new virtual provider added there MUST be added
- * here too so the proxy can resolve it; the API-contract test below
- * pins that invariant.
+ * Mirror of the managed surfaces in
+ * `src/lib/managed-virtual-provider-models.ts`, plus the native
+ * `codex_account` boundary exposed by `/api/providers/models`. Any new
+ * virtual provider added there MUST be added here too so the proxy can
+ * resolve it; the API-contract test below pins that invariant.
  */
 interface VirtualProviderEntry {
   displayName: string;
   compat: ProviderRuntimeCompat;
+  protocol?: Protocol;
   /** When true, this id should never have been routed through the
    *  proxy at all — surface a clear routing-bug error. */
   routingBug?: true;
 }
 
 const VIRTUAL_PROVIDERS: Record<string, VirtualProviderEntry> = {
-  'openai-oauth': {
-    displayName: 'OpenAI OAuth (Codex API)',
-    compat: 'codepilot_only',
-  },
+  ...Object.fromEntries(
+    listManagedVirtualProviderDefinitions().map(definition => [
+      definition.providerId,
+      {
+        displayName: definition.providerName,
+        compat: definition.compat,
+        protocol: definition.protocol,
+      },
+    ]),
+  ),
   codex_account: {
     displayName: 'Codex Account',
     compat: 'codex_account',
@@ -100,6 +114,16 @@ const VIRTUAL_PROVIDERS: Record<string, VirtualProviderEntry> = {
 /** Exposed for the API-contract regression test. */
 export function getProxyResolvableProviderIds(extraDbIds: string[]): Set<string> {
   return new Set<string>([...Object.keys(VIRTUAL_PROVIDERS), ...extraDbIds]);
+}
+
+/** Exposed for metadata parity regression tests. */
+export function getProxyVirtualProviderMetadata(
+  providerId: string,
+): Pick<VirtualProviderEntry, 'compat' | 'protocol'> | undefined {
+  const entry = VIRTUAL_PROVIDERS[providerId];
+  return entry
+    ? { compat: entry.compat, ...(entry.protocol ? { protocol: entry.protocol } : {}) }
+    : undefined;
 }
 
 /**
@@ -175,7 +199,7 @@ export async function handleProxyRequest(
 
   // 2. Identify the provider. The API route exposes BOTH DB-backed
   //    providers AND a small set of virtual providers (openai-oauth,
-  //    codex_account) under `runtime=codex_runtime`. The proxy must
+  //    xai-oauth, codex_account) under `runtime=codex_runtime`. The proxy must
   //    resolve every id it surfaced — otherwise the UI would show a
   //    provider, the user would pick it, and the send would fail
   //    here with provider_not_found. Virtual providers don't have an
@@ -214,10 +238,11 @@ export async function handleProxyRequest(
 
   // 3. Resolve via the canonical provider-resolver. Same call for
   //    DB-backed AND virtual providers — provider-resolver already
-  //    has dedicated branches for openai-oauth / codex_account /
+  //    has dedicated branches for openai-oauth / xai-oauth / codex_account /
   //    env / DB ids. Passing the raw target id (not a derived field)
   //    is what lets the virtual paths kick in.
   const resolved = resolveProvider({
+    callScene: 'interactive_chat',
     providerId: input.targetProviderId,
     model: input.body.model,
   });

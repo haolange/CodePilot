@@ -3,7 +3,7 @@
  *
  * Background: `/api/providers/models?runtime=codex_runtime` surfaces
  * BOTH DB-backed providers AND virtual providers (`openai-oauth`,
- * `codex_account`). The Codex chat picker reads that list directly,
+ * `xai-oauth`, `codex_account`). The Codex chat picker reads that list directly,
  * so anything it shows MUST be resolvable by the proxy route. The
  * pre-fix bug: `handleProxyRequest` only looked up by `getProvider`
  * (DB-only), so a user picking openai-oauth under Codex Runtime hit
@@ -28,12 +28,14 @@ import assert from 'node:assert/strict';
 import {
   handleProxyRequest,
   getProxyResolvableProviderIds,
+  getProxyVirtualProviderMetadata,
   registerAdapter,
   type ResponsesAdapter,
 } from '@/lib/codex/proxy/adapter';
 import { getAllProviders } from '@/lib/db';
 import { createUnifiedAdapter } from '@/lib/codex/proxy/unified-adapter';
 import { makeErrorResult } from '@/lib/codex/proxy/errors';
+import { listManagedVirtualProviderDefinitions } from '@/lib/managed-virtual-provider-models';
 
 const validBody = {
   model: 'gpt-5.4',
@@ -110,6 +112,29 @@ describe('handleProxyRequest — virtual providers resolve without provider_not_
     if (result.kind !== 'error') return;
     assert.notEqual(result.error.code, 'provider_not_found');
     assert.match(result.error.message, /test-stub/);
+  });
+
+  it('xai-oauth: reaches the openai_compatible proxy adapter with the virtual id intact', async () => {
+    stubObserved = undefined;
+    const result = await handleProxyRequest({
+      targetProviderId: 'xai-oauth',
+      sessionId: '',
+      workspacePath: '',
+      body: { ...validBody, model: 'grok-4.5' },
+      signal: new AbortController().signal,
+    });
+    const observed = stubObserved as
+      | { providerId: string; modelHint: string | undefined; resolvedHasCredentials: boolean }
+      | undefined;
+    assert.ok(observed, 'xai-oauth must resolve and reach the proxy adapter');
+    assert.equal(observed.providerId, 'xai-oauth');
+    assert.equal(observed.modelHint, 'grok-4.5');
+    assert.equal(observed.resolvedHasCredentials, true);
+    assert.equal(result.kind, 'error');
+    if (result.kind === 'error') {
+      assert.notEqual(result.error.code, 'provider_not_found');
+      assert.match(result.error.message, /test-stub/);
+    }
   });
 
   it('codex_account: surfaces routing-bug error (NOT provider_not_found)', async () => {
@@ -190,35 +215,24 @@ describe('API contract — every provider surfaced under runtime=codex_runtime m
 });
 
 // ─────────────────────────────────────────────────────────────────────
-// Static guarantee — virtual provider registry mirrors the API route
+// Metadata guarantee — proxy registry derives from the shared catalog
 // ─────────────────────────────────────────────────────────────────────
 
-describe('Virtual-provider registry mirrors /api/providers/models', () => {
-  it('every virtual provider id the API route surfaces is registered in VIRTUAL_PROVIDERS', () => {
-    // Source-level grep is good enough here — the API route hand-codes
-    // virtual ids as string literals in `provider_id: 'openai-oauth'`
-    // / `provider_id: 'codex_account'`. We can't usefully invoke the
-    // route to enumerate them (Codex app-server may not be available)
-    // so we read the route file and assert each literal is registered.
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const fs = require('fs') as typeof import('fs');
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const path = require('path') as typeof import('path');
-    const routeSrc = fs.readFileSync(
-      path.resolve(__dirname, '../../app/api/providers/models/route.ts'),
-      'utf8',
-    );
-    const literalIds = new Set<string>();
-    for (const match of routeSrc.matchAll(/provider_id:\s*['"]([^'"]+)['"]/g)) {
-      const id = match[1];
-      if (id === 'env') continue; // env is the Claude Code default — explicit non-proxy path
-      literalIds.add(id);
-    }
+describe('Virtual-provider proxy metadata mirrors the shared catalog', () => {
+  it('derives id, compat, and protocol from every managed virtual provider definition', () => {
     const resolvable = getProxyResolvableProviderIds([]);
-    for (const id of literalIds) {
+    for (const definition of listManagedVirtualProviderDefinitions()) {
       assert.ok(
-        resolvable.has(id),
-        `Virtual provider id "${id}" is hard-coded in the API route but missing from VIRTUAL_PROVIDERS in src/lib/codex/proxy/adapter.ts. Add the entry or remove the literal — they must stay in lockstep.`,
+        resolvable.has(definition.providerId),
+        `Virtual provider "${definition.providerId}" must be proxy-resolvable`,
+      );
+      assert.deepEqual(
+        getProxyVirtualProviderMetadata(definition.providerId),
+        {
+          compat: definition.compat,
+          protocol: definition.protocol,
+        },
+        `Virtual provider "${definition.providerId}" must not duplicate compat/protocol metadata in the proxy`,
       );
     }
   });

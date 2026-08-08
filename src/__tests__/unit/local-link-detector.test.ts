@@ -12,6 +12,8 @@ import assert from 'node:assert/strict';
 import {
   looksLikeRemoteHref,
   isPotentialLocalFile,
+  parseLocalMarkdownReference,
+  remarkResolveLocalLinks,
 } from '../../lib/markdown/local-link-detector';
 
 describe('looksLikeRemoteHref', () => {
@@ -37,6 +39,7 @@ describe('looksLikeRemoteHref', () => {
 
   it('treats local paths as non-remote', () => {
     assert.equal(looksLikeRemoteHref('/abs/foo.md'), false);
+    assert.equal(looksLikeRemoteHref('C:\\work\\README.md'), false);
     assert.equal(looksLikeRemoteHref('docs/foo.md'), false);
     assert.equal(looksLikeRemoteHref('README.md'), false);
   });
@@ -70,6 +73,47 @@ describe('isPotentialLocalFile', () => {
   it('rejects empty / pathless input', () => {
     assert.equal(isPotentialLocalFile(''), false);
     assert.equal(isPotentialLocalFile('no-extension-bare-word'), false);
+  });
+
+  it('accepts explicit relative directory shapes without treating bare words as paths', () => {
+    assert.equal(isPotentialLocalFile('./docs'), true);
+    assert.equal(isPotentialLocalFile('../fixtures'), true);
+    assert.equal(isPotentialLocalFile('examples/'), true);
+    assert.equal(isPotentialLocalFile('docs'), false);
+  });
+});
+
+describe('parseLocalMarkdownReference', () => {
+  it('keeps remote links out of local-file routing', () => {
+    assert.equal(parseLocalMarkdownReference('https://example.com/docs'), null);
+    assert.equal(parseLocalMarkdownReference('mailto:hello@example.com'), null);
+    assert.equal(parseLocalMarkdownReference('javascript:alert(1)'), null);
+  });
+
+  it('decodes local paths and preserves line anchors', () => {
+    assert.deepEqual(
+      parseLocalMarkdownReference('/Users/me/My%20Project/README.md#L12'),
+      { filePath: '/Users/me/My Project/README.md', anchor: '#L12' },
+    );
+    assert.deepEqual(
+      parseLocalMarkdownReference('docs/guide.md:42:7'),
+      { filePath: 'docs/guide.md', anchor: ':42:7' },
+    );
+  });
+
+  it('normalizes file URLs and recognizes directory references', () => {
+    assert.deepEqual(
+      parseLocalMarkdownReference('file:///Users/me/My%20Project/index.html#L3'),
+      { filePath: '/Users/me/My Project/index.html', anchor: '#L3' },
+    );
+    assert.deepEqual(
+      parseLocalMarkdownReference('/Users/me/project'),
+      { filePath: '/Users/me/project' },
+    );
+    assert.deepEqual(
+      parseLocalMarkdownReference('./docs/'),
+      { filePath: './docs/' },
+    );
   });
 });
 
@@ -118,5 +162,44 @@ describe('relative-path resolution → classifyPath workspace tier', () => {
   it('absolute paths pass through unchanged', async () => {
     const { resolveToolPath } = await import('../../lib/file-write-tools');
     assert.equal(resolveToolPath('/abs/foo.md', '/Users/me/proj'), '/abs/foo.md');
+  });
+
+  it('normalizes dot segments before scope classification', async () => {
+    const { resolveToolPath } = await import('../../lib/file-write-tools');
+    assert.equal(
+      resolveToolPath('./docs/../README.md', '/Users/me/proj'),
+      '/Users/me/proj/README.md',
+    );
+    assert.equal(
+      resolveToolPath('../../../etc/passwd', '/Users/me/proj'),
+      '/etc/passwd',
+    );
+  });
+});
+
+describe('remarkResolveLocalLinks', () => {
+  function transform(url: string): string {
+    const tree = {
+      type: 'root',
+      children: [{ type: 'link', url, children: [{ type: 'text' }] }],
+    };
+    remarkResolveLocalLinks({ workingDirectory: '/Users/me/proj' })(tree);
+    return tree.children[0].url;
+  }
+
+  it('resolves bare files and relative directories before rehype hardening', () => {
+    assert.equal(transform('README.md'), '/Users/me/proj/README.md');
+    assert.equal(transform('./docs/'), '/Users/me/proj/docs');
+    assert.equal(transform('../fixtures/data.json#L4'), '/Users/me/fixtures/data.json#L4');
+  });
+
+  it('keeps scope escapes absolute so the later trust gate can require confirmation', () => {
+    assert.equal(transform('../../../etc/passwd'), '/etc/passwd');
+  });
+
+  it('does not rewrite remote or dangerous protocols', () => {
+    assert.equal(transform('https://example.com'), 'https://example.com');
+    assert.equal(transform('javascript:alert(1)'), 'javascript:alert(1)');
+    assert.equal(transform('data:text/html,boom'), 'data:text/html,boom');
   });
 });

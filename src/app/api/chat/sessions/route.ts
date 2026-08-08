@@ -1,7 +1,11 @@
 import { NextRequest } from 'next/server';
-import fs from 'fs/promises';
+import path from 'node:path';
 import { getAllSessions, createSession } from '@/lib/db';
+import { sanitizeManualTitle, type TitleOrigin } from '@/lib/conversation-title';
 import type { CreateSessionRequest, SessionsResponse, SessionResponse } from '@/types';
+import { serverErrorResponse } from '@/lib/api-error';
+import { isPermissionProfile, PERMISSION_PROFILES } from '@/lib/permission/profile';
+import { isExistingDirectory } from '@/lib/working-directory';
 
 export async function GET(request: NextRequest) {
   try {
@@ -28,9 +32,7 @@ export async function GET(request: NextRequest) {
     const response: SessionsResponse = { sessions };
     return Response.json(response);
   } catch (error) {
-    const message = error instanceof Error ? error.stack || error.message : String(error);
-    console.error('[GET /api/chat/sessions] Error:', message);
-    return Response.json({ error: message }, { status: 500 });
+    return serverErrorResponse('GET /api/chat/sessions', error);
   }
 }
 
@@ -47,29 +49,55 @@ export async function POST(request: NextRequest) {
     }
 
     // Validate directory actually exists on disk
-    try {
-      await fs.access(body.working_directory);
-    } catch {
+    const workingDirectory = body.working_directory.trim();
+    if (!path.isAbsolute(workingDirectory) || !isExistingDirectory(workingDirectory)) {
       return Response.json(
-        { error: 'Directory does not exist', code: 'INVALID_DIRECTORY' },
+        { error: 'Working directory must be an existing absolute directory', code: 'INVALID_DIRECTORY' },
         { status: 400 },
       );
     }
 
+    // A session is created with the profile the composer was showing. An
+    // unrecognised value is rejected rather than coerced — silently
+    // downgrading a caller that asked for 'full_access' would be as much a
+    // lie as silently honouring a typo'd elevation.
+    if (body.permission_profile !== undefined && !isPermissionProfile(body.permission_profile)) {
+      return Response.json(
+        { error: `permission_profile must be one of: ${PERMISSION_PROFILES.join(', ')}` },
+        { status: 400 },
+      );
+    }
+
+    // Title is optional and, since the composer stopped sending one, normally
+    // absent — the session is created as a placeholder and POST /api/chat
+    // derives the fallback from the first real message. A caller that DOES
+    // name the session is stating explicit intent, so it's validated through
+    // the shared rules and recorded as 'manual' (never auto-overwritten).
+    let title: string | undefined;
+    let titleOrigin: TitleOrigin | undefined;
+    if (body.title !== undefined) {
+      const result = sanitizeManualTitle(body.title);
+      if (!result.ok) {
+        return Response.json({ error: result.error }, { status: 400 });
+      }
+      title = result.title;
+      titleOrigin = 'manual';
+    }
+
     const session = createSession(
-      body.title,
+      title,
       body.model,
       body.system_prompt,
-      body.working_directory,
+      path.normalize(workingDirectory),
       body.mode,
       body.provider_id,
       body.permission_profile,
+      undefined, // source
+      titleOrigin,
     );
     const response: SessionResponse = { session };
     return Response.json(response, { status: 201 });
   } catch (error) {
-    const message = error instanceof Error ? error.stack || error.message : String(error);
-    console.error('[POST /api/chat/sessions] Error:', message);
-    return Response.json({ error: message }, { status: 500 });
+    return serverErrorResponse('POST /api/chat/sessions', error);
   }
 }

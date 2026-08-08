@@ -15,11 +15,21 @@
 
 import type { PreviewSource } from '@/hooks/usePanel';
 import type { PreviewTrust } from '@/lib/preview-source';
-import type { MarkdownPresentationStyle } from '@/lib/markdown/presentation-templates';
+import type { SubagentRunDetailsResponse } from '@/types';
+import type {
+  DelegatedAgentResult,
+  SubagentDispatchState,
+  SubagentRunPhase,
+} from '@/lib/subagent-status';
+import {
+  pathIsWithin,
+  remapMutationPath,
+  type FileMutationTransaction,
+} from '@/lib/file-mutation';
 
 export type FixedTabId = 'git' | 'widget';
 
-export type DynamicTabKind = 'markdown' | 'artifact' | 'file' | 'files-pinned';
+export type DynamicTabKind = 'markdown' | 'artifact' | 'file' | 'files-pinned' | 'agent-run';
 
 export interface FixedTab {
   id: FixedTabId;
@@ -38,10 +48,6 @@ export interface MarkdownTab {
   trust?: PreviewTrust;
   baseDir?: string;
   readonly?: boolean;
-  /** Phase 4 UX — in-place presentation style. Persists so the user's
-   *  choice survives reload + tab dedupe. Missing = the renderer
-   *  applies DEFAULT_MARKDOWN_PRESENTATION_STYLE. */
-  presentationTemplate?: MarkdownPresentationStyle;
 }
 
 export interface ArtifactTab {
@@ -71,7 +77,46 @@ export interface FilesPinnedTab {
   title: string;
 }
 
-export type DynamicTab = MarkdownTab | ArtifactTab | FilePreviewTab | FilesPinnedTab;
+export interface AgentRunTab {
+  id: string;
+  kind: 'agent-run';
+  key: string;
+  title: string;
+  run: {
+    id: string;
+    attemptId: string;
+    attemptNumber: number;
+    attemptCount: number;
+    agentName: string;
+    prompt: string;
+    requestedProviderId?: string;
+    requestedModel?: string;
+    effectiveProviderId?: string;
+    effectiveModel?: string;
+    workflowId?: string;
+    taskKey?: string;
+    dependencyTaskKeys: string[];
+    runtime?: 'codepilot_runtime' | 'claude_code' | 'codex_runtime';
+    status: 'queued' | 'running' | 'completed' | 'partial' | 'failed' | 'cancelled' | 'timed_out';
+    phase: SubagentRunPhase;
+    dispatchState: SubagentDispatchState;
+    currentActivity?: string;
+    lastActivityAt?: string;
+    result?: string;
+    structuredResult?: DelegatedAgentResult;
+    attempts?: SubagentRunDetailsResponse['attempts'];
+    lifecycleEvents?: SubagentRunDetailsResponse['events'];
+    isError?: boolean;
+    error?: {
+      code: string;
+      httpStatus?: number;
+      retryable?: boolean;
+    };
+    icon: 'search' | 'code' | 'task' | 'assistant';
+  };
+}
+
+export type DynamicTab = MarkdownTab | ArtifactTab | FilePreviewTab | FilesPinnedTab | AgentRunTab;
 export type Tab = FixedTab | DynamicTab;
 
 export interface WorkspaceSidebarState {
@@ -201,6 +246,58 @@ export function setWidth(state: WorkspaceSidebarState, width: number): Workspace
   return { ...state, width: clamped };
 }
 
+/**
+ * Atomically migrate every file-backed tab after a successful filesystem
+ * mutation. IDs and keys contain the absolute path, so changing only
+ * `filePath` would leave persistence and future deduplication corrupted.
+ */
+export function commitWorkspaceFileMutation(
+  state: WorkspaceSidebarState,
+  transaction: FileMutationTransaction,
+): WorkspaceSidebarState {
+  const affected = (tab: Tab) =>
+    (tab.kind === 'markdown' || tab.kind === 'file') &&
+    pathIsWithin(tab.filePath, transaction.targetPath);
+  const activeIndex = state.tabs.findIndex((tab) => tab.id === state.activeTabId);
+
+  if (transaction.kind === 'delete') {
+    const tabs = state.tabs.filter((tab) => !affected(tab));
+    if (tabs.length === state.tabs.length) return state;
+    const activeWasDeleted = state.tabs.some(
+      (tab) => tab.id === state.activeTabId && affected(tab),
+    );
+    const activeTabId = activeWasDeleted
+      ? tabs[Math.max(0, activeIndex - 1)]?.id ?? tabs[0]?.id ?? 'git'
+      : state.activeTabId;
+    return { ...state, tabs, activeTabId };
+  }
+
+  if (!transaction.newPath) return state;
+  let nextActiveId = state.activeTabId;
+  let changed = false;
+  const tabs = state.tabs.map((tab) => {
+    if (!affected(tab) || (tab.kind !== 'markdown' && tab.kind !== 'file')) {
+      return tab;
+    }
+    changed = true;
+    const filePath = remapMutationPath(
+      tab.filePath,
+      transaction.targetPath,
+      transaction.newPath!,
+    );
+    const id = dynamicTabId(tab.kind, filePath);
+    if (tab.id === state.activeTabId) nextActiveId = id;
+    return {
+      ...tab,
+      id,
+      key: filePath,
+      filePath,
+      title: filePath.split(/[\\/]/).filter(Boolean).pop() ?? filePath,
+    };
+  });
+  return changed ? { ...state, tabs, activeTabId: nextActiveId } : state;
+}
+
 // ─── Persistence ───────────────────────────────────────────────────
 
 /**
@@ -234,7 +331,9 @@ export function serialize(state: WorkspaceSidebarState): SerializedState {
     open: state.open,
     width: state.width,
     activeTabId: state.activeTabId,
-    dynamicTabs: state.tabs.filter(isDynamicTab),
+    // Agent transcripts are reconstructed from the durable chat message on
+    // demand. Do not duplicate prompt/result content into localStorage.
+    dynamicTabs: state.tabs.filter(isDynamicTab).filter(tab => tab.kind !== 'agent-run'),
   };
 }
 
@@ -247,7 +346,7 @@ export function parse(raw: string | null | undefined): WorkspaceSidebarState {
   try {
     const data = JSON.parse(raw) as Partial<SerializedState>;
     const dynamicTabs = Array.isArray(data.dynamicTabs)
-      ? data.dynamicTabs.filter(isParsableDynamicTab)
+      ? data.dynamicTabs.filter(isParsableDynamicTab).map(stripLegacyPresentationTemplate)
       : [];
     const tabs: Tab[] = [...FIXED_TABS, ...dynamicTabs];
     const fallbackActive = 'git';
@@ -266,10 +365,30 @@ export function parse(raw: string | null | undefined): WorkspaceSidebarState {
   }
 }
 
+/**
+ * Tabs written by v0.54 may carry the retired in-place Markdown theme.
+ * Accept the old record, but deliberately drop that field at the parse
+ * boundary so it cannot leak back into current runtime state.
+ */
+function stripLegacyPresentationTemplate(tab: DynamicTab): DynamicTab {
+  if (tab.kind !== 'markdown' || !('presentationTemplate' in tab)) return tab;
+  const next = { ...tab } as DynamicTab & { presentationTemplate?: unknown };
+  delete next.presentationTemplate;
+  return next;
+}
+
 function isParsableDynamicTab(value: unknown): value is DynamicTab {
   if (!value || typeof value !== 'object') return false;
   const v = value as Partial<DynamicTab> & { kind?: string; id?: string; key?: string };
   if (typeof v.id !== 'string' || typeof v.key !== 'string') return false;
+  if (v.kind === 'agent-run') {
+    const run = (v as Partial<AgentRunTab>).run;
+    return !!run
+      && typeof run.id === 'string'
+      && typeof run.agentName === 'string'
+      && typeof run.prompt === 'string'
+      && ['queued', 'running', 'completed', 'partial', 'failed', 'cancelled', 'timed_out'].includes(run.status);
+  }
   return v.kind === 'markdown' || v.kind === 'artifact' || v.kind === 'file' || v.kind === 'files-pinned';
 }
 
@@ -301,7 +420,6 @@ export function tabFromPreviewSource(source: PreviewSource): DynamicTab {
       trust: source.trust,
       baseDir: source.baseDir,
       readonly: source.readonly,
-      presentationTemplate: source.presentationTemplate,
     };
     if (MARKDOWN_EXTENSIONS.has(ext)) {
       return {
@@ -401,14 +519,11 @@ export function previewSourceFromTab(tab: Tab): PreviewSource | null {
     if (tab.trust !== undefined) provenance.trust = tab.trust;
     if (tab.baseDir !== undefined) provenance.baseDir = tab.baseDir;
     if (tab.readonly !== undefined) provenance.readonly = tab.readonly;
-    if (tab.kind === 'markdown' && tab.presentationTemplate !== undefined) {
-      provenance.presentationTemplate = tab.presentationTemplate;
-    }
     return { kind: 'file', filePath: tab.filePath, ...provenance };
   }
   if (tab.kind === 'artifact') {
     return tab.source;
   }
-  // 'fixed' / 'files-pinned' — preview surface isn't theirs to drive.
+  // 'fixed' / 'files-pinned' / 'agent-run' — preview surface isn't theirs.
   return null;
 }

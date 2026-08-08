@@ -25,10 +25,19 @@ import path from 'node:path';
 import {
   findCodexBinary,
   parseCodexVersion,
+  codexVersionSupportsAutoReview,
+  CODEX_AUTO_REVIEW_MIN_VERSION,
   selectBestCodexCandidate,
   isFatalCodexConfigStderr,
   resetCodexBinaryCacheForTests,
   buildCodexLaunch,
+  buildCodexAppServerArgs,
+  collectCodexCandidatePaths,
+  fingerprintCodexCandidates,
+  getMacOSCodexBundleCandidates,
+  getWindowsCodexCandidates,
+  isWindowsDesktopCodexPath,
+  getCodexAvailability,
 } from '@/lib/codex/app-server-manager';
 
 const managerSrc = fs.readFileSync(
@@ -90,42 +99,139 @@ describe('findCodexBinary — discovery order (round 6)', () => {
   });
 });
 
-describe('findCodexBinary — source pins (round 6 macOS bundle fallback)', () => {
-  it('source declares the /Applications/Codex.app/Contents/Resources/codex fallback path', () => {
-    // The exact path string. Refactoring is fine as long as the
-    // literal stays present somewhere in the file — that's what
-    // makes the .dmg-installed user no longer see "未安装".
-    assert.match(
-      managerSrc,
-      /\/Applications\/Codex\.app\/Contents\/Resources\/codex/,
-      'macOS Codex.app bundled-binary fallback path must remain in app-server-manager.ts',
-    );
+describe('findCodexBinary — macOS desktop bundle discovery', () => {
+  it('covers current ChatGPT.app + legacy Codex.app in system and user Applications', () => {
+    assert.deepEqual(getMacOSCodexBundleCandidates('/Users/tester'), [
+      '/Applications/ChatGPT.app/Contents/Resources/codex',
+      '/Applications/Codex.app/Contents/Resources/codex',
+      '/Users/tester/Applications/ChatGPT.app/Contents/Resources/codex',
+      '/Users/tester/Applications/Codex.app/Contents/Resources/codex',
+    ]);
   });
 
-  it('source gates the fallback on darwin (no Windows / Linux pickup of the macOS path)', () => {
-    assert.match(
-      managerSrc,
-      /process\.platform\s*===\s*['"]darwin['"][\s\S]{0,400}Codex\.app/,
-      'macOS fallback must be gated by process.platform === "darwin" so other platforms do not accidentally probe a macOS-specific path',
-    );
+  it('does not add macOS bundles on Windows or Linux', () => {
+    const exists = () => true;
+    const windows = collectCodexCandidatePaths({
+      platform: 'win32',
+      pathValue: 'C:\\npm',
+      homeDir: 'C:\\Users\\tester',
+      exists,
+    });
+    const linux = collectCodexCandidatePaths({
+      platform: 'linux',
+      pathValue: '/usr/bin',
+      homeDir: '/home/tester',
+      exists,
+    });
+    assert.ok(windows.every((candidate) => !candidate.includes('Applications/')));
+    assert.ok(linux.every((candidate) => !candidate.includes('Applications/')));
   });
 
-  it('source has the fallback AFTER the PATH walk (priority order)', () => {
-    // Discovery priority: CODEX_DISABLED → CODEX_BIN → PATH → macOS
-    // bundle. A future refactor that hoists the macOS path above
-    // the PATH walk would silently mask a user's custom `codex`
-    // build on their PATH, so we pin the order textually. Anchor on
-    // the loop body of the PATH walk vs. the literal `/Applications
-    // /Codex.app/...` string, since those are the load-bearing lines
-    // that drive the runtime behaviour.
-    const pathWalkIdx = managerSrc.search(/path\.split\(sep\)/);
-    const macOsIdx = managerSrc.search(/\/Applications\/Codex\.app\/Contents\/Resources\/codex/);
-    assert.notEqual(pathWalkIdx, -1, 'PATH walk anchor missing (looking for `path.split(sep)`)');
-    assert.notEqual(macOsIdx, -1, 'macOS fallback path string missing');
-    assert.ok(
-      pathWalkIdx < macOsIdx,
-      'PATH walk must come BEFORE the macOS Codex.app fallback so a custom `codex` on PATH still wins',
+  it('keeps PATH candidates before app bundles for equal-version tiebreaks', () => {
+    const existing = new Set([
+      '/opt/homebrew/bin/codex',
+      '/Applications/ChatGPT.app/Contents/Resources/codex',
+    ]);
+    const candidates = collectCodexCandidatePaths({
+      platform: 'darwin',
+      pathValue: '/opt/homebrew/bin',
+      homeDir: '/Users/tester',
+      exists: (candidate) => existing.has(candidate),
+    });
+    assert.deepEqual(candidates, [
+      '/opt/homebrew/bin/codex',
+      '/Applications/ChatGPT.app/Contents/Resources/codex',
+    ]);
+  });
+
+  it('changes the fingerprint when a CLI is installed or uninstalled', () => {
+    const before = fingerprintCodexCandidates(['/opt/homebrew/bin/codex']);
+    const coexisting = fingerprintCodexCandidates([
+      '/opt/homebrew/bin/codex',
+      '/Applications/ChatGPT.app/Contents/Resources/codex',
+    ]);
+    const afterUninstall = fingerprintCodexCandidates([
+      '/Applications/ChatGPT.app/Contents/Resources/codex',
+    ]);
+    assert.notEqual(before, coexisting);
+    assert.notEqual(coexisting, afterUninstall);
+  });
+
+  it('invalidates installed_idle when CODEX_BIN changes without a process restart', async () => {
+    const savedDisabled = process.env.CODEX_DISABLED;
+    const savedBin = process.env.CODEX_BIN;
+    const savedPath = process.env.PATH;
+    try {
+      delete process.env.CODEX_DISABLED;
+      process.env.PATH = '/no/such/dir';
+      process.env.CODEX_BIN = __filename;
+      resetCodexBinaryCacheForTests();
+      assert.deepEqual(await getCodexAvailability(), {
+        kind: 'installed_idle',
+        binary: __filename,
+      });
+
+      process.env.CODEX_BIN = path.resolve(__dirname, '../../lib/codex/app-server-manager.ts');
+      assert.deepEqual(await getCodexAvailability(), {
+        kind: 'installed_idle',
+        binary: process.env.CODEX_BIN,
+      });
+    } finally {
+      if (savedDisabled === undefined) delete process.env.CODEX_DISABLED;
+      else process.env.CODEX_DISABLED = savedDisabled;
+      if (savedBin === undefined) delete process.env.CODEX_BIN;
+      else process.env.CODEX_BIN = savedBin;
+      if (savedPath === undefined) delete process.env.PATH;
+      else process.env.PATH = savedPath;
+      resetCodexBinaryCacheForTests();
+    }
+  });
+});
+
+describe('findCodexBinary — Windows standalone and desktop discovery', () => {
+  it('checks the official standalone installer directory even when PATH misses it', () => {
+    const candidates = getWindowsCodexCandidates(
+      'C:\\Users\\tester',
+      'C:\\Users\\tester\\AppData\\Local',
+      'C:\\Users\\tester\\AppData\\Roaming',
     );
+    assert.ok(candidates.includes(
+      'C:\\Users\\tester\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe',
+    ));
+
+    const existing = new Set([
+      'C:\\Users\\tester\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe',
+    ]);
+    assert.deepEqual(collectCodexCandidatePaths({
+      platform: 'win32',
+      pathValue: '',
+      homeDir: 'C:\\Users\\tester',
+      localAppData: 'C:\\Users\\tester\\AppData\\Local',
+      appData: 'C:\\Users\\tester\\AppData\\Roaming',
+      exists: (candidate) => existing.has(candidate),
+    }), [...existing]);
+  });
+
+  it('classifies Store/MSIX bundles and app aliases as probe-required desktop paths', () => {
+    assert.equal(isWindowsDesktopCodexPath(
+      'C:\\Program Files\\WindowsApps\\OpenAI.Codex_1.0_x64__id\\app\\resources\\codex.exe',
+    ), true);
+    assert.equal(isWindowsDesktopCodexPath(
+      'C:\\Users\\tester\\AppData\\Local\\Microsoft\\WindowsApps\\codex.exe',
+    ), true);
+    assert.equal(isWindowsDesktopCodexPath(
+      'C:\\Users\\tester\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe',
+    ), false);
+  });
+
+  it('RuntimePanel explains the desktop-only state and independent CLI recovery', () => {
+    const panelSrc = fs.readFileSync(
+      path.resolve(__dirname, '../../components/settings/RuntimePanel.tsx'),
+      'utf8',
+    );
+    assert.match(panelSrc, /codexAvailability\.kind === ["']desktop_only["']/);
+    assert.match(panelSrc, /chatgpt\.com\/codex\/install\.ps1/);
+    assert.match(panelSrc, /仅桌面应用/);
   });
 });
 
@@ -172,10 +278,19 @@ describe('Codex app-server spawn compatibility', () => {
     // Phase 1 (2026-06-02) routed the spawn through buildCodexLaunch so a
     // Windows `.cmd` shim gets a cmd.exe wrapper; we pin the app-server
     // subcommand + no---listen contract that older Codex.app builds need.
+    const args = buildCodexAppServerArgs('/tmp/codepilot/codex-home');
+    const launch = buildCodexLaunch('/usr/bin/codex', args, 'linux');
+    assert.equal(launch.command, '/usr/bin/codex');
+    assert.equal(launch.args[0], 'app-server');
+    assert.equal(launch.args.includes('--listen'), false);
+    assert.deepEqual(launch.args.slice(1), [
+      '-c',
+      'sqlite_home="/tmp/codepilot/codex-home"',
+    ]);
     assert.match(
       managerSrc,
-      /buildCodexLaunch\(binary,\s*\[\s*['"]app-server['"]\s*\]/,
-      'app-server must be launched through buildCodexLaunch with the app-server subcommand',
+      /buildCodexLaunch\(binary,\s*buildCodexAppServerArgs\(preparedHome\.codexHome\)\)/,
+      'getCodexAppServer must launch with the isolated app-server argument builder',
     );
     assert.match(
       managerSrc,
@@ -260,6 +375,14 @@ describe('buildCodexLaunch — Windows .cmd shim wrapping (Phase 1, 2026-06-02)'
 // ─────────────────────────────────────────────────────────────────────
 
 describe('selectBestCodexCandidate — version-aware discovery (P0.1)', () => {
+  it('picks the current ChatGPT.app bundle over an older Homebrew codex', () => {
+    const chosen = selectBestCodexCandidate([
+      { path: '/opt/homebrew/bin/codex', version: 'codex-cli 0.45.0' },
+      { path: '/Applications/ChatGPT.app/Contents/Resources/codex', version: 'codex-cli 0.145.0-alpha.18' },
+    ]);
+    assert.equal(chosen, '/Applications/ChatGPT.app/Contents/Resources/codex');
+  });
+
   it('picks the newer Codex.app build over an older Homebrew codex listed first on PATH', () => {
     const chosen = selectBestCodexCandidate([
       { path: '/opt/homebrew/bin/codex', version: 'codex-cli 0.45.0' },
@@ -328,6 +451,26 @@ describe('parseCodexVersion', () => {
   it('returns null for null / garbage', () => {
     assert.equal(parseCodexVersion(null), null);
     assert.equal(parseCodexVersion('no version here'), null);
+  });
+});
+
+describe('Codex auto-review minimum version', () => {
+  it('pins the exact schema-probed alpha build', () => {
+    assert.equal(CODEX_AUTO_REVIEW_MIN_VERSION, '0.145.0-alpha.18');
+    assert.equal(codexVersionSupportsAutoReview('codex-cli 0.145.0-alpha.18'), true);
+  });
+
+  it('rejects earlier alphas and older minor releases', () => {
+    assert.equal(codexVersionSupportsAutoReview('codex-cli 0.145.0-alpha.17'), false);
+    assert.equal(codexVersionSupportsAutoReview('codex-cli 0.135.0-alpha.1'), false);
+  });
+
+  it('accepts later alphas and stable releases but rejects unknown versions', () => {
+    assert.equal(codexVersionSupportsAutoReview('codex-cli 0.145.0-alpha.19'), true);
+    assert.equal(codexVersionSupportsAutoReview('codex-cli 0.145.0'), true);
+    assert.equal(codexVersionSupportsAutoReview('codex-cli 0.146.0-alpha.1'), true);
+    assert.equal(codexVersionSupportsAutoReview(null), false);
+    assert.equal(codexVersionSupportsAutoReview('unknown'), false);
   });
 });
 

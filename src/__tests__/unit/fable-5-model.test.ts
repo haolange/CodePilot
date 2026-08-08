@@ -20,6 +20,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   sanitizeClaudeModelOptions,
   isOpusAdaptiveThinkingModel,
@@ -27,7 +28,7 @@ import {
 } from '../../lib/claude-model-options';
 import { getContextWindow } from '../../lib/model-context';
 
-const LIB = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../lib');
+const LIB = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../lib');
 const read = (f: string) => fs.readFileSync(path.join(LIB, f), 'utf8');
 
 describe('Fable 5 — adaptive-thinking family detection', () => {
@@ -162,12 +163,40 @@ describe('Fable 5 — thinkingForcedOn surfacing (Codex P1 closeout)', () => {
       'THINKING_ALWAYS_ON must be in TOAST_STATUS_CODES or the notification is swallowed');
   });
 
-  it('native-runtime effort-dropped copy covers Fable 5 (Codex P2)', () => {
-    const src = read('agent-loop.ts');
-    const toastIdx = src.indexOf("title: 'Effort ignored on this runtime'",
-      src.indexOf('Official API: pass through sanitized thinking'));
-    assert.ok(toastIdx > 0, 'official-API effort toast must exist');
-    assert.match(src.slice(toastIdx, toastIdx + 400), /Fable 5/,
-      'the effort-dropped message must name Fable 5 now that it is in the gated family');
+  it('native official path SENDS effort for the adaptive family, gated per model (s05)', () => {
+    // 2026-07-18 (model plan Phase 2 / s05): the old workaround that dropped
+    // effort for the WHOLE Fable 5 / Opus 4.7+ family on the native path — and
+    // emitted RUNTIME_EFFORT_IGNORED — is reverted. @ai-sdk/anthropic 4.0.5
+    // ships effort via GA output_config.effort with no deprecated beta header,
+    // so the composer's effort pick must reach the wire for these models.
+    //
+    // Codex review P1 (same day) narrowed this: "not dropped for the adaptive
+    // family" is NOT "sent unconditionally". Only models on Anthropic's effort
+    // list get the field; everything else omits it and raises
+    // effortDroppedUnsupportedModel. The gate is now model × exact tier:
+    // Sonnet 4.6 accepts max but not xhigh, including values supplied by an
+    // external Codex config. This assertion pins the shared table lookup; the
+    // executable matrix lives in agent-loop-anthropic-wire.test.ts.
+    const wireSrc = read('agent-loop-anthropic-wire.ts');
+    const elseIdx = wireSrc.indexOf('} else {');
+    const ctx1mIdx = wireSrc.indexOf('sanitized.applyContext1mBeta', elseIdx);
+    assert.ok(elseIdx > 0 && ctx1mIdx > elseIdx, 'official (else) branch markers present');
+    const officialBlock = wireSrc.slice(elseIdx, ctx1mIdx);
+    assert.match(officialBlock, /getAnthropicApiSupportedEffortLevels\(model\)/,
+      'official native path must load the exact per-model tier allowlist');
+    assert.match(officialBlock, /supportedLevels\.includes\(sanitized\.effort/,
+      'official native path must gate the concrete effort tier, not only the model');
+    assert.match(officialBlock, /anthropicOpts\.effort = sanitized\.effort;/,
+      'supported models must still get the composer pick on the wire');
+    assert.match(officialBlock, /effortDroppedUnsupportedModel = true/,
+      'an unsupported model must raise the drop signal, never omit silently');
+    assert.match(officialBlock, /effortDroppedUnsupportedTier = \{/,
+      'an unsupported tier must raise a distinct drop signal');
+    // The PROXY-only signal still never appears on the official branch.
+    assert.doesNotMatch(officialBlock, /effortDroppedForProxy = true/,
+      'the official path is not a proxy — the two drop reasons stay distinct');
+    // agent-loop.ts consumes the helper (not re-inlining the logic).
+    assert.match(read('agent-loop.ts'), /buildAnthropicProviderOptions\(\{/,
+      'agent-loop must build providerOptions via the extracted wire helper');
   });
 });

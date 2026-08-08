@@ -4,14 +4,15 @@
 
 import { tool } from 'ai';
 import { z } from 'zod';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import path from 'path';
 import type { ToolContext } from './index';
+import { globWithNode, SEARCH_EXCLUDED_DIRECTORIES } from './search-fallback';
 
 export function createGlobTool(ctx: ToolContext) {
   return tool({
     description:
-      'Find files matching a glob pattern. Returns file paths sorted by modification time. ' +
+      'Find files matching a glob pattern. Returns file paths in stable path order. ' +
       'Use this to discover files by name pattern (e.g. "**/*.ts", "src/components/**/*.tsx").',
     inputSchema: z.object({
       pattern: z.string().describe('Glob pattern to match files against'),
@@ -23,19 +24,34 @@ export function createGlobTool(ctx: ToolContext) {
         : ctx.workingDirectory;
 
       try {
-        // Use find + glob via bash for portability, with reasonable limits
-        // Exclude common heavy directories
-        const excludes = 'node_modules .git .next dist build coverage .cache __pycache__'
-          .split(' ')
-          .map(d => `-not -path "*/${d}/*"`)
-          .join(' ');
+        const args = ['--files', '--color=never', '--glob', pattern];
+        for (const directory of SEARCH_EXCLUDED_DIRECTORIES) {
+          args.push('--glob', `!${directory}/**`, '--glob', `!**/${directory}/**`);
+        }
+        let result: string;
+        try {
+          result = execFileSync('rg', args, {
+            cwd,
+            encoding: 'utf-8',
+            timeout: 10_000,
+            maxBuffer: 1024 * 1024,
+          });
+        } catch (error) {
+          const processError = error as NodeJS.ErrnoException & { status?: number };
+          if (processError.status === 1) {
+            result = '';
+          } else if (processError.code === 'ENOENT') {
+            result = globWithNode(cwd, pattern).join('\n');
+          } else {
+            throw error;
+          }
+        }
 
-        const result = execSync(
-          `find . -type f -name '${pattern.replace(/\*\*\//g, '')}' ${excludes} 2>/dev/null | head -200 | sort`,
-          { cwd, encoding: 'utf-8', timeout: 10_000 },
-        );
-
-        const files = result.trim().split('\n').filter(Boolean);
+        const files = result.trim().split('\n')
+          .filter(Boolean)
+          .map((file) => file.replace(/^\.([/\\])/, '').replace(/\\/g, '/'))
+          .sort()
+          .slice(0, 200);
         if (files.length === 0) {
           return `No files found matching pattern "${pattern}" in ${cwd}`;
         }

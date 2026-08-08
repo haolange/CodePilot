@@ -14,11 +14,12 @@
  * post-render DOM walk over text nodes whose ancestor chain does NOT
  * include `<pre>`, `<code>`, or `<a>`. Tokenize each safe text node
  * and splice in chip <button> elements. Markdown links that look
- * like local file references get intercepted in a separate pass.
+ * like local filesystem references get intercepted in a separate pass.
  *
  * The chip elements carry their target metadata on `data-*`
- * attributes; one container-level click listener routes through
- * setPreviewSource. No React portals, no innerHTML rewrites — we
+ * attributes; one container-level click listener probes and routes each
+ * target to PreviewPanel or the system file manager. No React portals,
+ * no innerHTML rewrites — we
  * mutate plain DOM nodes that React doesn't manage (they live inside
  * a ref'd div and the tree underneath comes from streamdown's
  * dangerouslySetInnerHTML / its react renderer of static markdown
@@ -28,15 +29,24 @@
 
 import { useEffect, useRef, useCallback, useMemo } from "react";
 import type React from "react";
+import { defaultRemarkPlugins } from "streamdown";
+import type { PluggableList } from "unified";
 import { MessageResponse } from "@/components/ai-elements/message";
+import { MARKDOWN_LINK_CLASS_NAME } from "@/components/markdown/markdown-contract";
 import { usePanel } from "@/hooks/usePanel";
+import { useTranslation } from "@/hooks/useTranslation";
+import { showToast } from "@/hooks/useToast";
+import { cn } from "@/lib/utils";
 import { classifyPath } from "@/lib/preview-source";
 import {
   tokenizeDevOutput,
   type DevOutputToken,
 } from "@/lib/markdown/dev-output-parser";
-import { splitPathAndAnchor } from "@/lib/markdown/anchor";
-import { looksLikeRemoteHref, isPotentialLocalFile } from "@/lib/markdown/local-link-detector";
+import {
+  parseLocalMarkdownReference,
+  remarkResolveLocalLinks,
+} from "@/lib/markdown/local-link-detector";
+import { inspectLocalPath, revealPathWithSystem } from "@/lib/local-path-navigation";
 import { resolveToolPath } from "@/lib/file-write-tools";
 
 /** Tag names whose subtree we never tokenize — letting markdown
@@ -48,9 +58,118 @@ const SKIP_TAGS = new Set(["PRE", "CODE", "A", "BUTTON"]);
  *  re-process already-chipified content. */
 const PROCESSED_ATTR = "data-codepilot-dev-processed";
 
+/**
+ * Link renderer for DevOutputSegment only. Streamdown treats unknown hrefs as
+ * inert controls, but Codex output often contains local file references that
+ * CodePilot needs to route itself. Keep the shared Markdown link appearance
+ * while preserving those stricter navigation rules.
+ */
+export function DevOutputMarkdownLink(
+  props: React.AnchorHTMLAttributes<HTMLAnchorElement>,
+) {
+  const { href, children, className, title, target, rel, ...rest } = props;
+  const safeHref = typeof href === "string" ? href : "";
+  const linkClassName = cn(MARKDOWN_LINK_CLASS_NAME, className);
+  const localReference = parseLocalMarkdownReference(safeHref);
+  if (localReference) {
+    return (
+      <a
+        {...rest}
+        href={safeHref}
+        className={linkClassName}
+        title={title ?? safeHref}
+        target={target ?? "_blank"}
+        rel={rel ?? "noreferrer"}
+        data-codepilot-fileref-path={localReference.filePath}
+        {...(localReference.anchor
+          ? { "data-codepilot-fileref-anchor": localReference.anchor }
+          : {})}
+      >
+        {children}
+      </a>
+    );
+  }
+  if (/^(?:https?|mailto|tel):/i.test(safeHref)) {
+    return (
+      <a
+        {...rest}
+        href={safeHref}
+        className={linkClassName}
+        title={title ?? safeHref}
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        {children}
+      </a>
+    );
+  }
+  // Anything else (javascript:, data:, unknown schemes) → inert span.
+  return <span title="Blocked URL">{children}</span>;
+}
+
+const DEV_OUTPUT_MARKDOWN_COMPONENTS = { a: DevOutputMarkdownLink };
+
 export function DevOutputSegment({ text }: { text: string }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const { workingDirectory, setPreviewSource } = usePanel();
+  const { workingDirectory, sessionId, setPreviewSource } = usePanel();
+  const { t } = useTranslation();
+  const remarkPlugins = useMemo<PluggableList>(
+    () => [
+      ...Object.values(defaultRemarkPlugins),
+      [remarkResolveLocalLinks, { workingDirectory }],
+    ],
+    [workingDirectory],
+  );
+
+  const openLocalReference = useCallback(
+    async (rawFilePath: string, anchor?: string) => {
+      const absolutePath = resolveToolPath(rawFilePath, workingDirectory);
+      const cls = classifyPath(absolutePath, workingDirectory);
+
+      // Preserve the two-step permission gate for paths outside the current
+      // workspace. PreviewPanel performs the type probe only after confirm,
+      // so an AI-authored reference cannot read metadata on its own.
+      if (cls.trust !== "workspace") {
+        setPreviewSource({
+          kind: "file",
+          filePath: absolutePath,
+          trust: cls.trust,
+          readonly: cls.readonly,
+          ...(anchor ? { anchor } : {}),
+        });
+        return;
+      }
+
+      try {
+        if (!sessionId) throw new Error("Missing session scope");
+        const inspection = await inspectLocalPath(absolutePath, { sessionId });
+        if (inspection.kind === "directory") {
+          await revealPathWithSystem({ path: inspection.realPath, sessionId });
+          return;
+        }
+        if (inspection.kind !== "file") {
+          showToast({ type: "warning", message: t("localReference.unsupported") });
+          return;
+        }
+        setPreviewSource({
+          kind: "file",
+          filePath: inspection.realPath,
+          trust: cls.trust,
+          ...(cls.baseDir ? { baseDir: cls.baseDir } : {}),
+          readonly: cls.readonly,
+          ...(anchor ? { anchor } : {}),
+        });
+      } catch (error) {
+        showToast({
+          type: "error",
+          message: t("localReference.openFailed", {
+            reason: error instanceof Error ? error.message : String(error),
+          }),
+        });
+      }
+    },
+    [workingDirectory, sessionId, setPreviewSource, t],
+  );
 
   // Click delegation — single listener at the container catches every
   // chip + intercepted markdown-link click.
@@ -65,23 +184,7 @@ export function DevOutputSegment({ text }: { text: string }) {
         event.preventDefault();
         event.stopPropagation();
         const anchor = el.getAttribute("data-codepilot-fileref-anchor") ?? undefined;
-        // Phase 4 P1.1 — relative / bare paths must be resolved
-        // against the active workingDirectory BEFORE classifyPath.
-        // classifyPath uses absolute-path-under-cwd to decide between
-        // workspace and agent-referenced; feeding it a bare
-        // `README.md` would always classify as agent-referenced and
-        // then read from homeDir after the user confirmed — not the
-        // workspace file the user meant.
-        const absolutePath = resolveToolPath(rawFilePath, workingDirectory);
-        const cls = classifyPath(absolutePath, workingDirectory);
-        setPreviewSource({
-          kind: "file",
-          filePath: absolutePath,
-          trust: cls.trust,
-          ...(cls.baseDir ? { baseDir: cls.baseDir } : {}),
-          readonly: cls.readonly,
-          ...(anchor ? { anchor } : {}),
-        });
+        void openLocalReference(rawFilePath, anchor);
         return;
       }
       const action = el.getAttribute("data-codepilot-localhost-action");
@@ -113,15 +216,15 @@ export function DevOutputSegment({ text }: { text: string }) {
         cspMode: "navigate",
       });
     },
-    [workingDirectory, setPreviewSource],
+    [openLocalReference, setPreviewSource],
   );
 
   // Post-render enrichment. Runs after streamdown has rendered the
   // markdown into our container. The walker visits text nodes
   // outside skip tags and rewrites them in place; <a> tags whose
-  // href looks like a local file reference get an intercepting
-  // wrapper so clicking opens the file in PreviewPanel rather than
-  // letting the browser navigate to a non-existent URL.
+  // href looks like a local filesystem reference get an intercepting
+  // wrapper so clicking can distinguish files from directories rather
+  // than navigating Chromium to a non-existent URL.
   useEffect(() => {
     const root = containerRef.current;
     if (!root) return;
@@ -135,48 +238,21 @@ export function DevOutputSegment({ text }: { text: string }) {
   // links like `[label](README.md#L12)`. Rather than disable chat
   // link safety globally (which would unwrap arbitrary http links),
   // we provide a `components.a` override that handles three cases:
-  //   1. Local file path → render <a> with data-* attributes so the
-  //      container's click handler intercepts and routes through
-  //      setPreviewSource (resolved against workingDirectory).
+  //   1. Local filesystem path → render <a> with data-* attributes so
+  //      the click handler can inspect and route it (resolved against
+  //      workingDirectory).
   //   2. Safe remote scheme (http/https/mailto/tel) → render an
   //      anchor with target=_blank + rel="noopener noreferrer".
   //   3. Anything else → render a plain span so the URL never
   //      navigates the browser.
-  const linkRenderer = useMemo(
-    () =>
-      function CodepilotLink(props: React.AnchorHTMLAttributes<HTMLAnchorElement>) {
-        const { href, children, ...rest } = props;
-        const safeHref = typeof href === "string" ? href : "";
-        const { filePath: rawFilePath, anchor } = splitPathAndAnchor(safeHref);
-        const isRemote = looksLikeRemoteHref(safeHref);
-        if (!isRemote && isPotentialLocalFile(rawFilePath)) {
-          return (
-            <a
-              href={safeHref}
-              data-codepilot-fileref-path={rawFilePath}
-              {...(anchor ? { "data-codepilot-fileref-anchor": anchor } : {})}
-              {...rest}
-            >
-              {children}
-            </a>
-          );
-        }
-        if (/^(?:https?|mailto|tel):/i.test(safeHref)) {
-          return (
-            <a href={safeHref} target="_blank" rel="noopener noreferrer" {...rest}>
-              {children}
-            </a>
-          );
-        }
-        // Anything else (javascript:, data:, unknown schemes) → inert span.
-        return <span title="Blocked URL">{children}</span>;
-      },
-    [],
-  );
-
   return (
     <div ref={containerRef} onClick={onClick}>
-      <MessageResponse components={{ a: linkRenderer }}>{text}</MessageResponse>
+      <MessageResponse
+        components={DEV_OUTPUT_MARKDOWN_COMPONENTS}
+        remarkPlugins={remarkPlugins}
+      >
+        {text}
+      </MessageResponse>
     </div>
   );
 }
@@ -196,7 +272,7 @@ export function DevOutputSegment({ text }: { text: string }) {
  *   4. Stamp the parent element with PROCESSED_ATTR so future
  *      passes ignore it.
  *   5. Separately, walk <a> elements. If an anchor's href looks like
- *      a local file (no scheme + previewable extension OR abs path),
+ *      a local file or directory reference,
  *      stamp it with the same data-* attributes so the container's
  *      click handler intercepts it.
  */
@@ -297,16 +373,15 @@ function enrichLocalFileLinks(root: HTMLElement): void {
     if (a.hasAttribute("data-codepilot-fileref-path")) return;
     const href = a.getAttribute("href") ?? "";
     if (!href) return;
-    if (looksLikeRemoteHref(href)) return;
-    // Resolve into file-ref-shaped data — same anchor parser as the
-    // bare chip path so behavior stays consistent.
-    const { filePath, anchor } = splitPathAndAnchor(href);
-    if (!isPotentialLocalFile(filePath)) return;
-    a.setAttribute("data-codepilot-fileref-path", filePath);
-    if (anchor) a.setAttribute("data-codepilot-fileref-anchor", anchor);
+    const reference = parseLocalMarkdownReference(href);
+    if (!reference) return;
+    a.setAttribute("data-codepilot-fileref-path", reference.filePath);
+    if (reference.anchor) {
+      a.setAttribute("data-codepilot-fileref-anchor", reference.anchor);
+    }
   });
 }
 
-// looksLikeRemoteHref + isPotentialLocalFile live in
+// Local href parsing lives in
 // `src/lib/markdown/local-link-detector.ts` so the link-interception
 // contract can be unit-tested without jsdom.

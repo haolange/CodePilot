@@ -20,10 +20,25 @@ contextBridge.exposeInMainWorld('electronAPI', {
     },
   },
   shell: {
-    openPath: (folderPath: string) => ipcRenderer.invoke('shell:open-path', folderPath),
+    revealPath: (request: {
+      path: string;
+      sessionId?: string;
+      scope?: 'home';
+    }) => ipcRenderer.invoke('shell:reveal-path', request),
+    openHtmlFile: (request: { path: string; sessionId: string }) =>
+      ipcRenderer.invoke('shell:open-html-file', request),
   },
   app: {
     getLogPath: () => ipcRenderer.invoke('app:get-log-path') as Promise<string | null>,
+    getDefaultAssistantHome: () =>
+      ipcRenderer.invoke('app:get-default-assistant-home') as Promise<string>,
+  },
+  codex: {
+    prepareWindowsRecovery: () => ipcRenderer.invoke('codex:prepare-windows-recovery'),
+  },
+  theme: {
+    setSource: (source: 'system' | 'light' | 'dark') =>
+      ipcRenderer.invoke('theme:set-source', source) as Promise<boolean>,
   },
   dialog: {
     openFolder: (options?: { defaultPath?: string; title?: string }) =>
@@ -59,10 +74,18 @@ contextBridge.exposeInMainWorld('electronAPI', {
       html: string;
       width: number;
       pixelRatio?: number;
-      outPath?: string;
+      // No `outPath` — the main handler never writes to a renderer-supplied
+      // path; it returns base64 and the renderer downloads it. (audit 1.1)
       maxHeightPx?: number;
       timeoutMs?: number;
     }) => ipcRenderer.invoke('artifact:export-long-shot', params),
+  },
+  asset: {
+    captureHtmlThumbnail: (params: {
+      previewUrl: string;
+      width?: number;
+      height?: number;
+    }) => ipcRenderer.invoke('asset:capture-html-thumbnail', params),
   },
   terminal: {
     create: (opts: { id: string; cwd: string; cols: number; rows: number }) =>
@@ -85,30 +108,19 @@ contextBridge.exposeInMainWorld('electronAPI', {
     },
   },
   notification: {
-    // Phase 3 Step 3: payload extended with task / session / event IDs
-    // so the click → router.push round-trip can route to the right
-    // /settings/tasks?focus=… or chat session.
-    show: (options: {
-      title: string;
-      body: string;
-      onClick?: unknown;
-      taskId?: string;
-      sessionId?: string;
-      event_id?: string;
-    }) =>
-      ipcRenderer.invoke('notification:show', options),
+    ready: () => ipcRenderer.send('notification:renderer-ready'),
     onClick: (
       callback: (
         action:
           | { type: string; payload: string }
-          | { taskId?: string; sessionId?: string; event_id?: string },
+          | { taskId?: string; sessionId?: string; event_id?: string; route?: string },
       ) => void,
     ) => {
       const listener = (
         _event: unknown,
         action:
           | { type: string; payload: string }
-          | { taskId?: string; sessionId?: string; event_id?: string },
+          | { taskId?: string; sessionId?: string; event_id?: string; route?: string },
       ) => callback(action);
       ipcRenderer.on('notification:click', listener);
       return () => { ipcRenderer.removeListener('notification:click', listener); };

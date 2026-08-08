@@ -77,6 +77,11 @@ export interface CodexClientInfo {
 
 export interface CodexInitializeCapabilities {
   experimentalApi?: boolean;
+  /** CodePilot does not handle upstream attestation requests. Current
+   * app-server schemas require an explicit boolean when capabilities are
+   * present. */
+  requestAttestation?: boolean;
+  mcpServerOpenaiFormElicitation?: boolean;
   /** Exact method names to suppress for this connection. */
   optOutNotificationMethods?: readonly string[];
 }
@@ -148,12 +153,31 @@ export interface CodexThreadStartParams {
 
 export interface CodexThreadStartResponse {
   thread: { id: string; status?: string; ephemeral?: boolean };
+  /** Effective reviewer echoed by current app-server builds. Optional here so
+   *  old/malformed responses can be detected and degraded rather than trusted. */
+  approvalsReviewer?: string;
 }
+
+export type CodexThreadResumeResponse = CodexThreadStartResponse;
+
+/**
+ * A single Codex app-server `turn/start` input block. Wire format confirmed
+ * against codex-cli 0.142.0-alpha.1 via serde-error probing — see
+ * docs/research/codex-image-input-poc/FINDINGS.md. Valid `type` variants the
+ * server enumerates: text · image · localImage · skill · mention. We wire the
+ * first three (text + the two image forms); skill/mention are not used here.
+ */
+export type CodexTurnInputBlock =
+  | { type: 'text'; text: string }
+  /** Remote or data URL image. Field is `url` (NOT `image_url`); `detail` optional. */
+  | { type: 'image'; url: string; detail?: string | null }
+  /** Local image by absolute filesystem path (avoids a multi-MB data URL). */
+  | { type: 'localImage'; path: string };
 
 export interface CodexTurnStartParams {
   threadId: string;
-  /** User input — Codex `UserInput[]`. We pass text-only items today. */
-  input: readonly { type: 'text'; text: string }[];
+  /** User input — Codex `UserInput[]`. Text + image blocks (#632 / Phase 2 #3). */
+  input: readonly CodexTurnInputBlock[];
   cwd?: string;
   model?: string;
   effort?: string;
@@ -194,14 +218,16 @@ export type CodexAvailability =
   | { kind: 'unknown' }
   /** `codex` binary not found on PATH. */
   | { kind: 'not_installed' }
+  /** Windows desktop app found, but its managed bundle is not an executable CLI for this process. */
+  | { kind: 'desktop_only'; binary: string; reason: 'desktop_bundle_not_executable' }
   /** Binary found, but the app-server has not been initialized in this process yet. */
   | { kind: 'installed_idle'; binary: string }
   /** Binary found but version is below our minimum supported. */
-  | { kind: 'too_old'; version: string; minimum: string }
+  | { kind: 'too_old'; version: string; minimum: string; binary?: string }
   /** Binary found and version OK, but spawn failed. */
-  | { kind: 'spawn_failed'; reason: string }
+  | { kind: 'spawn_failed'; reason: string; binary?: string }
   /** App-server initialized successfully. */
-  | { kind: 'ready'; version: string; codexHome: string };
+  | { kind: 'ready'; version: string; codexHome: string; binary: string };
 
 /**
  * Codex Compliance Logs name for this integration. Per app-server

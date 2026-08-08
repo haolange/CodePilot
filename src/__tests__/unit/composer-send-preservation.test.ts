@@ -40,10 +40,19 @@ describe('MessageInput: no-send branches preserve the composer (#615)', () => {
       countMatches(src, /const delivered = await onSend\(/g) >= 2,
       'both the normal and badge send paths must await onSend for the delivery signal',
     );
-    // … and abort (preserve) when it comes back false.
+    // … and abort (preserve) when it comes back false. The badge path aborts
+    // inline; the normal path now clears the composer optimistically before the
+    // await and RESTORES it inside the `delivered === false` block before
+    // aborting (so the box empties immediately on a real send — the lingering-
+    // text fix — without losing a gated send's text). Both still gate on
+    // `delivered === false` and still call abortComposerSubmit to preserve.
     assert.ok(
-      countMatches(src, /if \(delivered === false\) abortComposerSubmit\('composer-send-not-delivered'\)/g) >= 2,
-      'each awaited send must preserve the composer when delivered === false',
+      countMatches(src, /if \(delivered === false\)/g) >= 2,
+      'each awaited send must gate the preserve on delivered === false',
+    );
+    assert.ok(
+      countMatches(src, /abortComposerSubmit\('composer-send-not-delivered'\)/g) >= 2,
+      'each awaited send must preserve the composer (abortComposerSubmit) when delivered === false',
     );
   });
 
@@ -54,6 +63,17 @@ describe('MessageInput: no-send branches preserve the composer (#615)', () => {
 
   it('the old screenshot-eating bare returns are gone (no `|| disabled) return;`)', () => {
     assert.doesNotMatch(src, /\|\| disabled\)\s*return;/);
+  });
+
+  it('QuickActions awaits onSend and clears ONLY on delivery (Codex P3 — gated send keeps the composer)', () => {
+    // Was `onSend(text); setInputValue('')` — fire-and-forget, no await, no
+    // delivery check, so a gated send (provider/model/runtime not ready) still
+    // ate the user's text. Must mirror handleSubmit's await + `!== false` gate.
+    assert.match(
+      src,
+      /onAction=\{async \(text\) => \{[\s\S]*?const delivered = await onSend\(text\)[\s\S]*?if \(delivered !== false\) setInputValue\(''\)/,
+      'QuickActions onAction must await onSend and only setInputValue("") when delivered !== false',
+    );
   });
 });
 
@@ -109,7 +129,14 @@ describe('page.tsx sendFirstMessage signals not-delivered on its gates (#615)', 
     assert.match(src, /const firstSendInFlightRef = useRef\(false\)/);
     assert.match(src, /if \(firstSendInFlightRef\.current\) return false/);
     assert.equal(countMatches(src, /setIsStreaming\(true\)/g), 1, 'isStreaming must be flipped in exactly one place (deferred to post-accept)');
-    assert.match(src, /accepted = true;[\s\S]{0,400}setIsStreaming\(true\)/);
+    // setIsStreaming(true) must come AFTER `accepted = true` (deferred to
+    // post-accept). Order-based, not distance-based: more #4/#5 post-accept work
+    // (draft-clear, prefill-consume) legitimately accrues between them, and a
+    // tight char-distance bound kept false-failing as that grew.
+    const acceptIdx = src.indexOf('accepted = true;');
+    const streamIdx = src.indexOf('setIsStreaming(true)');
+    assert.ok(acceptIdx > 0, 'expected an `accepted = true;` commit point');
+    assert.ok(streamIdx > acceptIdx, 'setIsStreaming(true) must come after accepted = true (deferred to post-accept)');
   });
 
   it('composer-stack siblings are keyed so an ErrorBanner toggle keeps MessageInput identity (#615)', () => {

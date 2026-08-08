@@ -84,6 +84,14 @@ export function useStreamSubscription({
     const unsubscribe = subscribe(sessionId, (event) => {
       setStreamSnapshot(event.snapshot);
 
+      // NOTE: clearing the single-value pendingApprovalSessionId on a resolved/
+      // timed-out permission lives in AppShell's global stream-session-event
+      // handler (A5 Step 2 follow-up #2), NOT here — that handler runs even
+      // after this ChatView unmounts (user switched sessions), and clears
+      // precisely (only when the event's session left the approvals set), so a
+      // per-session unconditional clear here would be both redundant and less
+      // safe (could drop a peer's global under split-screen).
+
       // Sync panel state
       if (event.type === 'phase-changed') {
         if (event.snapshot.phase === 'active') {

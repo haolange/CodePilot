@@ -21,6 +21,7 @@ import {
 } from 'ai';
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { createOpenAI } from '@ai-sdk/openai';
+import { createXai } from '@ai-sdk/xai';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { createAmazonBedrock } from '@ai-sdk/amazon-bedrock';
 import { createVertexAnthropic } from '@ai-sdk/google-vertex/anthropic';
@@ -31,15 +32,25 @@ import {
   toAiSdkConfig,
 } from './provider-resolver';
 import { ensureTokenFresh } from './openai-oauth-manager';
+import { createXaiOAuthFetch } from './xai-oauth-manager';
 import { hasClaudeSettingsCredentials } from './claude-settings';
+import { withChatImageDataUrlFetch } from './openai-chat-image-normalizer';
+import { assertProviderCallAllowed, type ProviderCallScene } from './provider-call-policy';
+import type { ChatRuntime } from './chat-runtime';
 
 // ── Public API ──────────────────────────────────────────────────
 
 export interface CreateModelOptions {
+  callScene: ProviderCallScene;
   providerId?: string;
   sessionProviderId?: string;
+  /** Provider snapshot captured by a fail-closed upstream caller. When set,
+   *  model construction must not re-resolve or fall back to another provider. */
+  resolvedProvider?: ResolvedProvider;
   model?: string;
   sessionModel?: string;
+  /** Runtime-specific transport selection (for example native Responses in Codex Runtime). */
+  runtime?: ChatRuntime;
 }
 
 export interface CreateModelResult {
@@ -54,13 +65,16 @@ export interface CreateModelResult {
 /**
  * Resolve provider + model and create a Vercel AI SDK LanguageModel instance.
  */
-export function createModel(opts: CreateModelOptions = {}): CreateModelResult {
-  const resolved = resolveProvider({
+export function createModel(opts: CreateModelOptions): CreateModelResult {
+  const resolved = opts.resolvedProvider ?? resolveProvider({
+    callScene: opts.callScene,
     providerId: opts.providerId,
     sessionProviderId: opts.sessionProviderId,
     model: opts.model,
     sessionModel: opts.sessionModel,
+    runtime: opts.runtime,
   });
+  assertProviderCallAllowed(resolved.provider, opts.callScene);
 
   if (!resolved.hasCredentials && !resolved.provider) {
     // If the user has credentials in ~/.claude/settings.json (e.g. cc-switch)
@@ -77,7 +91,9 @@ export function createModel(opts: CreateModelOptions = {}): CreateModelResult {
     );
   }
 
-  const config = toAiSdkConfig(resolved, opts.model || opts.sessionModel);
+  const config = toAiSdkConfig(resolved, opts.model || opts.sessionModel, {
+    runtime: opts.runtime,
+  });
 
   // ── Model ID resolution ─────────────────────────────────────
   // toAiSdkConfig tries to resolve via availableModels catalog, but if
@@ -105,8 +121,11 @@ export function createModel(opts: CreateModelOptions = {}): CreateModelResult {
     process.env[k] = v;
   }
 
-  const isThirdPartyProxy = config.sdkType === 'anthropic' &&
-    !!config.baseUrl && !isOfficialAnthropicUrl(config.baseUrl);
+  const isThirdPartyProxy = config.sdkType === 'claude-code-compat' || (
+    config.sdkType === 'anthropic'
+    && !!config.baseUrl
+    && !isOfficialAnthropicUrl(config.baseUrl)
+  );
 
   const rawModel = createLanguageModel(config, isThirdPartyProxy);
 
@@ -129,6 +148,18 @@ function isOfficialAnthropicUrl(url: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Whether a provider base URL points at the first-party Anthropic endpoint.
+ * Empty / absent base_url = the SDK default (api.anthropic.com) = first-party.
+ * Used to decide whether the SDK's `modelUsage.contextWindow` is trustworthy:
+ * it's the SDK's bundled-catalog value — reliable for first-party Anthropic,
+ * but a generic default for third-party Anthropic-compatible proxies (e.g. a
+ * GLM endpoint via custom base_url), where it misrepresents the real window. (#632)
+ */
+export function isFirstPartyAnthropicEndpoint(baseUrl?: string | null): boolean {
+  return !baseUrl || isOfficialAnthropicUrl(baseUrl);
 }
 
 /**
@@ -155,6 +186,49 @@ function normaliseBaseUrl(url: string | undefined): string | undefined {
 const ANTHROPIC_BETA_HEADERS = [
   'interleaved-thinking-2025-05-14',
 ];
+
+/**
+ * Build an API-key authenticated Responses model from a resolved transport.
+ * Exported so request-shape tests can exercise the exact production factory
+ * with a capture fetch instead of duplicating the SDK setup.
+ */
+export function createApiKeyResponsesLanguageModel(
+  config: Pick<
+    AiSdkConfig,
+    'apiKey' | 'baseUrl' | 'modelId' | 'headers' | 'supportsResponsesReasoningSummary'
+  >,
+  fetchImpl?: typeof fetch,
+): LanguageModel {
+  const hasHeaders = Object.keys(config.headers || {}).length > 0;
+  const upstreamFetch = fetchImpl ?? globalThis.fetch;
+  const compatibleFetch = config.supportsResponsesReasoningSummary === false
+    ? (async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (typeof init?.body !== 'string') return upstreamFetch(input, init);
+        let body: Record<string, unknown>;
+        try {
+          body = JSON.parse(init.body) as Record<string, unknown>;
+        } catch {
+          return upstreamFetch(input, init);
+        }
+        const reasoning = body.reasoning;
+        if (!reasoning || typeof reasoning !== 'object' || Array.isArray(reasoning)) {
+          return upstreamFetch(input, init);
+        }
+        const { summary: _unsupportedSummary, ...supportedReasoning } = reasoning as Record<string, unknown>;
+        return upstreamFetch(input, {
+          ...init,
+          body: JSON.stringify({ ...body, reasoning: supportedReasoning }),
+        });
+      }) as typeof fetch
+    : fetchImpl;
+  const openai = createOpenAI({
+    apiKey: config.apiKey,
+    baseURL: config.baseUrl,
+    ...(hasHeaders ? { headers: config.headers } : {}),
+    ...(compatibleFetch ? { fetch: compatibleFetch } : {}),
+  });
+  return openai.responses(config.modelId);
+}
 
 function createLanguageModel(config: AiSdkConfig, isThirdPartyProxy: boolean): LanguageModel {
   const hasHeaders = Object.keys(config.headers || {}).length > 0;
@@ -190,9 +264,16 @@ function createLanguageModel(config: AiSdkConfig, isThirdPartyProxy: boolean): L
     }
 
     case 'openai': {
+      // API-key Responses providers use the normal SDK transport. The preset
+      // resolver only enables this for model/runtime pairs whose vendor wire
+      // contract was verified (DeepSeek V4 Flash + Codex Runtime today).
+      if (config.useResponsesApi && config.responsesApiAuth === 'api_key') {
+        return createApiKeyResponsesLanguageModel(config);
+      }
+
       // OpenAI OAuth (Codex API) — use custom fetch to rewrite URL + inject auth
       // Pattern from opencode-dev's codex.ts plugin
-      if (config.useResponsesApi) {
+      if (config.useResponsesApi && config.responsesApiAuth === 'codex_oauth') {
         // Phase 5b round-7 fix (2026-05-18) — per-fetch token refresh.
         // Pre-fix this captured `getOAuthCredentialsSync()` at model-
         // creation time AND stored `accessToken` / `accountId` in
@@ -275,6 +356,14 @@ function createLanguageModel(config: AiSdkConfig, isThirdPartyProxy: boolean): L
         apiKey: config.apiKey,
         baseURL: config.baseUrl,
         ...(hasHeaders ? { headers: config.headers } : {}),
+        // @ai-sdk/openai@4.0.5 .chat() emits image_url.url as BARE base64
+        // (missing the data:<mime>;base64, prefix — Phase 2 发现 3, fixture
+        // openai-chat-file-image-upstream-bare-base64). Gateways expect a
+        // data URL or remote URL, so bare base64 breaks image input on this
+        // wire. The wrapper sniffs the real MIME (png/jpeg/webp/gif/svg) and
+        // prefixes it; already-schemed URLs pass through verbatim, so an
+        // upstream fix cannot double-prefix.
+        fetch: withChatImageDataUrlFetch(),
       });
       // Chat Completions, NOT the Responses API. In @ai-sdk/openai v3 the bare
       // `openai(modelId)` call defaults to `.responses()` (/v1/responses), but
@@ -286,6 +375,18 @@ function createLanguageModel(config: AiSdkConfig, isThirdPartyProxy: boolean): L
       // gateways implement /v1/chat/completions, not /v1/responses, so
       // `.chat()` is the correct + portable wire here.
       return openai.chat(config.modelId);
+    }
+
+    case 'xai': {
+      const xai = createXai({
+        apiKey: config.useXaiOAuth ? 'xai-oauth' : config.apiKey,
+        baseURL: config.baseUrl || 'https://api.x.ai/v1',
+        ...(hasHeaders ? { headers: config.headers } : {}),
+        ...(config.useXaiOAuth ? { fetch: createXaiOAuthFetch() } : {}),
+      });
+      // Grok 4.5 is intentionally wired through xAI Responses, not the
+      // provider's OpenAI-compatible Chat Completions surface.
+      return xai.responses(config.modelId);
     }
 
     case 'google': {

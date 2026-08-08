@@ -33,6 +33,7 @@ import { readFileSync } from 'node:fs';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import path from 'node:path';
+import { buildClaudePermissionQueryOptions } from '@/lib/permission/profile';
 
 const SRC_ROOT = path.resolve(__dirname, '../..');
 function read(rel: string): string {
@@ -107,6 +108,19 @@ describe('/api/settings/workspace no longer returns needsHeartbeat', () => {
       /shouldRunHeartbeat\s*\(/,
       'route must not call shouldRunHeartbeat — that helper is now scheduler-internal only.',
     );
+  });
+});
+
+describe('public chat cannot enter the heartbeat protocol', () => {
+  it('has no client-controlled heartbeat classifier in route, context, or collector', () => {
+    const route = read('app/api/chat/route.ts');
+    const context = read('lib/context-assembler.ts');
+    const collector = read('lib/chat-collect-stream-response.ts');
+    for (const [name, source] of [['route', route], ['context', context], ['collector', collector]] as const) {
+      assert.doesNotMatch(source, /isHeartbeatTurn|stripHeartbeatToken|heartbeat-done/,
+        `${name} must not expose the retired foreground heartbeat protocol`);
+    }
+    assert.doesNotMatch(route, /autoTrigger[^\n]+\u5fc3\u8df3|\u5fc3\u8df3[^\n]+autoTrigger/);
   });
 });
 
@@ -333,7 +347,8 @@ beforeEach(() => {
 
 afterEach(async () => {
   try {
-    const { closeDb } = await import('../../lib/db');
+    const { closeDb, removeHeartbeatTask } = await import('../../lib/db');
+    removeHeartbeatTask();
     closeDb();
   } catch { /* ignore */ }
   if (originalDataDir === undefined) delete process.env.CLAUDE_GUI_DATA_DIR;
@@ -454,20 +469,53 @@ describe('ensureHeartbeatTask refresh discipline', () => {
       /if\s*\(\s*!isHeartbeatMode\s*\)\s*\{[\s\S]{0,1000}?codepilot-notify/,
       'codepilot-notify MCP registration must be wrapped in `if (!isHeartbeatMode)` — that MCP exposes schedule_task / list_tasks / cancel_task which are exactly the tools the heartbeat-loop bug was abusing.',
     );
-    // allowedTools differs: memory-only on heartbeat path.
+    // claude-client must still hand isHeartbeatMode to the shared assembly —
+    // the narrowing below is only reached if this wiring survives.
     assert.match(
       src,
-      /allowedTools:\s*isHeartbeatMode[\s\S]{0,200}?\[\s*['"]mcp__codepilot-memory['"]\s*\]/,
+      /buildClaudePermissionQueryOptions\(\{[\s\S]{0,300}?isHeartbeatMode,/,
+      'claude-client must pass isHeartbeatMode into buildClaudePermissionQueryOptions.',
+    );
+  });
+
+  /**
+   * The heartbeat narrowing moved out of claude-client into the shared
+   * permission assembly (runtime-permission-modes.md Phase 1). These assertions
+   * followed it, and got stronger on the way: they now run the real function
+   * instead of pattern-matching the source that used to contain the literals.
+   */
+  it('claude-client: heartbeat wire options are memory-only and block SDK builtins', () => {
+    const heartbeat = buildClaudePermissionQueryOptions({
+      permissionMode: 'acceptEdits',
+      sessionBypassPermissions: false,
+      globalSkip: false,
+      isHeartbeatMode: true,
+    });
+
+    assert.deepEqual(
+      [...heartbeat.allowedTools], ['mcp__codepilot-memory'],
       'allowedTools on heartbeat must be ["mcp__codepilot-memory"] only — every other MCP that was previously auto-approved must require explicit permission (and there should be no UI to grant it because it isn\'t registered anyway).',
     );
-    // disallowedTools must list the SDK builtins we explicitly block.
+
     for (const banned of ['Bash', 'Edit', 'Write', 'WebSearch', 'WebFetch']) {
-      assert.match(
-        src,
-        new RegExp(`disallowedTools:[\\s\\S]{0,300}?['"]${banned}['"]`),
-        `claude-client heartbeat branch must list "${banned}" in disallowedTools — auto-approve is not a whitelist; we need explicit blocking for SDK builtins.`,
+      assert.ok(
+        heartbeat.disallowedTools?.includes(banned),
+        `heartbeat must list "${banned}" in disallowedTools — auto-approve is not a whitelist; we need explicit blocking for SDK builtins.`,
       );
     }
+
+    // Positive control: the same assembly does NOT block these outside
+    // heartbeat, so the assertions above pin heartbeat's narrowing rather than
+    // a blanket restriction that would pass no matter what.
+    const normal = buildClaudePermissionQueryOptions({
+      permissionMode: 'acceptEdits',
+      sessionBypassPermissions: false,
+      globalSkip: false,
+      isHeartbeatMode: false,
+    });
+    assert.ok(!normal.disallowedTools?.includes('Bash'),
+      'a normal turn must still be able to run Bash (through the permission prompt)');
+    assert.ok(normal.allowedTools.length > 1, 'a normal turn keeps the read-only MCP servers');
   });
 
   it('ai_task failure fallback does NOT write into latest-by-workspace user session (Codex P2)', () => {

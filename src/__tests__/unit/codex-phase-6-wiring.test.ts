@@ -188,6 +188,43 @@ describe('RuntimePanel — three-engine picker (IA correction)', () => {
     assert.match(panelSrc, /href="\/settings\/providers"/);
     assert.match(panelSrc, /href="\/settings\/models"/);
   });
+
+  it('refresh explicitly rescans the CLI and surfaces the selected binary path', () => {
+    assert.match(
+      panelSrc,
+      /fetch\(["']\/api\/codex\/status["']\s*,\s*\{[\s\S]{0,160}method:\s*["']POST["']/,
+      'the refresh button must POST so same-path upgrades clear resolver/version/failure caches',
+    );
+    assert.match(panelSrc, /["']binary["']\s+in\s+codexAvailability/);
+    assert.match(panelSrc, /CLI 来源/);
+    assert.match(panelSrc, /CLI source/);
+  });
+});
+
+describe('/api/codex/status — safe refresh contract', () => {
+  const routeSrc = fs.readFileSync(
+    path.join(repoRoot, 'app/api/codex/status/route.ts'),
+    'utf8',
+  );
+  const managerSrc = fs.readFileSync(
+    path.join(repoRoot, 'lib/codex/app-server-manager.ts'),
+    'utf8',
+  );
+
+  it('keeps GET read-only and exposes POST through refreshCodexAvailability', () => {
+    assert.match(routeSrc, /export\s+async\s+function\s+GET\s*\(/);
+    assert.match(routeSrc, /export\s+async\s+function\s+POST\s*\(/);
+    assert.match(routeSrc, /POST\(\)[\s\S]{0,180}refreshCodexAvailability\(\)/);
+  });
+
+  it('does not dispose or switch a healthy/pending app-server during refresh', () => {
+    const refreshBlock = managerSrc.match(
+      /export\s+async\s+function\s+refreshCodexAvailability[\s\S]+?\n}\n\n\/\*\*/,
+    );
+    assert.ok(refreshBlock, 'refreshCodexAvailability block must exist');
+    assert.match(refreshBlock![0], /if\s*\(cached\)\s*return\s+getCodexAvailability\(\)/);
+    assert.doesNotMatch(refreshBlock![0], /disposeCodexAppServer|\.dispose\(|\.kill\(/);
+  });
 });
 
 describe('runtime/effective — three-engine union (IA correction)', () => {
@@ -232,13 +269,13 @@ describe('ProviderManager — Codex Account virtual card (IA correction)', () =>
     assert.match(mgrSrc, /import\s*\{\s*CodexQuotaWidget\s*\}\s*from\s*["']\.\/CodexQuotaWidget["']/);
   });
 
-  it('Codex Account card renders alongside OpenAI OAuth when logged in', () => {
-    // The OAuth section header must trigger when EITHER provider is
-    // connected — regressing this means logged-in Codex users would
+  it('Codex Account card renders alongside OAuth virtual providers when logged in', () => {
+    // The OAuth section header must trigger when OpenAI, xAI, OR Codex is
+    // connected — regressing this means a virtual-provider user would
     // see no card at all.
     assert.match(
       mgrSrc,
-      /openaiAuth\?\.authenticated\s*\|\|\s*codexAccount\?\.kind\s*===\s*['"]logged_in['"]/,
+      /openaiAuth\?\.authenticated\s*\|\|\s*xaiAuth\?\.authenticated\s*\|\|\s*codexAccount\?\.kind\s*===\s*['"]logged_in['"]/,
     );
     assert.match(mgrSrc, /codexAccount\?\.kind\s*===\s*['"]logged_in['"][\s\S]{0,500}<ProviderCard/);
   });
@@ -271,6 +308,20 @@ describe('ProviderManager — Codex Account virtual card (IA correction)', () =>
     assert.ok(codexLoginDialog, 'Codex login dialog must exist');
     assert.doesNotMatch(codexLoginDialog![0], /window\.open\(/);
     assert.match(codexLoginDialog![0], /target=["']_blank["']/);
+  });
+
+  it('keeps Add Service open and renders an inline error when Codex login startup fails', () => {
+    // First-time users have no connected OAuth section, so codexError must be
+    // rendered inside the still-open Add Service dialog. Closing before the
+    // POST resolved made the original failure look like a no-op.
+    assert.match(
+      mgrSrc,
+      /handleCodexLogin\(\)\.then\(\(started\)[\s\S]{0,100}if\s*\(started\)\s*setAddServiceOpen\(false\)/,
+    );
+    const addDialog = mgrSrc.match(/Add Service dialog[\s\S]+?Codex Account login dialog/);
+    assert.ok(addDialog, 'Add Service dialog block must exist');
+    assert.match(addDialog![0], /codexError\s*&&[\s\S]{0,160}role=["']alert["']/);
+    assert.match(addDialog![0], /aria-busy=\{entry\.loading/);
   });
 });
 
@@ -774,9 +825,21 @@ describe('MessageInput auto-correct — manual-only side effects (Phase 6 P0)', 
     // The load-bearing assertion: the auto-correct effect must mark
     // its callback as auto so the parent can skip the manual-pick
     // side effects (warning clear, localStorage write).
+    //
+    // s07 reviewer fix (run i31): the effect now routes through the
+    // `emitProviderModelChange` wrapper, which enriches opts with the new
+    // model's supportedEffortLevels (so both effort-reset consumers validate
+    // against the same picker feed) and forwards `...opts` — including
+    // `isAuto` — to `onProviderModelChange`. Assert both hops preserve isAuto.
     assert.match(
       src,
-      /onProviderModelChange\?\.\([\s\S]{0,200}\{\s*isAuto:\s*true\s*\}\s*\)/,
+      /emitProviderModelChange\([\s\S]{0,120}\{\s*isAuto:\s*true\s*\}\s*\)/,
+      'the auto-correct effect must mark its switch as auto',
+    );
+    assert.match(
+      src,
+      /onProviderModelChange\?\.\([\s\S]{0,200}\.\.\.opts[\s\S]{0,200}\)/,
+      'the enriching wrapper must forward ...opts (carrying isAuto) to the parent',
     );
   });
 
@@ -788,9 +851,15 @@ describe('MessageInput auto-correct — manual-only side effects (Phase 6 P0)', 
     // PATCHing the session on a silent fallback would persist a
     // model the user never picked — the next page load would surface
     // the auto-corrected pair as their "real" selection. Must not.
+    //
+    // s07 (2026-07-18) moved the effort-effect block ABOVE this guard so the
+    // helper's isAuto branch stays live, but the invariant is unchanged: the
+    // isAuto early-return must still fire BEFORE the session PATCH. Assert that
+    // ordering directly (stronger than a fixed-distance grep).
     assert.match(
       src,
-      /handleProviderModelChange[\s\S]{0,800}opts\?\.isAuto[\s\S]{0,60}return/,
+      /opts\?\.isAuto\)\s*return;[\s\S]{0,400}fetch\(`\/api\/chat\/sessions\//,
+      'isAuto must early-return before the session PATCH so a silent fallback is not persisted',
     );
   });
 });

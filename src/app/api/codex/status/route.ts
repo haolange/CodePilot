@@ -1,5 +1,6 @@
 /**
- * GET /api/codex/status
+ * GET /api/codex/status — read current status with automatic candidate-change
+ * detection. POST forces a safe rescan for same-path in-place CLI upgrades.
  *
  * Phase 5 Phase 1 (2026-05-13) — Settings status card source.
  *
@@ -16,17 +17,42 @@
  */
 
 import { NextResponse } from 'next/server';
-import { getCodexAvailability } from '@/lib/codex/app-server-manager';
+import {
+  getCodexAvailability,
+  refreshCodexAvailability,
+} from '@/lib/codex/app-server-manager';
+import { buildCodexRuntimeProbe } from '@/lib/runtime-probe';
 
 export async function GET() {
   try {
     const availability = await getCodexAvailability();
-    return NextResponse.json({ availability });
+    return NextResponse.json({
+      availability,
+      probe: buildCodexRuntimeProbe(availability),
+    });
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
-    return NextResponse.json(
-      { availability: { kind: 'spawn_failed', reason } },
-      { status: 200 },
-    );
+    const availability = { kind: 'spawn_failed', reason } as const;
+    return NextResponse.json({
+      availability,
+      probe: buildCodexRuntimeProbe(availability),
+    }, { status: 200 });
+  }
+}
+
+export async function POST() {
+  try {
+    const availability = await refreshCodexAvailability();
+    return NextResponse.json({
+      availability,
+      probe: buildCodexRuntimeProbe(availability),
+    });
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    const availability = { kind: 'spawn_failed', reason } as const;
+    return NextResponse.json({
+      availability,
+      probe: buildCodexRuntimeProbe(availability),
+    }, { status: 200 });
   }
 }

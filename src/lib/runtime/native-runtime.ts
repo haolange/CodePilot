@@ -11,10 +11,14 @@ import { buildSystemPrompt } from '../agent-system-prompt';
 import { resolveProvider } from '../provider-resolver';
 import { syncMcpConnections, disposeAll as disposeMcp } from '../mcp-connection-manager';
 import { isOAuthUsable } from '../openai-oauth-manager';
+import { isXaiOAuthUsable } from '../xai-oauth-manager';
 import { wrapController } from '../safe-stream';
-
-// Track active AbortControllers for interrupt support
-const activeControllers = new Map<string, AbortController>();
+import {
+  disposeNativeTurns,
+  interruptNativeTurn,
+  registerNativeTurnController,
+  unregisterNativeTurnController,
+} from './native-turn-registry';
 
 export const nativeRuntime: AgentRuntime = {
   id: 'native',
@@ -32,7 +36,7 @@ export const nativeRuntime: AgentRuntime = {
 
     // Create or reuse abort controller
     const abortController = options.abortController || new AbortController();
-    activeControllers.set(options.sessionId, abortController);
+    registerNativeTurnController(options.sessionId, abortController);
 
     const ro = options.runtimeOptions || {};
     const maxSteps = (ro.maxSteps as number) || undefined;
@@ -40,6 +44,7 @@ export const nativeRuntime: AgentRuntime = {
 
     const stream = runAgentLoop({
       prompt: options.prompt,
+      callScene: options.callScene,
       sessionId: options.sessionId,
       providerId: options.providerId,
       sessionProviderId: options.sessionProviderId,
@@ -54,6 +59,9 @@ export const nativeRuntime: AgentRuntime = {
       thinking: options.thinking,
       effort: options.effort,
       context1m: options.context1m,
+      temperature: options.temperature,
+      topP: options.topP,
+      topK: options.topK,
       maxSteps,
       autoTrigger: options.autoTrigger,
       onRuntimeStatusChange: options.onRuntimeStatusChange,
@@ -73,7 +81,7 @@ export const nativeRuntime: AgentRuntime = {
             if (controller.closed) break; // consumer aborted — stop pulling
           }
         } finally {
-          activeControllers.delete(options.sessionId);
+          unregisterNativeTurnController(options.sessionId, abortController);
           controller.close();
         }
       },
@@ -83,11 +91,7 @@ export const nativeRuntime: AgentRuntime = {
   },
 
   interrupt(sessionId: string): void {
-    const controller = activeControllers.get(sessionId);
-    if (controller) {
-      controller.abort();
-      activeControllers.delete(sessionId);
-    }
+    interruptNativeTurn(sessionId);
   },
 
   isAvailable(): boolean {
@@ -95,7 +99,7 @@ export const nativeRuntime: AgentRuntime = {
     // A lightweight check — don't resolve the full provider, just check if
     // there's any configured provider, env-based credentials, or OpenAI OAuth.
     try {
-      const resolved = resolveProvider({});
+      const resolved = resolveProvider({ callScene: 'connection_test' });
       if (resolved.hasCredentials || !!resolved.provider) return true;
     } catch { /* fall through */ }
 
@@ -104,15 +108,15 @@ export const nativeRuntime: AgentRuntime = {
       if (isOAuthUsable()) return true;
     } catch { /* module not available */ }
 
+    try {
+      if (isXaiOAuthUsable()) return true;
+    } catch { /* module not available */ }
+
     return false;
   },
 
   dispose(): void {
-    // Abort all active sessions
-    for (const controller of activeControllers.values()) {
-      controller.abort();
-    }
-    activeControllers.clear();
+    disposeNativeTurns();
     // Clean up MCP connections
     disposeMcp().catch(() => {});
   },

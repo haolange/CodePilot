@@ -16,6 +16,10 @@ import { findModelOption } from '@/lib/model-option-match';
 // single source, not be re-hardcoded (Codex review P1, 2026-06-10: this
 // fallback copy was missing opus-4-8 and fable-5).
 import { ENV_CLAUDE_CODE_MODELS } from '@/lib/provider-catalog';
+import {
+  CODEX_MODEL_CATALOG_READY_EVENT,
+  warmCodexModelCatalog,
+} from '@/lib/codex/model-catalog-warmup';
 
 export { findModelOption };
 
@@ -25,6 +29,8 @@ export interface DefaultModelOption {
   label: string;
   supportsEffort?: boolean;
   supportedEffortLevels?: string[];
+  /** i18n key for the effort menu's mapping note (GLM two-tier / Kimi Auto). */
+  effortNoteKey?: string;
 }
 
 export const DEFAULT_MODEL_OPTIONS: DefaultModelOption[] = ENV_CLAUDE_CODE_MODELS.map(m => ({
@@ -218,6 +224,8 @@ export function useProviderModels(
           provider_id: 'env',
           provider_name: 'Anthropic',
           provider_type: 'anthropic',
+          preset_key: '',
+          protocol: 'anthropic',
           models: DEFAULT_MODEL_OPTIONS,
         }]);
         setDefaultProviderId('');
@@ -246,10 +254,13 @@ export function useProviderModels(
   /* eslint-disable */
   useEffect(() => {
     fetchAll();
-    const handler = () => fetchAll();
-    window.addEventListener('provider-changed', handler);
+    const providerChangedHandler = () => fetchAll();
+    const codexCatalogReadyHandler = () => fetchAll();
+    window.addEventListener('provider-changed', providerChangedHandler);
+    window.addEventListener(CODEX_MODEL_CATALOG_READY_EVENT, codexCatalogReadyHandler);
     return () => {
-      window.removeEventListener('provider-changed', handler);
+      window.removeEventListener('provider-changed', providerChangedHandler);
+      window.removeEventListener(CODEX_MODEL_CATALOG_READY_EVENT, codexCatalogReadyHandler);
       // Abort any in-flight request when the consumer unmounts so it
       // can't try to setState on a torn-down component.
       fetchControllerRef.current?.abort();
@@ -257,6 +268,16 @@ export function useProviderModels(
     };
   }, [fetchAll]);
   /* eslint-enable */
+
+  // A no-runtime provider feed is intentionally cache-only for Codex so a
+  // broken app-server can never freeze every other model. Warm that cache in
+  // parallel on chat mount; the helper emits a narrow ready event when the
+  // bounded `/api/codex/models` request succeeds, and the listener above then
+  // refreshes this hook from the unified, fully annotated catalog. ChatView
+  // and MessageInput both mount the hook, so the helper is single-flight.
+  useEffect(() => {
+    void warmCodexModelCatalog();
+  }, []);
 
   // Phase 6 UI收口 P2 (2026-05-14) — runtime-compatible projection of
   // the full catalog. The hook fetches everything unfiltered (so the

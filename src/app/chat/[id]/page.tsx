@@ -4,11 +4,15 @@ import { useEffect, useState, useRef, use } from 'react';
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
 import type { Message, MessagesResponse, ChatSession } from '@/types';
+import { normalizePermissionProfile, type SessionPermissionProfile } from '@/lib/permission/profile';
 import { ChatView } from '@/components/chat/ChatView';
 import { SpinnerGap } from "@/components/ui/icon";
 import { usePanel } from '@/hooks/usePanel';
 import { useWorkspaceSidebarOptional } from '@/hooks/useWorkspaceSidebar';
 import { useTranslation } from '@/hooks/useTranslation';
+import { getSnapshot, seedSnapshotPatch } from '@/lib/stream-session-manager';
+import { subscribeSessionTitle } from '@/lib/session-title-events';
+import { reconcilePhase } from '@/lib/stream-phase-reconcile';
 
 interface ChatSessionPageProps {
   params: Promise<{ id: string }>;
@@ -29,7 +33,7 @@ export default function ChatSessionPage({ params }: ChatSessionPageProps) {
   // global agent_runtime.
   const [sessionRuntimePin, setSessionRuntimePin] = useState<string>('');
   const [sessionInfoLoaded, setSessionInfoLoaded] = useState(false);
-  const [sessionPermissionProfile, setSessionPermissionProfile] = useState<'default' | 'full_access'>('default');
+  const [sessionPermissionProfile, setSessionPermissionProfile] = useState<SessionPermissionProfile>('default');
   const [sessionMode, setSessionMode] = useState<'code' | 'plan'>('code');
   const [sessionHasSummary, setSessionHasSummary] = useState(false);
   const { setWorkingDirectory, setSessionId, setSessionTitle: setPanelSessionTitle, setFileTreeOpen } = usePanel();
@@ -72,9 +76,28 @@ export default function ChatSessionPage({ params }: ChatSessionPageProps) {
           setSessionModel(resolved.model);
           setSessionProviderId(resolved.providerId);
           setSessionRuntimePin(data.session.runtime_pin || '');
-          setSessionPermissionProfile(data.session.permission_profile || 'default');
+          setSessionPermissionProfile(normalizePermissionProfile(data.session.permission_profile));
           setSessionMode((data.session.mode as 'code' | 'plan') || 'code');
           setSessionHasSummary(!!data.session.context_summary);
+
+          // Interrupt/phase reconcile — reconcile the client stream phase against the
+          // authoritative backend runtime_status on mount (I2). This corrects a
+          // client snapshot left stuck 'active' after the backend already reached
+          // a terminal status (idle / interrupted / error) — the "假 active" split
+          // that keeps the composer locked (isStreaming ≡ phase==='active',
+          // GitHub #578). We converge to a TERMINAL phase only: we do NOT
+          // fabricate a reader-less 'active' snapshot for the inverse case
+          // (backend running but no live local stream), because a fresh JS
+          // context can't resume the server turn and seeding 'active' with no
+          // reader is exactly the #578 strand. Mount-read only — no active-period
+          // poll (DP2).
+          const localPhase = getSnapshot(id)?.phase;
+          if (localPhase === 'active') {
+            const next = reconcilePhase(data.session.runtime_status, localPhase);
+            if (next && next !== 'active') {
+              seedSnapshotPatch(id, { phase: next });
+            }
+          }
         }
       } catch {
         // Session info load failed - panel will still work without directory
@@ -86,6 +109,14 @@ export default function ChatSessionPage({ params }: ChatSessionPageProps) {
     loadSession();
     return () => { cancelled = true; };
   }, [id, setWorkingDirectory, setSessionId, setPanelSessionTitle, t]);
+
+  // Keep the top bar's title live. The effect above reads the title exactly
+  // once on mount, so before this the first message's fallback title (written
+  // server-side, after mount) never reached the top bar — it kept showing
+  // "New Chat" for the rest of the session.
+  useEffect(() => {
+    return subscribeSessionTitle(id, (title) => setPanelSessionTitle(title));
+  }, [id, setPanelSessionTitle]);
 
   useEffect(() => {
     // Reset state when switching sessions

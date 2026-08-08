@@ -64,6 +64,8 @@ export interface ResponsesFunctionCallItem {
   call_id: string;
   /** Tool name. Matches the `name` declared in the request's `tools[]`. */
   name: string;
+  /** Present when Codex routes the call to a namespaced MCP tool. */
+  namespace?: string;
   /** JSON-encoded arguments. Codex sends a string (not an object) per
    *  the Responses spec. The adapter parses lazily so a malformed
    *  payload surfaces as a runtime error, not a translation error. */
@@ -172,7 +174,7 @@ export interface ResponsesRequestBody {
    *  the underlying SDK accepts it (Anthropic thinking, OpenAI o1
    *  reasoning_effort, etc.). */
   reasoning?: {
-    effort?: 'minimal' | 'low' | 'medium' | 'high' | 'max';
+    effort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   };
   /** OpenAI Responses-API `store` field. The Codex `/responses`
    *  endpoint (chatgpt.com/backend-api/codex/responses) requires
@@ -387,7 +389,14 @@ export interface ResponsesNonStreamResponse {
  */
 export type ResponsesOutputItem =
   | { id: string; type: 'message'; role: 'assistant'; content: ResponsesContentBlock[] }
-  | { id?: string; type: 'function_call'; call_id: string; name: string; arguments: string };
+  | {
+      id?: string;
+      type: 'function_call';
+      call_id: string;
+      name: string;
+      namespace?: string;
+      arguments: string;
+    };
 
 // ─────────────────────────────────────────────────────────────────────
 // Errors
@@ -421,6 +430,8 @@ export type ResponsesErrorCode =
   | 'upstream_rate_limited'
   /** Upstream provider returned 5xx. */
   | 'upstream_server_error'
+  /** DNS/socket/TLS/fetch failure before a valid upstream response. */
+  | 'upstream_network'
   /** Total / idle timeout on the upstream call. */
   | 'upstream_timeout'
   /** Tool call referenced a tool not declared in the tools[] array. */

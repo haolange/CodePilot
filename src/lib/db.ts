@@ -3,15 +3,89 @@ import path from 'path';
 import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
-import type { ChatSession, Message, SettingsMap, TaskItem, TaskStatus, ApiProvider, CreateProviderRequest, UpdateProviderRequest, MediaJob, MediaJobStatus, MediaJobItem, MediaJobItemStatus, MediaContextEvent, BatchConfig, CustomCliTool, ScheduledTask } from '@/types';
+import type {
+  ChatSession,
+  Message,
+  SettingsMap,
+  TaskItem,
+  TaskStatus,
+  ApiProvider,
+  CreateProviderRequest,
+  UpdateProviderRequest,
+  MediaJob,
+  MediaJobStatus,
+  MediaJobItem,
+  MediaJobItemStatus,
+  MediaContextEvent,
+  BatchConfig,
+  CustomCliTool,
+  ScheduledTask,
+  SubagentRunRecord,
+  SubagentRunEventRecord,
+  StartSubagentRunInput,
+  CheckpointSubagentRunInput,
+  RecordSubagentRunEventInput,
+  SettleSubagentRunInput,
+} from '@/types';
 import type { ChannelType, ChannelBinding } from './bridge/types';
 import { getLocalDateString, localDayStartAsUTC } from './utils';
 import { inferProtocolFromLegacy } from './provider-catalog';
+import {
+  decryptProviderSecret,
+  encryptProviderSecret,
+  getProviderSecretEnvironmentStatus,
+  providerSecretStorageKind,
+} from './provider-secret-crypto';
+import type { TitleOrigin } from './conversation-title';
+import { normalizePermissionProfile, type SessionPermissionProfile } from './permission/profile';
+import type { DelegatedAgentResult, SubagentStatusError } from './subagent-status';
 
 const dataDir = process.env.CLAUDE_GUI_DATA_DIR || path.join(os.homedir(), '.codepilot');
 const DB_PATH = path.join(dataDir, 'codepilot.db');
 
-let db: Database.Database | null = null;
+interface DatabaseProcessState {
+  db: Database.Database | null;
+  schemaRevision?: string;
+  runtimeOwnerToken?: string;
+}
+
+interface RuntimeOwnerRecord {
+  pid: number;
+  token: string;
+  claimedAt: string;
+}
+
+const DATABASE_PROCESS_STATES_KEY = Symbol.for('codepilot.database-process-states');
+const DATABASE_SHUTDOWN_HANDLER_KEY = Symbol.for('codepilot.database-shutdown-handler');
+const RUNTIME_OWNER_PATH = `${DB_PATH}.runtime-owner.json`;
+const RUNTIME_OWNER_LOCK_PATH = `${DB_PATH}.runtime-owner.lock`;
+// Next.js dev hot reload preserves the process-global database handle while
+// replacing this module. Keep a code-owned revision beside that handle so a
+// newly loaded migration still runs without requiring the user to restart the
+// desktop client. Bump this value whenever initDb/migrateDb gains a migration.
+const DATABASE_SCHEMA_REVISION = '2026-08-06-provider-secret-envelope-v1';
+const LEGACY_NOTIFICATION_BACKLOG_MARKER = 'notification_delivery_legacy_backlog_v1';
+const LEGACY_NOTIFICATION_BACKLOG_MAX_AGE_MS = 60 * 60 * 1000;
+
+function getDatabaseProcessStates(): Map<string, DatabaseProcessState> {
+  const target = globalThis as typeof globalThis & {
+    [DATABASE_PROCESS_STATES_KEY]?: Map<string, DatabaseProcessState>;
+  };
+  if (!target[DATABASE_PROCESS_STATES_KEY]) {
+    target[DATABASE_PROCESS_STATES_KEY] = new Map();
+  }
+  return target[DATABASE_PROCESS_STATES_KEY]!;
+}
+
+function getDatabaseProcessState(): DatabaseProcessState {
+  const states = getDatabaseProcessStates();
+  let state = states.get(DB_PATH);
+  if (!state) {
+    state = { db: null };
+    states.set(DB_PATH, state);
+  }
+  return state;
+}
 
 // File-based lock to prevent concurrent migration from multiple Next.js build workers.
 // Workers will retry for up to 10 seconds before giving up.
@@ -50,7 +124,9 @@ function withMigrationLock(dbInstance: Database.Database, fn: (db: Database.Data
 }
 
 export function getDb(): Database.Database {
-  if (!db) {
+  const state = getDatabaseProcessState();
+  let openedDatabase = false;
+  if (!state.db) {
     const dir = path.dirname(DB_PATH);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
@@ -94,13 +170,25 @@ export function getDb(): Database.Database {
       }
     }
 
-    db = new Database(DB_PATH);
-    db.pragma('journal_mode = WAL');
-    db.pragma('busy_timeout = 5000');
-    db.pragma('foreign_keys = ON');
-    withMigrationLock(db, initDb);
+    state.db = new Database(DB_PATH);
+    state.db.pragma('journal_mode = WAL');
+    state.db.pragma('busy_timeout = 5000');
+    state.db.pragma('foreign_keys = ON');
+    openedDatabase = true;
   }
-  return db;
+
+  // A live dev process can keep an older global database handle across HMR.
+  // Re-run the idempotent structural bootstrap when the loaded code revision
+  // changes; runtime recovery remains tied to opening/owning the process and
+  // must not run merely because a route module was hot-reloaded.
+  if (openedDatabase || state.schemaRevision !== DATABASE_SCHEMA_REVISION) {
+    withMigrationLock(state.db, initDb);
+    state.schemaRevision = DATABASE_SCHEMA_REVISION;
+  }
+  if (openedDatabase) {
+    runRuntimeStartupRecoveryOnce(state.db);
+  }
+  return state.db;
 }
 
 function initDb(db: Database.Database): void {
@@ -123,7 +211,62 @@ function initDb(db: Database.Database): void {
       content TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       token_usage TEXT,
+      stream_status TEXT NOT NULL DEFAULT 'completed',
       FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS subagent_runs (
+      id TEXT PRIMARY KEY,
+      logical_run_id TEXT NOT NULL DEFAULT '',
+      attempt_number INTEGER NOT NULL DEFAULT 1 CHECK(attempt_number > 0),
+      parent_session_id TEXT NOT NULL,
+      runtime TEXT NOT NULL CHECK(runtime IN ('codepilot_runtime', 'claude_code', 'codex_runtime')),
+      tool_name TEXT NOT NULL DEFAULT '',
+      agent_name TEXT NOT NULL DEFAULT 'Sub-agent',
+      provider_id TEXT NOT NULL DEFAULT '',
+      requested_model TEXT NOT NULL DEFAULT '',
+      effective_provider_id TEXT NOT NULL DEFAULT '',
+      effective_model TEXT NOT NULL DEFAULT '',
+      workflow_id TEXT NOT NULL DEFAULT '',
+      task_key TEXT NOT NULL DEFAULT '',
+      dependencies_json TEXT NOT NULL DEFAULT '[]',
+      dispatch_state TEXT NOT NULL DEFAULT 'executing'
+        CHECK(dispatch_state IN ('queued', 'executing', 'settling', 'terminal')),
+      prompt TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'running'
+        CHECK(status IN ('running', 'completed', 'partial', 'failed', 'cancelled', 'timed_out')),
+      phase TEXT NOT NULL DEFAULT 'running'
+        CHECK(phase IN ('running', 'settling', 'terminal')),
+      terminal INTEGER NOT NULL DEFAULT 0 CHECK(terminal IN (0, 1)),
+      result_text TEXT NOT NULL DEFAULT '',
+      result_json TEXT NOT NULL DEFAULT '',
+      current_activity TEXT NOT NULL DEFAULT '',
+      last_activity_at TEXT NOT NULL DEFAULT '',
+      error_json TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      completed_at TEXT NOT NULL DEFAULT '',
+      FOREIGN KEY (parent_session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS subagent_run_events (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      logical_run_id TEXT NOT NULL DEFAULT '',
+      sequence INTEGER NOT NULL CHECK(sequence > 0),
+      cursor INTEGER NOT NULL DEFAULT 0 CHECK(cursor >= 0),
+      event_type TEXT NOT NULL
+        CHECK(event_type IN (
+          'started', 'activity', 'tool_started', 'tool_completed',
+          'permission_requested', 'permission_resolved', 'partial_result',
+          'settling', 'terminal', 'route_warning'
+        )),
+      activity TEXT NOT NULL DEFAULT '',
+      tool_name TEXT NOT NULL DEFAULT '',
+      payload_json TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (run_id) REFERENCES subagent_runs(id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS settings (
@@ -147,8 +290,11 @@ function initDb(db: Database.Database): void {
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       provider_type TEXT NOT NULL DEFAULT 'anthropic',
+      preset_key TEXT NOT NULL DEFAULT '',
       base_url TEXT NOT NULL DEFAULT '',
       api_key TEXT NOT NULL DEFAULT '',
+      api_key_ciphertext TEXT NOT NULL DEFAULT '',
+      api_key_storage TEXT NOT NULL DEFAULT 'legacy_plaintext',
       is_active INTEGER NOT NULL DEFAULT 0,
       sort_order INTEGER NOT NULL DEFAULT 0,
       extra_env TEXT NOT NULL DEFAULT '{}',
@@ -239,6 +385,12 @@ function initDb(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id);
     CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
     CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON chat_sessions(updated_at);
+    CREATE INDEX IF NOT EXISTS idx_subagent_runs_parent_created
+      ON subagent_runs(parent_session_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_subagent_runs_parent_terminal
+      ON subagent_runs(parent_session_id, terminal, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_subagent_run_events_run_sequence
+      ON subagent_run_events(run_id, sequence);
     CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id);
     CREATE INDEX IF NOT EXISTS idx_media_created_at ON media_generations(created_at);
     CREATE INDEX IF NOT EXISTS idx_media_session_id ON media_generations(session_id);
@@ -323,6 +475,10 @@ function initDb(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_perm_links_request ON channel_permission_links(permission_request_id);
   `);
 
+  // Harness Home Program B. One idempotent additive schema function serves
+  // both clean bootstrap and on-touch upgrade so the two shapes cannot drift.
+  migrateAssetLibrarySchema(db);
+
   // Run migrations for existing databases
   migrateDb(db);
 }
@@ -338,6 +494,7 @@ function safeAddColumn(db: Database.Database, sql: string): void {
 }
 
 function migrateDb(db: Database.Database): void {
+  migrateAssetLibrarySchema(db);
   const columns = db.prepare("PRAGMA table_info(chat_sessions)").all() as { name: string }[];
   const colNames = columns.map(c => c.name);
 
@@ -428,6 +585,36 @@ function migrateDb(db: Database.Database): void {
   if (!colNames.includes('permission_profile')) {
     safeAddColumn(db, "ALTER TABLE chat_sessions ADD COLUMN permission_profile TEXT NOT NULL DEFAULT 'default'");
   }
+  if (!colNames.includes('title_origin')) {
+    // Provenance for `title` — decides who is allowed to overwrite it later
+    // (see TitleOrigin in lib/conversation-title.ts). Added with DEFAULT ''
+    // rather than a real origin so existing rows land in a "not yet
+    // classified" state that the backfill below can find and re-decide;
+    // ALTER ... DEFAULT 'placeholder' would silently stamp every legacy row
+    // as overwritable, which is exactly the wrong direction to fail.
+    safeAddColumn(db, "ALTER TABLE chat_sessions ADD COLUMN title_origin TEXT NOT NULL DEFAULT ''");
+  }
+  // Backfill, OUTSIDE the ADD COLUMN guard on purpose: ALTER and UPDATE are two
+  // statements, and a crash between them used to leave every legacy row stuck
+  // at '' forever — the next boot saw the column present and skipped the fill.
+  // `WHERE title_origin = ''` makes this re-entrant and a no-op once done; no
+  // insert path ever writes '', so an empty origin can only mean "unclassified".
+  // Conservative on purpose:
+  //   'New Chat' / '' → 'placeholder': never had a real title, so the next
+  //     real user message should fill in a fallback (the whole point).
+  //   anything else   → 'manual': the row predates provenance, so we CANNOT
+  //     tell a user's hand-typed rename from an old auto-truncation. Both
+  //     look like plain text. Guessing 'fallback' would let Phase 2's
+  //     generator silently rename a session the user deliberately named —
+  //     breaking "manual is never overwritten", the one promise this whole
+  //     feature rests on. 'manual' is the safe wrong answer: worst case a
+  //     legacy session keeps its current (already user-visible, already
+  //     accepted) title forever instead of gaining a semantic one.
+  db.prepare(
+    `UPDATE chat_sessions
+        SET title_origin = CASE WHEN title = '' OR title = 'New Chat' THEN 'placeholder' ELSE 'manual' END
+      WHERE title_origin = ''`
+  ).run();
   if (!colNames.includes('context_summary')) {
     safeAddColumn(db, "ALTER TABLE chat_sessions ADD COLUMN context_summary TEXT NOT NULL DEFAULT ''");
   }
@@ -476,6 +663,16 @@ function migrateDb(db: Database.Database): void {
     safeAddColumn(db, "ALTER TABLE messages ADD COLUMN is_heartbeat_ack INTEGER NOT NULL DEFAULT 0");
   }
 
+  // Durable assistant-stream checkpoint lifecycle. Existing rows are complete
+  // transcripts, so the conservative migration default is `completed`.
+  // In-flight collector rows explicitly opt into `streaming`; startup recovery
+  // below converts only those rows to `interrupted`.
+  if (!msgColNames.includes('stream_status')) {
+    safeAddColumn(db, "ALTER TABLE messages ADD COLUMN stream_status TEXT NOT NULL DEFAULT 'completed'");
+  }
+
+  migrateSubagentRunSchema(db);
+
   // Ensure tasks table exists for databases created before this migration
   db.exec(`
     CREATE TABLE IF NOT EXISTS tasks (
@@ -507,8 +704,11 @@ function migrateDb(db: Database.Database): void {
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       provider_type TEXT NOT NULL DEFAULT 'anthropic',
+      preset_key TEXT NOT NULL DEFAULT '',
       base_url TEXT NOT NULL DEFAULT '',
       api_key TEXT NOT NULL DEFAULT '',
+      api_key_ciphertext TEXT NOT NULL DEFAULT '',
+      api_key_storage TEXT NOT NULL DEFAULT 'legacy_plaintext',
       is_active INTEGER NOT NULL DEFAULT 0,
       sort_order INTEGER NOT NULL DEFAULT 0,
       extra_env TEXT NOT NULL DEFAULT '{}',
@@ -518,10 +718,15 @@ function migrateDb(db: Database.Database): void {
     );
   `);
 
-  // Add new provider fields (protocol, headers, env_overrides, role_models)
+  // Add provider fields. preset_key is the stable product identity; URL and
+  // protocol are insufficient because multiple Qwen Token Plan products share
+  // the same endpoint.
   {
     const providerCols = db.prepare("PRAGMA table_info(api_providers)").all() as { name: string }[];
     const provColNames = providerCols.map(c => c.name);
+    if (!provColNames.includes('preset_key')) {
+      safeAddColumn(db, "ALTER TABLE api_providers ADD COLUMN preset_key TEXT NOT NULL DEFAULT ''");
+    }
     if (!provColNames.includes('protocol')) {
       safeAddColumn(db, "ALTER TABLE api_providers ADD COLUMN protocol TEXT NOT NULL DEFAULT ''");
     }
@@ -536,6 +741,12 @@ function migrateDb(db: Database.Database): void {
     }
     if (!provColNames.includes('options_json')) {
       safeAddColumn(db, "ALTER TABLE api_providers ADD COLUMN options_json TEXT NOT NULL DEFAULT '{}'");
+    }
+    if (!provColNames.includes('api_key_ciphertext')) {
+      safeAddColumn(db, "ALTER TABLE api_providers ADD COLUMN api_key_ciphertext TEXT NOT NULL DEFAULT ''");
+    }
+    if (!provColNames.includes('api_key_storage')) {
+      safeAddColumn(db, "ALTER TABLE api_providers ADD COLUMN api_key_storage TEXT NOT NULL DEFAULT 'legacy_plaintext'");
     }
   }
 
@@ -589,6 +800,12 @@ function migrateDb(db: Database.Database): void {
         ELSE 'recommended'
       END`);
   }
+
+  // Stable preset identity migration. Only rows whose identity is provable
+  // are backfilled. Token Plan personal/team share one URL, so an uncertain
+  // legacy row deliberately keeps preset_key='' and is surfaced for user
+  // confirmation instead of inheriting catalog array order.
+  backfillProviderPresetKeys(db);
 
   // Ensure media_generations table exists for databases created before this migration
   db.exec(`
@@ -692,16 +909,6 @@ function migrateDb(db: Database.Database): void {
     // Column already exists
   }
 
-  // Recover stale jobs: mark 'running' jobs as 'paused' after process restart
-  db.exec(`
-    UPDATE media_jobs SET status = 'paused', updated_at = datetime('now')
-    WHERE status = 'running'
-  `);
-  db.exec(`
-    UPDATE media_job_items SET status = 'pending', updated_at = datetime('now')
-    WHERE status = 'processing'
-  `);
-
   // Create session_runtime_locks table
   db.exec(`
     CREATE TABLE IF NOT EXISTS session_runtime_locks (
@@ -738,23 +945,6 @@ function migrateDb(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_permission_expires_at ON permission_requests(expires_at);
   `);
 
-  // Startup recovery: reset stale runtime states from previous process
-  db.exec(`
-    UPDATE chat_sessions
-    SET runtime_status = 'idle',
-        runtime_error = 'Process restarted',
-        runtime_updated_at = datetime('now')
-    WHERE runtime_status IN ('running', 'waiting_permission')
-  `);
-  db.exec("DELETE FROM session_runtime_locks");
-  db.exec(`
-    UPDATE permission_requests
-    SET status = 'aborted',
-        resolved_at = datetime('now'),
-        message = 'Process restarted'
-    WHERE status = 'pending'
-  `);
-
   // Migrate existing settings to a default provider if api_providers is empty
   const providerCount = db.prepare('SELECT COUNT(*) as count FROM api_providers').get() as { count: number };
   if (providerCount.count === 0) {
@@ -763,11 +953,14 @@ function migrateDb(db: Database.Database): void {
     if (tokenRow || baseUrlRow) {
       const id = crypto.randomBytes(16).toString('hex');
       const now = new Date().toISOString().replace('T', ' ').split('.')[0];
+      const storedSecret = encodeProviderSecret(id, tokenRow?.value || '');
       db.prepare(
-        'INSERT INTO api_providers (id, name, provider_type, base_url, api_key, is_active, sort_order, extra_env, notes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-      ).run(id, 'Default', 'anthropic', baseUrlRow?.value || '', tokenRow?.value || '', 1, 0, '{}', 'Migrated from settings', now, now);
+        'INSERT INTO api_providers (id, name, provider_type, base_url, api_key, api_key_ciphertext, api_key_storage, is_active, sort_order, extra_env, notes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      ).run(id, 'Default', 'anthropic', baseUrlRow?.value || '', storedSecret.plaintext, storedSecret.ciphertext, storedSecret.storage, 1, 0, '{}', 'Migrated from settings', now, now);
     }
   }
+
+  migrateProviderSecrets(db);
 
   // Ensure bridge tables exist for databases created before bridge feature
   db.exec(`
@@ -971,7 +1164,7 @@ function migrateDb(db: Database.Database): void {
         // require tripped Turbopack's NFT into tracing the whole project.
         const updateStmt = db.prepare("UPDATE api_providers SET protocol = ? WHERE id = ?");
         for (const row of legacyCustom) {
-          const protocol = inferProtocolFromLegacy('custom', row.base_url || '');
+          const protocol = inferProtocolFromLegacy('custom', row.base_url || '', '');
           updateStmt.run(protocol, row.id);
         }
       }
@@ -1111,6 +1304,8 @@ function migrateDb(db: Database.Database): void {
       event_id TEXT NOT NULL UNIQUE,
       task_id TEXT,
       session_id TEXT,
+      action_type TEXT,
+      action_payload TEXT,
       source TEXT NOT NULL DEFAULT 'codepilot',
       title TEXT NOT NULL,
       body TEXT NOT NULL,
@@ -1134,6 +1329,532 @@ function migrateDb(db: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_notification_deliveries_event_id ON notification_deliveries(event_id);
   `);
+
+  safeAddColumn(db, 'ALTER TABLE notification_events ADD COLUMN action_type TEXT');
+  safeAddColumn(db, 'ALTER TABLE notification_events ADD COLUMN action_payload TEXT');
+
+  // Durable consumer lease. Status CHECK remains unchanged; claim/retry is
+  // represented by additive columns so old rows and old readers stay valid.
+  safeAddColumn(db, 'ALTER TABLE notification_deliveries ADD COLUMN claim_owner TEXT');
+  safeAddColumn(db, 'ALTER TABLE notification_deliveries ADD COLUMN claimed_at TEXT');
+  safeAddColumn(db, 'ALTER TABLE notification_deliveries ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn(db, 'ALTER TABLE notification_deliveries ADD COLUMN last_attempt_at TEXT');
+  safeAddColumn(db, 'ALTER TABLE notification_deliveries ADD COLUMN next_attempt_at TEXT');
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_notification_deliveries_claimable
+    ON notification_deliveries(channel, status, next_attempt_at, claimed_at);
+  `);
+
+  suppressLegacyQueuedNotificationBacklog(db);
+  consolidateHeartbeatTasksAndEnsureUniqueIndex(db);
+}
+
+/**
+ * The pre-durable renderer queue left delivery rows in `queued` after its
+ * in-memory payload had vanished. Replaying those rows when the durable
+ * consumer first appears produces a burst of months-old notifications.
+ *
+ * Preserve the event/delivery audit trail, but close stale legacy work as
+ * `skipped`. The one-time marker makes the migration idempotent, while the
+ * age boundary protects notifications created by the current app run during
+ * a dev HMR race.
+ */
+export function suppressLegacyQueuedNotificationBacklog(
+  db: Database.Database,
+  now = new Date(),
+): number {
+  const migrate = db.transaction(() => {
+    const alreadyMigrated = db.prepare('SELECT 1 FROM settings WHERE key = ?').get(
+      LEGACY_NOTIFICATION_BACKLOG_MARKER,
+    );
+    if (alreadyMigrated) return 0;
+
+    const cutoff = new Date(now.getTime() - LEGACY_NOTIFICATION_BACKLOG_MAX_AGE_MS).toISOString();
+    const ackedAt = now.toISOString();
+    const result = db.prepare(`
+      UPDATE notification_deliveries
+      SET status = 'skipped',
+          error = 'legacy_backlog_suppressed',
+          acked_at = ?,
+          claim_owner = NULL,
+          claimed_at = NULL,
+          next_attempt_at = NULL
+      WHERE status = 'queued'
+        AND channel IN ('renderer-toast', 'electron-native')
+        AND datetime(created_at) <= datetime(?)
+    `).run(ackedAt, cutoff);
+
+    db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run(
+      LEGACY_NOTIFICATION_BACKLOG_MARKER,
+      JSON.stringify({ migratedAt: ackedAt, cutoff, skipped: result.changes }),
+    );
+    return result.changes;
+  });
+  return migrate();
+}
+
+/**
+ * Normalize historical system heartbeat rows before enforcing the one-row
+ * invariant. Run/event history is re-linked to the keeper; user-created tasks
+ * and notification event identities are never rewritten or deleted.
+ */
+export function consolidateHeartbeatTasksAndEnsureUniqueIndex(db: Database.Database): void {
+  const migrate = db.transaction(() => {
+    const rows = db.prepare(`
+      SELECT id
+      FROM scheduled_tasks
+      WHERE source = 'assistant_heartbeat'
+      ORDER BY
+        CASE status WHEN 'active' THEN 0 ELSE 1 END,
+        datetime(updated_at) DESC,
+        id ASC
+    `).all() as Array<{ id: string }>;
+
+    if (rows.length > 1) {
+      const keeperId = rows[0].id;
+      const duplicateIds = rows.slice(1).map((row) => row.id);
+      const placeholders = duplicateIds.map(() => '?').join(', ');
+      db.prepare(
+        `UPDATE task_run_logs SET task_id = ? WHERE task_id IN (${placeholders})`,
+      ).run(keeperId, ...duplicateIds);
+      db.prepare(
+        `UPDATE notification_events SET task_id = ? WHERE task_id IN (${placeholders})`,
+      ).run(keeperId, ...duplicateIds);
+      db.prepare(
+        `DELETE FROM scheduled_tasks WHERE id IN (${placeholders})`,
+      ).run(...duplicateIds);
+    }
+
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_scheduled_tasks_one_assistant_heartbeat
+      ON scheduled_tasks(source)
+      WHERE source = 'assistant_heartbeat';
+    `);
+  });
+  migrate();
+}
+
+const ASSET_RECORD_REQUIRED_COLUMNS = [
+  'id',
+  'kind',
+  'producer_id',
+  'stable_path',
+  'content_hash',
+  'mime_type',
+  'curation_state',
+  'rating',
+  'tags',
+  'materialization_key',
+  'lifecycle_state',
+  'integrity_state',
+  'source_media_generation_id',
+  'created_at',
+  'updated_at',
+] as const;
+
+/**
+ * Additive, data-preserving Asset Library schema.
+ *
+ * Existing `media_generations` remains untouched and readable by v0.62.
+ * `asset_records` is a typed index/provenance layer over those bytes plus
+ * future materializers. Backfill is performed separately and idempotently so
+ * schema initialization never hashes a large user library on the hot path.
+ */
+export function migrateAssetLibrarySchema(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS asset_records (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL,
+      producer_id TEXT NOT NULL,
+      stable_path TEXT NOT NULL,
+      content_hash TEXT NOT NULL DEFAULT '',
+      mime_type TEXT NOT NULL DEFAULT '',
+      byte_size INTEGER NOT NULL DEFAULT 0,
+      width INTEGER,
+      height INTEGER,
+      duration_ms INTEGER,
+      preview_path TEXT NOT NULL DEFAULT '',
+      harness_id TEXT NOT NULL DEFAULT '',
+      project_id TEXT NOT NULL DEFAULT '',
+      session_id TEXT,
+      message_id TEXT,
+      runtime_id TEXT NOT NULL DEFAULT '',
+      provider_id TEXT NOT NULL DEFAULT '',
+      model_id TEXT NOT NULL DEFAULT '',
+      prompt TEXT NOT NULL DEFAULT '',
+      method_ref TEXT NOT NULL DEFAULT '',
+      trust_tier TEXT NOT NULL DEFAULT 'local_generated',
+      source_scope TEXT NOT NULL DEFAULT '',
+      license TEXT NOT NULL DEFAULT '',
+      source_url TEXT NOT NULL DEFAULT '',
+      curation_state TEXT NOT NULL DEFAULT 'unreviewed'
+        CHECK(curation_state IN ('unreviewed','selected','rejected')),
+      rating INTEGER CHECK(rating IS NULL OR (rating >= 1 AND rating <= 5)),
+      tags TEXT NOT NULL DEFAULT '[]',
+      lifecycle_state TEXT NOT NULL DEFAULT 'active'
+        CHECK(lifecycle_state IN ('active','trashed')),
+      integrity_state TEXT NOT NULL DEFAULT 'valid'
+        CHECK(integrity_state IN ('valid','missing','modified')),
+      integrity_reason TEXT NOT NULL DEFAULT '',
+      metadata TEXT NOT NULL DEFAULT '{}',
+      materialization_key TEXT NOT NULL DEFAULT '',
+      source_media_generation_id TEXT UNIQUE,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      deleted_at TEXT,
+      FOREIGN KEY (source_media_generation_id)
+        REFERENCES media_generations(id) ON DELETE RESTRICT
+    );
+
+    CREATE TABLE IF NOT EXISTS asset_lineage (
+      parent_asset_id TEXT NOT NULL,
+      child_asset_id TEXT NOT NULL,
+      relation TEXT NOT NULL
+        CHECK(relation IN ('derived_from','input_reference','variant_of')),
+      metadata TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (parent_asset_id, child_asset_id, relation),
+      CHECK(parent_asset_id != child_asset_id),
+      FOREIGN KEY (parent_asset_id) REFERENCES asset_records(id) ON DELETE RESTRICT,
+      FOREIGN KEY (child_asset_id) REFERENCES asset_records(id) ON DELETE RESTRICT
+    );
+
+    CREATE TABLE IF NOT EXISTS asset_references (
+      id TEXT PRIMARY KEY,
+      asset_id TEXT NOT NULL,
+      consumer_type TEXT NOT NULL,
+      consumer_id TEXT NOT NULL,
+      metadata TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      released_at TEXT,
+      UNIQUE(asset_id, consumer_type, consumer_id),
+      FOREIGN KEY (asset_id) REFERENCES asset_records(id) ON DELETE RESTRICT
+    );
+
+    CREATE TABLE IF NOT EXISTS asset_backfill_state (
+      source_table TEXT PRIMARY KEY,
+      scanned_count INTEGER NOT NULL DEFAULT 0,
+      created_count INTEGER NOT NULL DEFAULT 0,
+      missing_count INTEGER NOT NULL DEFAULT 0,
+      skipped_count INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT NOT NULL DEFAULT '',
+      last_run_at TEXT,
+      completed_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS asset_backfill_failures (
+      source_table TEXT NOT NULL,
+      source_id TEXT NOT NULL,
+      failure_revision TEXT NOT NULL,
+      error TEXT NOT NULL,
+      attempt_count INTEGER NOT NULL DEFAULT 1,
+      first_failed_at TEXT NOT NULL DEFAULT (datetime('now')),
+      last_failed_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (source_table, source_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_asset_kind_created
+      ON asset_records(kind, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_asset_lifecycle_created
+      ON asset_records(lifecycle_state, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_asset_content_hash
+      ON asset_records(content_hash);
+    CREATE INDEX IF NOT EXISTS idx_asset_session
+      ON asset_records(session_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_asset_lineage_parent
+      ON asset_lineage(parent_asset_id);
+    CREATE INDEX IF NOT EXISTS idx_asset_lineage_child
+      ON asset_lineage(child_asset_id);
+    CREATE INDEX IF NOT EXISTS idx_asset_references_asset
+      ON asset_references(asset_id, released_at);
+    CREATE INDEX IF NOT EXISTS idx_asset_backfill_failures_revision
+      ON asset_backfill_failures(source_table, failure_revision);
+  `);
+
+  const existingAssetColumns = new Set(
+    (db.prepare("PRAGMA table_info(asset_records)").all() as { name: string }[])
+      .map((column) => column.name),
+  );
+  if (!existingAssetColumns.has('curation_state')) {
+    safeAddColumn(
+      db,
+      `ALTER TABLE asset_records
+       ADD COLUMN curation_state TEXT NOT NULL DEFAULT 'unreviewed'
+       CHECK(curation_state IN ('unreviewed','selected','rejected'))`,
+    );
+  }
+  if (!existingAssetColumns.has('rating')) {
+    safeAddColumn(
+      db,
+      `ALTER TABLE asset_records
+       ADD COLUMN rating INTEGER
+       CHECK(rating IS NULL OR (rating >= 1 AND rating <= 5))`,
+    );
+  }
+  if (!existingAssetColumns.has('tags')) {
+    safeAddColumn(
+      db,
+      `ALTER TABLE asset_records
+       ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'`,
+    );
+    const mediaColumns = new Set(
+      (db.prepare("PRAGMA table_info(media_generations)").all() as { name: string }[])
+        .map((column) => column.name),
+    );
+    if (mediaColumns.has('tags')) {
+      db.prepare(
+        `UPDATE asset_records
+         SET tags = (
+           SELECT mg.tags
+           FROM media_generations mg
+           WHERE mg.id = asset_records.source_media_generation_id
+             AND json_valid(mg.tags)
+             AND json_type(mg.tags) = 'array'
+         )
+         WHERE tags = '[]'
+           AND source_media_generation_id IS NOT NULL
+           AND EXISTS (
+             SELECT 1
+             FROM media_generations mg
+             WHERE mg.id = asset_records.source_media_generation_id
+               AND json_valid(mg.tags)
+               AND json_type(mg.tags) = 'array'
+           )`,
+      ).run();
+    }
+  }
+  if (!existingAssetColumns.has('materialization_key')) {
+    safeAddColumn(
+      db,
+      `ALTER TABLE asset_records
+       ADD COLUMN materialization_key TEXT NOT NULL DEFAULT ''`,
+    );
+  }
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_asset_materialization_key
+      ON asset_records(materialization_key)
+      WHERE materialization_key != ''
+  `);
+  const backfillColumns = new Set(
+    (db.prepare("PRAGMA table_info(asset_backfill_state)").all() as { name: string }[])
+      .map((column) => column.name),
+  );
+  if (!backfillColumns.has('last_error')) {
+    safeAddColumn(
+      db,
+      `ALTER TABLE asset_backfill_state
+       ADD COLUMN last_error TEXT NOT NULL DEFAULT ''`,
+    );
+  }
+  const columns = new Set(
+    (db.prepare("PRAGMA table_info(asset_records)").all() as { name: string }[])
+      .map((column) => column.name),
+  );
+  const missing = ASSET_RECORD_REQUIRED_COLUMNS.filter(
+    (column) => !columns.has(column),
+  );
+  if (missing.length > 0) {
+    throw new Error(
+      `Existing asset_records table has an incompatible shape; missing: `
+      + missing.join(', '),
+    );
+  }
+}
+
+/**
+ * Additive Sub-agent orchestration migration.
+ *
+ * Historical rows represented one physical attempt and had no logical task
+ * identity. Conservatively backfill each existing id as its own logical run,
+ * attempt 1; never guess that similarly named agents were retries.
+ */
+/** Exported for additive migration contract tests. Production uses migrateDb(). */
+export function migrateSubagentRunSchema(db: Database.Database): void {
+  const columns = db.prepare("PRAGMA table_info(subagent_runs)").all() as { name: string }[];
+  if (columns.length === 0) return;
+  const names = new Set(columns.map(column => column.name));
+
+  db.transaction(() => {
+    if (!names.has('logical_run_id')) {
+      safeAddColumn(db, "ALTER TABLE subagent_runs ADD COLUMN logical_run_id TEXT NOT NULL DEFAULT ''");
+    }
+    if (!names.has('attempt_number')) {
+      safeAddColumn(db, "ALTER TABLE subagent_runs ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 1 CHECK(attempt_number > 0)");
+    }
+    if (!names.has('effective_provider_id')) {
+      safeAddColumn(db, "ALTER TABLE subagent_runs ADD COLUMN effective_provider_id TEXT NOT NULL DEFAULT ''");
+    }
+    if (!names.has('phase')) {
+      safeAddColumn(db, "ALTER TABLE subagent_runs ADD COLUMN phase TEXT NOT NULL DEFAULT 'running' CHECK(phase IN ('running', 'settling', 'terminal'))");
+    }
+    if (!names.has('result_json')) {
+      safeAddColumn(db, "ALTER TABLE subagent_runs ADD COLUMN result_json TEXT NOT NULL DEFAULT ''");
+    }
+    if (!names.has('current_activity')) {
+      safeAddColumn(db, "ALTER TABLE subagent_runs ADD COLUMN current_activity TEXT NOT NULL DEFAULT ''");
+    }
+    if (!names.has('last_activity_at')) {
+      safeAddColumn(db, "ALTER TABLE subagent_runs ADD COLUMN last_activity_at TEXT NOT NULL DEFAULT ''");
+    }
+    if (!names.has('workflow_id')) {
+      safeAddColumn(db, "ALTER TABLE subagent_runs ADD COLUMN workflow_id TEXT NOT NULL DEFAULT ''");
+    }
+    if (!names.has('task_key')) {
+      safeAddColumn(db, "ALTER TABLE subagent_runs ADD COLUMN task_key TEXT NOT NULL DEFAULT ''");
+    }
+    if (!names.has('dependencies_json')) {
+      safeAddColumn(db, "ALTER TABLE subagent_runs ADD COLUMN dependencies_json TEXT NOT NULL DEFAULT '[]'");
+    }
+    if (!names.has('dispatch_state')) {
+      safeAddColumn(
+        db,
+        "ALTER TABLE subagent_runs ADD COLUMN dispatch_state TEXT NOT NULL DEFAULT 'executing' CHECK(dispatch_state IN ('queued', 'executing', 'settling', 'terminal'))",
+      );
+    }
+
+    db.exec(`
+      UPDATE subagent_runs
+      SET logical_run_id = id
+      WHERE logical_run_id = '';
+
+      UPDATE subagent_runs
+      SET phase = CASE WHEN terminal = 1 THEN 'terminal' ELSE 'running' END
+      WHERE phase = ''
+         OR (terminal = 1 AND phase != 'terminal');
+
+      UPDATE subagent_runs
+      SET last_activity_at = updated_at
+      WHERE last_activity_at = '';
+
+      UPDATE subagent_runs
+      SET dispatch_state = CASE
+        WHEN terminal = 1 THEN 'terminal'
+        WHEN phase = 'settling' THEN 'settling'
+        ELSE 'executing'
+      END
+      WHERE dispatch_state = ''
+         OR terminal = 1
+         OR phase = 'settling';
+
+      CREATE TABLE IF NOT EXISTS subagent_run_events (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        logical_run_id TEXT NOT NULL DEFAULT '',
+        sequence INTEGER NOT NULL CHECK(sequence > 0),
+        cursor INTEGER NOT NULL DEFAULT 0 CHECK(cursor >= 0),
+        event_type TEXT NOT NULL
+          CHECK(event_type IN (
+            'started', 'activity', 'tool_started', 'tool_completed',
+            'permission_requested', 'permission_resolved', 'partial_result',
+            'settling', 'terminal', 'route_warning'
+          )),
+        activity TEXT NOT NULL DEFAULT '',
+        tool_name TEXT NOT NULL DEFAULT '',
+        payload_json TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (run_id) REFERENCES subagent_runs(id) ON DELETE CASCADE
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_subagent_runs_logical_attempt
+        ON subagent_runs(parent_session_id, logical_run_id, attempt_number);
+      CREATE INDEX IF NOT EXISTS idx_subagent_runs_parent_logical
+        ON subagent_runs(parent_session_id, logical_run_id, attempt_number DESC);
+      CREATE INDEX IF NOT EXISTS idx_subagent_runs_workflow_task
+        ON subagent_runs(parent_session_id, workflow_id, task_key, attempt_number DESC)
+        WHERE workflow_id != '' AND task_key != '';
+      CREATE INDEX IF NOT EXISTS idx_subagent_run_events_run_sequence
+        ON subagent_run_events(run_id, sequence);
+    `);
+
+    const eventColumns = db.prepare("PRAGMA table_info(subagent_run_events)")
+      .all() as { name: string }[];
+    if (!eventColumns.some(column => column.name === 'cursor')) {
+      safeAddColumn(
+        db,
+        'ALTER TABLE subagent_run_events ADD COLUMN cursor INTEGER NOT NULL DEFAULT 0 CHECK(cursor >= 0)',
+      );
+    }
+    db.exec(`
+      UPDATE subagent_run_events
+      SET cursor = rowid
+      WHERE cursor = 0;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_subagent_run_events_cursor
+        ON subagent_run_events(cursor);
+      CREATE INDEX IF NOT EXISTS idx_subagent_run_events_logical_cursor
+        ON subagent_run_events(logical_run_id, cursor);
+      CREATE INDEX IF NOT EXISTS idx_subagent_run_events_run_cursor
+        ON subagent_run_events(run_id, cursor);
+    `);
+  })();
+}
+
+const BAILIAN_CODING_PLAN_URL = 'https://coding.dashscope.aliyuncs.com/apps/anthropic';
+const QWEN_TOKEN_PLAN_URL = 'https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic';
+const LEGACY_QWEN_TEAM_MODELS = new Set(['qwen3.6-plus', 'glm-5', 'MiniMax-M2.5']);
+
+/** Exported for migration contract tests. Production callers should use getDb(). */
+export function backfillProviderPresetKeys(dbInstance: Database.Database): void {
+  const columns = dbInstance.prepare("PRAGMA table_info(api_providers)").all() as Array<{ name: string }>;
+  if (!columns.some(c => c.name === 'preset_key')) return;
+
+  const migrate = dbInstance.transaction(() => {
+    dbInstance.prepare(`
+      UPDATE api_providers
+      SET preset_key = 'bailian'
+      WHERE preset_key = ''
+        AND base_url = ?
+        AND (protocol = 'anthropic' OR protocol = '' OR protocol IS NULL)
+    `).run(BAILIAN_CODING_PLAN_URL);
+
+    const tokenRows = dbInstance.prepare(`
+      SELECT id, role_models_json
+      FROM api_providers
+      WHERE preset_key = ''
+        AND base_url = ?
+        AND (protocol = 'anthropic' OR protocol = '' OR protocol IS NULL)
+    `).all(QWEN_TOKEN_PLAN_URL) as Array<{ id: string; role_models_json: string }>;
+
+    const modelStmt = dbInstance.prepare(`
+      SELECT model_id, source, user_edited
+      FROM provider_models
+      WHERE provider_id = ?
+    `);
+    const updateTeam = dbInstance.prepare(`
+      UPDATE api_providers
+      SET preset_key = 'bailian-token-plan-cn'
+      WHERE id = ? AND preset_key = ''
+    `);
+
+    for (const row of tokenRows) {
+      let roles: Record<string, unknown>;
+      try {
+        const parsed = JSON.parse(row.role_models_json || '{}');
+        roles = parsed && typeof parsed === 'object' ? parsed : {};
+      } catch {
+        continue;
+      }
+      const roleFingerprint = ['default', 'sonnet', 'opus', 'haiku']
+        .every(role => roles[role] === 'qwen3.6-plus');
+      if (!roleFingerprint) continue;
+
+      const modelRows = modelStmt.all(row.id) as Array<{
+        model_id: string;
+        source: string;
+        user_edited: number;
+      }>;
+      const managedIds = new Set(
+        modelRows
+          .filter(model => model.source !== 'manual' && model.user_edited === 0)
+          .map(model => model.model_id),
+      );
+      const exactManagedCatalog = managedIds.size === LEGACY_QWEN_TEAM_MODELS.size
+        && [...LEGACY_QWEN_TEAM_MODELS].every(id => managedIds.has(id));
+      if (exactManagedCatalog) updateTeam.run(row.id);
+    }
+  });
+
+  migrate();
 }
 
 // ==========================================
@@ -1233,8 +1954,16 @@ export function createSession(
   workingDirectory?: string,
   mode?: string,
   providerId?: string,
-  permissionProfile?: string,
+  permissionProfile?: SessionPermissionProfile,
   source?: 'user' | 'task',
+  /**
+   * Provenance of `title`. Defaults to the honest reading of the args: a
+   * caller that passed no title gets 'placeholder' (a fallback may fill it
+   * in later); a caller that named the session explicitly gets 'manual'
+   * (protected). System callers (bridge / task / heartbeat / worktree) and
+   * the importer pass 'system' / 'import' explicitly.
+   */
+  titleOrigin?: TitleOrigin,
 ): ChatSession {
   const db = getDb();
   const id = crypto.randomBytes(16).toString('hex');
@@ -1242,10 +1971,11 @@ export function createSession(
   const wd = workingDirectory || '';
   const projectName = path.basename(wd);
   const sourceValue = source === 'task' ? 'task' : 'user';
+  const originValue: TitleOrigin = titleOrigin ?? (title ? 'manual' : 'placeholder');
 
   db.prepare(
-    'INSERT INTO chat_sessions (id, title, created_at, updated_at, model, system_prompt, working_directory, sdk_session_id, project_name, status, mode, sdk_cwd, provider_id, permission_profile, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-  ).run(id, title || 'New Chat', now, now, model || '', systemPrompt || '', wd, '', projectName, 'active', mode || 'code', wd, providerId || '', permissionProfile || 'default', sourceValue);
+    'INSERT INTO chat_sessions (id, title, created_at, updated_at, model, system_prompt, working_directory, sdk_session_id, project_name, status, mode, sdk_cwd, provider_id, permission_profile, source, title_origin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(id, title || 'New Chat', now, now, model || '', systemPrompt || '', wd, '', projectName, 'active', mode || 'code', wd, providerId || '', normalizePermissionProfile(permissionProfile), sourceValue, originValue);
 
   return getSession(id)!;
 }
@@ -1301,9 +2031,42 @@ export function updateSessionTimestamp(id: string): void {
   db.prepare('UPDATE chat_sessions SET updated_at = ? WHERE id = ?').run(now, id);
 }
 
-export function updateSessionTitle(id: string, title: string): void {
+/**
+ * Write a session title together with its provenance.
+ *
+ * `origin` is REQUIRED — a title without a recorded origin is what let the
+ * old unconditional blind write clobber a user's manual rename. Every call
+ * site now has to say, in the diff, who is writing and by what right.
+ *
+ * `opts.expectOrigin` makes the write a compare-and-swap: the row is only
+ * touched if its CURRENT origin is in that list. This is the atomicity
+ * boundary for background generation — `expectOrigin: ['fallback']` cannot
+ * overwrite 'manual' / 'system' / 'import', cannot double-apply (the first
+ * write moves the row to 'generated'), and cannot resurrect a deleted
+ * session (zero rows match). Omit it only for writes that are themselves the
+ * user's or the system's explicit intent.
+ *
+ * @returns true if a row was actually updated.
+ */
+export function updateSessionTitle(
+  id: string,
+  title: string,
+  origin: TitleOrigin,
+  opts?: { expectOrigin?: readonly TitleOrigin[] },
+): boolean {
   const db = getDb();
-  db.prepare('UPDATE chat_sessions SET title = ? WHERE id = ?').run(title, id);
+  const expect = opts?.expectOrigin;
+  if (expect && expect.length > 0) {
+    const slots = expect.map(() => '?').join(', ');
+    const res = db
+      .prepare(`UPDATE chat_sessions SET title = ?, title_origin = ? WHERE id = ? AND title_origin IN (${slots})`)
+      .run(title, origin, id, ...expect);
+    return res.changes > 0;
+  }
+  const res = db
+    .prepare('UPDATE chat_sessions SET title = ?, title_origin = ? WHERE id = ?')
+    .run(title, origin, id);
+  return res.changes > 0;
 }
 
 export function updateSdkSessionId(id: string, sdkSessionId: string): void {
@@ -1397,9 +2160,890 @@ export function updateSessionMode(id: string, mode: string): void {
   db.prepare('UPDATE chat_sessions SET mode = ? WHERE id = ?').run(mode, id);
 }
 
-export function updateSessionPermissionProfile(id: string, profile: string): void {
+/**
+ * Persist a session's permission profile. `normalizePermissionProfile` is the
+ * fail-closed floor: a caller that somehow reaches here with an unvalidated
+ * value writes 'default', never an elevated profile. API validation still
+ * rejects bad input with a 400 — this is the second line, not the first.
+ */
+export function updateSessionPermissionProfile(id: string, profile: SessionPermissionProfile): void {
   const db = getDb();
-  db.prepare('UPDATE chat_sessions SET permission_profile = ? WHERE id = ?').run(profile, id);
+  db.prepare('UPDATE chat_sessions SET permission_profile = ? WHERE id = ?')
+    .run(normalizePermissionProfile(profile), id);
+}
+
+// ==========================================
+// Managed Sub-agent Run Operations
+// ==========================================
+
+export const SUBAGENT_RUN_CHECKPOINT_MAX_CHARS = 64 * 1024;
+const SUBAGENT_LOGICAL_RUN_ID_MAX_CHARS = 160;
+const SUBAGENT_WORKFLOW_KEY_MAX_CHARS = 160;
+
+type SubagentLogicalRunConflictCode =
+  | 'LOGICAL_RUN_STILL_RUNNING'
+  | 'LOGICAL_RUN_ALREADY_COMPLETED'
+  | 'DUPLICATE_TASK_KEY';
+
+class SubagentLogicalRunConflictError extends Error {
+  readonly name = 'SubagentLogicalRunConflictError';
+  readonly retryable = false;
+
+  constructor(
+    readonly code: SubagentLogicalRunConflictCode,
+    readonly logicalRunId: string,
+    readonly latestAttemptId: string,
+    readonly latestStatus: SubagentRunRecord['status'],
+    readonly latestPhase: SubagentRunRecord['phase'],
+  ) {
+    super(
+      code === 'LOGICAL_RUN_STILL_RUNNING'
+        ? `Logical Sub-agent run "${logicalRunId}" already has active attempt "${latestAttemptId}" in phase "${latestPhase}".`
+        : code === 'LOGICAL_RUN_ALREADY_COMPLETED'
+          ? `Logical Sub-agent run "${logicalRunId}" already completed successfully in attempt "${latestAttemptId}".`
+          : `Workflow task "${logicalRunId}" already belongs to attempt "${latestAttemptId}".`,
+    );
+  }
+}
+
+class SubagentDependencySpecError extends Error {
+  readonly name = 'SubagentDependencySpecError';
+  readonly code = 'INVALID_DEPENDENCY_SPEC';
+  readonly retryable = false;
+
+  constructor(readonly detail: string) {
+    super(detail);
+  }
+}
+
+export function describeSubagentRunStartRejection(error: unknown): {
+  error: SubagentStatusError;
+  message: string;
+} | undefined {
+  if (!error || typeof error !== 'object') return undefined;
+  const dependencyCandidate = error as Partial<SubagentDependencySpecError>;
+  if (dependencyCandidate.code === 'INVALID_DEPENDENCY_SPEC') {
+    return {
+      error: { code: 'INVALID_DEPENDENCY_SPEC', retryable: false },
+      message: `INVALID_DEPENDENCY_SPEC: ${dependencyCandidate.detail || dependencyCandidate.message || 'the workflow dependency graph is invalid.'}`,
+    };
+  }
+  const candidate = error as Partial<SubagentLogicalRunConflictError>;
+  if (
+    candidate.code !== 'LOGICAL_RUN_STILL_RUNNING'
+    && candidate.code !== 'LOGICAL_RUN_ALREADY_COMPLETED'
+    && candidate.code !== 'DUPLICATE_TASK_KEY'
+  ) {
+    return undefined;
+  }
+  const logicalRunId = typeof candidate.logicalRunId === 'string'
+    ? candidate.logicalRunId
+    : '(unknown)';
+  const latestAttemptId = typeof candidate.latestAttemptId === 'string'
+    ? candidate.latestAttemptId
+    : '(unknown)';
+  if (candidate.code === 'LOGICAL_RUN_STILL_RUNNING') {
+    const latestPhase = candidate.latestPhase === 'settling' ? 'settling' : 'running';
+    return {
+      error: { code: candidate.code, retryable: false },
+      message: `${candidate.code}: logical_run_id "${logicalRunId}" already has active attempt "${latestAttemptId}" in phase "${latestPhase}". Do not launch a parallel retry or hide the active attempt. Wait for its terminal result and read the authoritative run details; omit logical_run_id only when starting genuinely different work.`,
+    };
+  }
+  if (candidate.code === 'DUPLICATE_TASK_KEY') {
+    return {
+      error: { code: candidate.code, retryable: false },
+      message: `${candidate.code}: workflow task "${logicalRunId}" already belongs to attempt "${latestAttemptId}". Do not create a second physical Sub-agent for the same workflow task. Use a different task_key, or explicitly retry the failed logicalRunId returned by the existing task.`,
+    };
+  }
+  return {
+    error: { code: candidate.code, retryable: false },
+    message: `${candidate.code}: logical_run_id "${logicalRunId}" already completed successfully in attempt "${latestAttemptId}". Do not replace or hide the delivered result. Read the existing result; omit logical_run_id if the user intends a new logical task.`,
+  };
+}
+
+function parseSubagentDependencyKeys(value: string): string[] {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is string => typeof item === 'string')
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function assertNoSubagentWorkflowCycle(
+  db: Database.Database,
+  parentSessionId: string,
+  workflowId: string,
+  taskKey: string,
+  dependencyTaskKeys: string[],
+): void {
+  const rows = db.prepare(`
+    SELECT task_key, dependencies_json
+    FROM subagent_runs
+    WHERE parent_session_id = ?
+      AND workflow_id = ?
+      AND task_key != ''
+    ORDER BY attempt_number DESC, rowid DESC
+  `).all(parentSessionId, workflowId) as Array<{
+    task_key: string;
+    dependencies_json: string;
+  }>;
+  const graph = new Map<string, string[]>();
+  for (const row of rows) {
+    if (!graph.has(row.task_key)) {
+      graph.set(row.task_key, parseSubagentDependencyKeys(row.dependencies_json));
+    }
+  }
+  graph.set(taskKey, dependencyTaskKeys);
+
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const visit = (current: string, path: string[]): string[] | undefined => {
+    if (visiting.has(current)) {
+      const cycleStart = path.indexOf(current);
+      return [...path.slice(Math.max(0, cycleStart)), current];
+    }
+    if (visited.has(current)) return undefined;
+    visiting.add(current);
+    for (const dependency of graph.get(current) || []) {
+      const cycle = visit(dependency, [...path, current]);
+      if (cycle) return cycle;
+    }
+    visiting.delete(current);
+    visited.add(current);
+    return undefined;
+  };
+  const cycle = visit(taskKey, []);
+  if (cycle) {
+    throw new SubagentDependencySpecError(
+      `workflow "${workflowId}" contains a dependency cycle (${cycle.join(' → ')}). No durable attempt was created and no child was started.`,
+    );
+  }
+}
+
+function normalizeSubagentWorkflowKey(
+  value: string | undefined,
+  field: 'workflow_id' | 'task_key',
+): string {
+  const candidate = value?.trim() || '';
+  if (!candidate) return '';
+  if (
+    candidate.length > SUBAGENT_WORKFLOW_KEY_MAX_CHARS
+    || !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(candidate)
+  ) {
+    throw new Error(
+      `Invalid ${field}. Use 1-${SUBAGENT_WORKFLOW_KEY_MAX_CHARS} ASCII letters, digits, dot, underscore, colon, or dash.`,
+    );
+  }
+  return candidate;
+}
+
+function normalizeLogicalRunId(value: string | undefined, fallbackAttemptId: string): string {
+  const candidate = value?.trim() || fallbackAttemptId;
+  if (
+    candidate.length === 0
+    || candidate.length > SUBAGENT_LOGICAL_RUN_ID_MAX_CHARS
+    || !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(candidate)
+  ) {
+    throw new Error(
+      'Invalid logical Sub-agent run id. Use 1-160 ASCII letters, digits, dot, underscore, colon, or dash.',
+    );
+  }
+  return candidate;
+}
+
+function subagentTimestamp(): string {
+  return new Date().toISOString().replace('T', ' ').split('.')[0];
+}
+
+function nextSubagentEventSequence(db: Database.Database, runId: string): number {
+  const row = db.prepare(`
+    SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence
+    FROM subagent_run_events
+    WHERE run_id = ?
+  `).get(runId) as { sequence: number };
+  return row.sequence;
+}
+
+function nextSubagentEventCursor(db: Database.Database): number {
+  const row = db.prepare(`
+    SELECT COALESCE(MAX(cursor), 0) + 1 AS cursor
+    FROM subagent_run_events
+  `).get() as { cursor: number };
+  return row.cursor;
+}
+
+export const SUBAGENT_RUN_EVENT_LIMIT_PER_ATTEMPT = 200;
+
+function pruneSubagentRunEvents(db: Database.Database, runId: string): void {
+  db.prepare(`
+    DELETE FROM subagent_run_events
+    WHERE run_id = ?
+      AND id NOT IN (
+        SELECT id
+        FROM subagent_run_events
+        WHERE run_id = ?
+        ORDER BY cursor DESC
+        LIMIT ?
+      )
+  `).run(runId, runId, SUBAGENT_RUN_EVENT_LIMIT_PER_ATTEMPT);
+}
+
+function subagentEventId(runId: string, coalesceKey?: string): string {
+  if (!coalesceKey) return `subagent-event-${crypto.randomUUID()}`;
+  const digest = crypto.createHash('sha256').update(coalesceKey).digest('hex').slice(0, 24);
+  return `${runId}:event:${digest}`;
+}
+
+function insertSubagentRunEvent(
+  db: Database.Database,
+  run: Pick<SubagentRunRecord, 'id' | 'logical_run_id'>,
+  input: RecordSubagentRunEventInput,
+  now = subagentTimestamp(),
+): SubagentRunEventRecord {
+  const eventId = subagentEventId(run.id, input.coalesceKey);
+  const existing = input.coalesceKey
+    ? db.prepare('SELECT sequence, created_at FROM subagent_run_events WHERE id = ?')
+      .get(eventId) as { sequence: number; created_at: string } | undefined
+    : undefined;
+  const sequence = existing?.sequence || nextSubagentEventSequence(db, run.id);
+  const cursor = nextSubagentEventCursor(db);
+  const payloadJson = input.payload ? JSON.stringify(input.payload) : '';
+  db.prepare(`
+    INSERT INTO subagent_run_events (
+      id, run_id, logical_run_id, sequence, cursor, event_type, activity,
+      tool_name, payload_json, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      cursor = excluded.cursor,
+      event_type = excluded.event_type,
+      activity = excluded.activity,
+      tool_name = excluded.tool_name,
+      payload_json = excluded.payload_json,
+      updated_at = excluded.updated_at
+  `).run(
+    eventId,
+    run.id,
+    run.logical_run_id,
+    sequence,
+    cursor,
+    input.type,
+    input.activity || '',
+    input.toolName || '',
+    payloadJson,
+    existing?.created_at || now,
+    now,
+  );
+  pruneSubagentRunEvents(db, run.id);
+  return db.prepare('SELECT * FROM subagent_run_events WHERE id = ?')
+    .get(eventId) as SubagentRunEventRecord;
+}
+
+function safeFiniteNonNegative(value: number | undefined): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+function buildDelegatedAgentResult(
+  run: SubagentRunRecord,
+  input: SettleSubagentRunInput,
+  resultText: string,
+  effectiveProviderId: string,
+  effectiveModel: string,
+): DelegatedAgentResult {
+  const usage = input.usage ? {
+    ...(safeFiniteNonNegative(input.usage.requests) !== undefined
+      ? { requests: safeFiniteNonNegative(input.usage.requests) }
+      : {}),
+    ...(safeFiniteNonNegative(input.usage.inputTokens) !== undefined
+      ? { inputTokens: safeFiniteNonNegative(input.usage.inputTokens) }
+      : {}),
+    ...(safeFiniteNonNegative(input.usage.outputTokens) !== undefined
+      ? { outputTokens: safeFiniteNonNegative(input.usage.outputTokens) }
+      : {}),
+    ...(safeFiniteNonNegative(input.usage.toolCalls) !== undefined
+      ? { toolCalls: safeFiniteNonNegative(input.usage.toolCalls) }
+      : {}),
+    ...(safeFiniteNonNegative(input.usage.costUsd) !== undefined
+      ? { costUsd: safeFiniteNonNegative(input.usage.costUsd) }
+      : {}),
+  } : undefined;
+  return {
+    status: input.status,
+    ...(resultText ? { summary: resultText } : {}),
+    ...(input.error ? { error: input.error } : {}),
+    sources: input.sources || [],
+    artifacts: input.artifacts || [],
+    warnings: input.warnings || [],
+    ...(usage && Object.keys(usage).length > 0 ? { usage } : {}),
+    provenance: {
+      logicalRunId: run.logical_run_id,
+      attemptId: run.id,
+      attemptNumber: run.attempt_number,
+      ...(run.provider_id ? { requestedProviderId: run.provider_id } : {}),
+      ...(run.requested_model ? { requestedModel: run.requested_model } : {}),
+      ...(effectiveProviderId ? { effectiveProviderId } : {}),
+      ...(effectiveModel ? { effectiveModel } : {}),
+      factSource: 'sqlite.subagent_runs',
+    },
+  };
+}
+
+/**
+ * Create the durable running fact before a managed child is launched.
+ *
+ * The parent session FK is deliberate: if the parent chat does not exist, the
+ * child must not run without an auditable owner. Callers should fail closed.
+ */
+export function startSubagentRun(input: StartSubagentRunInput): SubagentRunRecord {
+  const db = getDb();
+  const logicalRunId = normalizeLogicalRunId(input.logicalRunId, input.id);
+  const workflowId = normalizeSubagentWorkflowKey(input.workflowId, 'workflow_id');
+  const taskKey = normalizeSubagentWorkflowKey(input.taskKey, 'task_key');
+  const dependencyTaskKeys = [...new Set(input.dependencyTaskKeys || [])].map(
+    key => normalizeSubagentWorkflowKey(key, 'task_key'),
+  );
+  if ((workflowId && !taskKey) || (!workflowId && taskKey)) {
+    throw new Error('workflow_id and task_key must be provided together.');
+  }
+  if (dependencyTaskKeys.length > 0 && (!workflowId || !taskKey)) {
+    throw new Error('Dependent Sub-agent tasks require workflow_id and task_key.');
+  }
+  if (taskKey && dependencyTaskKeys.includes(taskKey)) {
+    throw new Error('A Sub-agent task cannot depend on itself.');
+  }
+  const dispatchState = dependencyTaskKeys.length > 0 ? 'queued' : 'executing';
+  const initialActivity = dependencyTaskKeys.length > 0
+    ? `Waiting for dependencies: ${dependencyTaskKeys.join(', ')}`.slice(0, 500)
+    : 'Starting Sub-agent';
+  const now = subagentTimestamp();
+  db.transaction(() => {
+    const latest = input.logicalRunId
+      ? db.prepare(`
+          SELECT id, status, phase, terminal
+          FROM subagent_runs
+          WHERE parent_session_id = ? AND logical_run_id = ?
+          ORDER BY attempt_number DESC, rowid DESC
+          LIMIT 1
+        `).get(input.parentSessionId, logicalRunId) as Pick<
+          SubagentRunRecord,
+          'id' | 'status' | 'phase' | 'terminal'
+        > | undefined
+      : undefined;
+    if (latest?.terminal === 0) {
+      throw new SubagentLogicalRunConflictError(
+        'LOGICAL_RUN_STILL_RUNNING',
+        logicalRunId,
+        latest.id,
+        latest.status,
+        latest.phase,
+      );
+    }
+    if (latest?.status === 'completed') {
+      throw new SubagentLogicalRunConflictError(
+        'LOGICAL_RUN_ALREADY_COMPLETED',
+        logicalRunId,
+        latest.id,
+        latest.status,
+        latest.phase,
+      );
+    }
+    if (workflowId && taskKey) {
+      const existingTask = db.prepare(`
+        SELECT id, logical_run_id, status, phase
+        FROM subagent_runs
+        WHERE parent_session_id = ?
+          AND workflow_id = ?
+          AND task_key = ?
+        ORDER BY attempt_number DESC, rowid DESC
+        LIMIT 1
+      `).get(input.parentSessionId, workflowId, taskKey) as Pick<
+        SubagentRunRecord,
+        'id' | 'logical_run_id' | 'status' | 'phase'
+      > | undefined;
+      const isExplicitRetry = Boolean(
+        input.logicalRunId
+        && existingTask
+        && existingTask.logical_run_id === logicalRunId,
+      );
+      if (existingTask && !isExplicitRetry) {
+        throw new SubagentLogicalRunConflictError(
+          'DUPLICATE_TASK_KEY',
+          `${workflowId}:${taskKey}`,
+          existingTask.id,
+          existingTask.status,
+          existingTask.phase,
+        );
+      }
+      assertNoSubagentWorkflowCycle(
+        db,
+        input.parentSessionId,
+        workflowId,
+        taskKey,
+        dependencyTaskKeys,
+      );
+    }
+    const previous = db.prepare(`
+      SELECT COALESCE(MAX(attempt_number), 0) AS max_attempt
+      FROM subagent_runs
+      WHERE parent_session_id = ? AND logical_run_id = ?
+    `).get(input.parentSessionId, logicalRunId) as { max_attempt: number };
+    const attemptNumber = previous.max_attempt + 1;
+    db.prepare(`
+      INSERT INTO subagent_runs (
+        id,
+        logical_run_id,
+        attempt_number,
+        parent_session_id,
+        runtime,
+        tool_name,
+        agent_name,
+        provider_id,
+        requested_model,
+        workflow_id,
+        task_key,
+        dependencies_json,
+        dispatch_state,
+        prompt,
+        status,
+        phase,
+        terminal,
+        current_activity,
+        last_activity_at,
+        created_at,
+        updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', 'running', 0, ?, ?, ?, ?)
+    `).run(
+      input.id,
+      logicalRunId,
+      attemptNumber,
+      input.parentSessionId,
+      input.runtime,
+      input.toolName,
+      input.agentName,
+      input.providerId || '',
+      input.requestedModel || '',
+      workflowId,
+      taskKey,
+      JSON.stringify(dependencyTaskKeys),
+      dispatchState,
+      input.prompt || '',
+      initialActivity,
+      now,
+      now,
+      now,
+    );
+    const run = db.prepare('SELECT * FROM subagent_runs WHERE id = ?')
+      .get(input.id) as SubagentRunRecord;
+    insertSubagentRunEvent(db, run, {
+      type: 'started',
+      activity: initialActivity,
+      payload: {
+        requestedProviderId: input.providerId || undefined,
+        requestedModel: input.requestedModel || undefined,
+        attemptNumber,
+        workflowId: workflowId || undefined,
+        taskKey: taskKey || undefined,
+        dependencies: dependencyTaskKeys,
+        dispatchState,
+      },
+    }, now);
+  })();
+  return getSubagentRun(input.id)!;
+}
+
+export function getSubagentRun(id: string): SubagentRunRecord | undefined {
+  return getDb()
+    .prepare('SELECT * FROM subagent_runs WHERE id = ?')
+    .get(id) as SubagentRunRecord | undefined;
+}
+
+export function getLatestSubagentRunByWorkflowTask(
+  parentSessionId: string,
+  workflowId: string,
+  taskKey: string,
+): SubagentRunRecord | undefined {
+  return getDb().prepare(`
+    SELECT *
+    FROM subagent_runs
+    WHERE parent_session_id = ?
+      AND workflow_id = ?
+      AND task_key = ?
+    ORDER BY attempt_number DESC, rowid DESC
+    LIMIT 1
+  `).get(parentSessionId, workflowId, taskKey) as SubagentRunRecord | undefined;
+}
+
+export function markSubagentRunExecuting(
+  id: string,
+  activity = 'Starting Sub-agent',
+): SubagentRunRecord | undefined {
+  const db = getDb();
+  const now = subagentTimestamp();
+  const boundedActivity = activity.slice(0, 500);
+  db.transaction(() => {
+    const run = db.prepare('SELECT * FROM subagent_runs WHERE id = ?')
+      .get(id) as SubagentRunRecord | undefined;
+    if (!run || run.terminal === 1) return;
+    db.prepare(`
+      UPDATE subagent_runs
+      SET dispatch_state = 'executing',
+          current_activity = ?,
+          last_activity_at = ?,
+          updated_at = ?
+      WHERE id = ? AND terminal = 0
+    `).run(boundedActivity, now, now, id);
+    insertSubagentRunEvent(db, run, {
+      type: 'activity',
+      activity: boundedActivity,
+      payload: { dispatchState: 'executing' },
+      coalesceKey: 'dispatch-state',
+    }, now);
+  })();
+  return getSubagentRun(id);
+}
+
+export function listSubagentRuns(
+  parentSessionId: string,
+  options?: { limit?: number },
+): SubagentRunRecord[] {
+  const requestedLimit = options?.limit ?? 10;
+  const limit = Math.max(1, Math.min(20, Math.trunc(requestedLimit) || 10));
+  return getDb()
+    .prepare(`
+      SELECT *
+      FROM subagent_runs
+      WHERE parent_session_id = ?
+      ORDER BY created_at DESC, rowid DESC
+      LIMIT ?
+    `)
+    .all(parentSessionId, limit) as SubagentRunRecord[];
+}
+
+/** Latest physical attempt for each logical task, for parent/UI summaries. */
+export function listLatestSubagentRuns(
+  parentSessionId: string,
+  options?: { limit?: number },
+): SubagentRunRecord[] {
+  const requestedLimit = options?.limit ?? 10;
+  const limit = Math.max(1, Math.min(20, Math.trunc(requestedLimit) || 10));
+  return getDb().prepare(`
+    SELECT run.*
+    FROM subagent_runs AS run
+    INNER JOIN (
+      SELECT logical_run_id, MAX(attempt_number) AS latest_attempt
+      FROM subagent_runs
+      WHERE parent_session_id = ?
+      GROUP BY logical_run_id
+    ) AS latest
+      ON latest.logical_run_id = run.logical_run_id
+     AND latest.latest_attempt = run.attempt_number
+    WHERE run.parent_session_id = ?
+    ORDER BY run.updated_at DESC, run.rowid DESC
+    LIMIT ?
+  `).all(parentSessionId, parentSessionId, limit) as SubagentRunRecord[];
+}
+
+export function listSubagentRunAttempts(
+  parentSessionId: string,
+  logicalRunId: string,
+): SubagentRunRecord[] {
+  return getDb().prepare(`
+    SELECT *
+    FROM subagent_runs
+    WHERE parent_session_id = ? AND logical_run_id = ?
+    ORDER BY attempt_number ASC, rowid ASC
+  `).all(parentSessionId, logicalRunId) as SubagentRunRecord[];
+}
+
+export function listSubagentRunEvents(
+  parentSessionId: string,
+  logicalRunId: string,
+  options?: { limit?: number; afterCursor?: number },
+): SubagentRunEventRecord[] {
+  const requestedLimit = options?.limit ?? SUBAGENT_RUN_EVENT_LIMIT_PER_ATTEMPT;
+  const limit = Math.max(
+    1,
+    Math.min(SUBAGENT_RUN_EVENT_LIMIT_PER_ATTEMPT, Math.trunc(requestedLimit) || 100),
+  );
+  const afterCursor = Math.max(0, Math.trunc(options?.afterCursor || 0));
+  const db = getDb();
+  if (afterCursor > 0) {
+    return db.prepare(`
+      SELECT event.*
+      FROM subagent_run_events AS event
+      INNER JOIN subagent_runs AS run ON run.id = event.run_id
+      WHERE run.parent_session_id = ?
+        AND event.logical_run_id = ?
+        AND event.cursor > ?
+      ORDER BY event.cursor ASC
+      LIMIT ?
+    `).all(parentSessionId, logicalRunId, afterCursor, limit) as SubagentRunEventRecord[];
+  }
+  const rows = db.prepare(`
+    SELECT event.*
+    FROM subagent_run_events AS event
+    INNER JOIN subagent_runs AS run ON run.id = event.run_id
+    WHERE run.parent_session_id = ? AND event.logical_run_id = ?
+    ORDER BY event.cursor DESC
+    LIMIT ?
+  `).all(parentSessionId, logicalRunId, limit) as SubagentRunEventRecord[];
+  return rows.reverse();
+}
+
+export function recordSubagentRunEvent(
+  id: string,
+  input: RecordSubagentRunEventInput,
+): SubagentRunEventRecord | undefined {
+  const db = getDb();
+  const now = subagentTimestamp();
+  let event: SubagentRunEventRecord | undefined;
+  db.transaction(() => {
+    const run = db.prepare('SELECT * FROM subagent_runs WHERE id = ?')
+      .get(id) as SubagentRunRecord | undefined;
+    if (!run || run.terminal === 1) return;
+    const activity = input.activity?.slice(0, 500) || '';
+    db.prepare(`
+      UPDATE subagent_runs
+      SET current_activity = CASE WHEN ? = '' THEN current_activity ELSE ? END,
+          last_activity_at = ?,
+          updated_at = ?
+      WHERE id = ? AND terminal = 0
+    `).run(activity, activity, now, now, id);
+    event = insertSubagentRunEvent(db, run, {
+      ...input,
+      activity,
+    }, now);
+  })();
+  return event;
+}
+
+export function markSubagentRunSettling(
+  id: string,
+  activity = 'Finalizing Sub-agent result',
+): SubagentRunRecord | undefined {
+  const db = getDb();
+  const now = subagentTimestamp();
+  db.transaction(() => {
+    const run = db.prepare('SELECT * FROM subagent_runs WHERE id = ?')
+      .get(id) as SubagentRunRecord | undefined;
+    if (!run || run.terminal === 1) return;
+    db.prepare(`
+      UPDATE subagent_runs
+      SET phase = 'settling',
+          dispatch_state = 'settling',
+          current_activity = ?,
+          last_activity_at = ?,
+          updated_at = ?
+      WHERE id = ? AND terminal = 0
+    `).run(activity.slice(0, 500), now, now, id);
+    insertSubagentRunEvent(db, run, {
+      type: 'settling',
+      activity: activity.slice(0, 500),
+      coalesceKey: 'settling',
+    }, now);
+  })();
+  return getSubagentRun(id);
+}
+
+/**
+ * Persist bounded in-flight child output/model facts without manufacturing a
+ * terminal state. A late checkpoint after the first terminal update is a no-op.
+ */
+export function checkpointSubagentRun(
+  id: string,
+  input: CheckpointSubagentRunInput,
+): SubagentRunRecord | undefined {
+  const db = getDb();
+  const now = subagentTimestamp();
+  const hasResultText = input.resultText !== undefined;
+  const hasEffectiveProviderId = (
+    input.effectiveProviderId !== undefined
+    && input.effectiveProviderId !== ''
+  );
+  const hasEffectiveModel = input.effectiveModel !== undefined && input.effectiveModel !== '';
+  const activity = input.currentActivity?.slice(0, 500) || '';
+  const resultText = hasResultText
+    ? (input.resultText || '').slice(-SUBAGENT_RUN_CHECKPOINT_MAX_CHARS)
+    : '';
+  db.prepare(`
+    UPDATE subagent_runs
+    SET
+      result_text = CASE WHEN ? = 1 THEN ? ELSE result_text END,
+      effective_provider_id = CASE WHEN ? = 1 THEN ? ELSE effective_provider_id END,
+      effective_model = CASE WHEN ? = 1 THEN ? ELSE effective_model END,
+      current_activity = CASE WHEN ? = '' THEN current_activity ELSE ? END,
+      last_activity_at = ?,
+      updated_at = ?
+    WHERE id = ? AND terminal = 0
+  `).run(
+    hasResultText ? 1 : 0,
+    resultText,
+    hasEffectiveProviderId ? 1 : 0,
+    input.effectiveProviderId || '',
+    hasEffectiveModel ? 1 : 0,
+    input.effectiveModel || '',
+    activity,
+    activity,
+    now,
+    now,
+    id,
+  );
+  if (hasResultText) {
+    recordSubagentRunEvent(id, {
+      type: 'partial_result',
+      activity: activity || 'Generating Sub-agent result',
+      payload: { chars: resultText.length },
+      coalesceKey: 'partial-result',
+    });
+  }
+  return getSubagentRun(id);
+}
+
+/**
+ * Move a running run to one immutable terminal state.
+ *
+ * The `terminal = 0` predicate prevents late/duplicate events from rewriting a
+ * completed run. The existing row is returned even when this call lost that
+ * race, so callers can continue using the first terminal fact.
+ */
+export function settleSubagentRun(
+  id: string,
+  input: SettleSubagentRunInput,
+): SubagentRunRecord | undefined {
+  const db = getDb();
+  const now = subagentTimestamp();
+  const errorJson = input.error ? JSON.stringify(input.error) : '';
+  db.transaction(() => {
+    const run = db.prepare('SELECT * FROM subagent_runs WHERE id = ?')
+      .get(id) as SubagentRunRecord | undefined;
+    if (!run || run.terminal === 1) return;
+    const resultText = input.resultText === undefined ? run.result_text : input.resultText;
+    const effectiveProviderId = input.effectiveProviderId || run.effective_provider_id;
+    const effectiveModel = input.effectiveModel || run.effective_model;
+    const structured = buildDelegatedAgentResult(
+      run,
+      input,
+      resultText,
+      effectiveProviderId,
+      effectiveModel,
+    );
+    db.prepare(`
+      UPDATE subagent_runs
+      SET
+        status = ?,
+        phase = 'terminal',
+        dispatch_state = 'terminal',
+        terminal = 1,
+        result_text = ?,
+        result_json = ?,
+        effective_provider_id = ?,
+        effective_model = ?,
+        current_activity = ?,
+        last_activity_at = ?,
+        error_json = ?,
+        updated_at = ?,
+        completed_at = ?
+      WHERE id = ? AND terminal = 0
+    `).run(
+      input.status,
+      resultText,
+      JSON.stringify(structured),
+      effectiveProviderId,
+      effectiveModel,
+      `Sub-agent ${input.status}`,
+      now,
+      errorJson,
+      now,
+      now,
+      id,
+    );
+    insertSubagentRunEvent(db, run, {
+      type: 'terminal',
+      activity: `Sub-agent ${input.status}`,
+      payload: {
+        status: input.status,
+        error: input.error,
+      },
+      coalesceKey: 'terminal',
+    }, now);
+  })();
+  return getSubagentRun(id);
+}
+
+/**
+ * Converge every foreground child owned by a stopped parent session.
+ *
+ * Runtime adapters still receive their AbortSignal so subprocesses/turns can
+ * stop naturally. This database barrier is independent of whether a parent
+ * SDK waits for an in-flight tool handler to return: once Stop is accepted,
+ * no child capsule may remain queued/running indefinitely.
+ */
+export function cancelSubagentRunsForParentSession(
+  parentSessionId: string,
+  message = 'Parent turn stopped before the Sub-agent reached a terminal result.',
+): string[] {
+  const db = getDb();
+  const cancelledIds: string[] = [];
+  const now = subagentTimestamp();
+  db.transaction(() => {
+    const runs = db.prepare(`
+      SELECT *
+      FROM subagent_runs
+      WHERE parent_session_id = ? AND terminal = 0
+      ORDER BY created_at ASC, rowid ASC
+    `).all(parentSessionId) as SubagentRunRecord[];
+    for (const run of runs) {
+      const resultText = run.result_text || message;
+      const structured = buildDelegatedAgentResult(
+        run,
+        {
+          status: 'cancelled',
+          resultText,
+        },
+        resultText,
+        run.effective_provider_id,
+        run.effective_model,
+      );
+      const updated = db.prepare(`
+        UPDATE subagent_runs
+        SET status = 'cancelled',
+            phase = 'terminal',
+            dispatch_state = 'terminal',
+            terminal = 1,
+            result_text = ?,
+            result_json = ?,
+            current_activity = 'Sub-agent cancelled',
+            last_activity_at = ?,
+            error_json = '',
+            updated_at = ?,
+            completed_at = ?
+        WHERE id = ? AND terminal = 0
+      `).run(
+        resultText,
+        JSON.stringify(structured),
+        now,
+        now,
+        now,
+        run.id,
+      );
+      if (updated.changes !== 1) continue;
+      cancelledIds.push(run.id);
+      insertSubagentRunEvent(db, run, {
+        type: 'terminal',
+        activity: 'Sub-agent cancelled',
+        payload: {
+          status: 'cancelled',
+          source: 'parent_stop',
+        },
+        coalesceKey: 'terminal',
+      }, now);
+    }
+  })();
+  return cancelledIds;
 }
 
 // ==========================================
@@ -1452,16 +3096,20 @@ export function addMessage(
   role: 'user' | 'assistant',
   content: string,
   tokenUsage?: string | null,
-  metadata?: { task_run_id?: string | null },
+  metadata?: {
+    task_run_id?: string | null;
+    stream_status?: 'streaming' | 'completed' | 'interrupted' | 'error';
+  },
 ): Message {
   const db = getDb();
   const id = crypto.randomBytes(16).toString('hex');
   const now = new Date().toISOString().replace('T', ' ').split('.')[0];
   const taskRunId = metadata?.task_run_id ?? null;
+  const streamStatus = metadata?.stream_status ?? 'completed';
 
   db.prepare(
-    'INSERT INTO messages (id, session_id, role, content, created_at, token_usage, task_run_id) VALUES (?, ?, ?, ?, ?, ?, ?)'
-  ).run(id, sessionId, role, content, now, tokenUsage || null, taskRunId);
+    'INSERT INTO messages (id, session_id, role, content, created_at, token_usage, task_run_id, stream_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(id, sessionId, role, content, now, tokenUsage || null, taskRunId, streamStatus);
 
   updateSessionTimestamp(sessionId);
 
@@ -1472,6 +3120,252 @@ export function updateMessageContent(messageId: string, content: string): number
   const db = getDb();
   const result = db.prepare('UPDATE messages SET content = ? WHERE id = ?').run(content, messageId);
   return result.changes;
+}
+
+/**
+ * Update the single durable row owned by an assistant stream collector.
+ * Checkpoints and terminal writes share the same message id, preventing a
+ * refresh-recovered partial row from becoming a duplicate final response.
+ */
+export function updateMessageStreamCheckpoint(
+  messageId: string,
+  content: string,
+  status: 'streaming' | 'completed' | 'interrupted' | 'error',
+  tokenUsage?: string | null,
+): number {
+  const db = getDb();
+  const result = db.prepare(
+    'UPDATE messages SET content = ?, stream_status = ?, token_usage = ? WHERE id = ? AND role = ?'
+  ).run(content, status, tokenUsage || null, messageId, 'assistant');
+  return result.changes;
+}
+
+/**
+ * Settle a collector-owned row without allowing a stale stream to append newer
+ * content after its session lock was superseded.
+ */
+export function updateMessageStreamStatus(
+  messageId: string,
+  status: 'completed' | 'interrupted' | 'error',
+): number {
+  const db = getDb();
+  return db.prepare(
+    "UPDATE messages SET stream_status = ? WHERE id = ? AND role = 'assistant' AND stream_status = 'streaming'"
+  ).run(status, messageId).changes;
+}
+
+/**
+ * Startup recovery for a process that died between assistant checkpoints.
+ * Exported so the exact production recovery operation can be exercised against
+ * an isolated test database without restarting the test worker.
+ */
+export function recoverInterruptedMessageStreams(dbInstance: Database.Database = getDb()): number {
+  return dbInstance.prepare(
+    "UPDATE messages SET stream_status = 'interrupted' WHERE role = 'assistant' AND stream_status = 'streaming'"
+  ).run().changes;
+}
+
+/**
+ * Recover runtime-owned state after the previous CodePilot server process died.
+ *
+ * This must never run as part of schema initialization: Next.js may evaluate
+ * separate route bundles with separate module instances while another request
+ * is still streaming. Re-running this sweep from `initDb()` used to abort live
+ * permissions, interrupt checkpoints, and delete their session locks.
+ */
+export function recoverRuntimeStateAfterProcessRestart(
+  dbInstance: Database.Database = getDb(),
+): void {
+  dbInstance.transaction(() => {
+    dbInstance.exec(`
+      UPDATE media_jobs
+      SET status = 'paused', updated_at = datetime('now')
+      WHERE status = 'running'
+    `);
+    dbInstance.exec(`
+      UPDATE media_job_items
+      SET status = 'pending', updated_at = datetime('now')
+      WHERE status = 'processing'
+    `);
+    dbInstance.exec(`
+      UPDATE chat_sessions
+      SET runtime_status = 'idle',
+          runtime_error = 'Process restarted',
+          runtime_updated_at = datetime('now')
+      WHERE runtime_status IN ('running', 'streaming', 'waiting_permission')
+    `);
+    recoverInterruptedMessageStreams(dbInstance);
+    dbInstance.exec('DELETE FROM session_runtime_locks');
+    dbInstance.exec(`
+      UPDATE permission_requests
+      SET status = 'aborted',
+          resolved_at = datetime('now'),
+          message = 'Process restarted'
+      WHERE status = 'pending'
+    `);
+    const interruptedRuns = dbInstance.prepare(
+      'SELECT * FROM subagent_runs WHERE terminal = 0',
+    ).all() as SubagentRunRecord[];
+    const recoveryError: SubagentStatusError = {
+      code: 'RUNTIME_ERROR',
+      retryable: true,
+    };
+    const recoveryMessage = 'Process restarted before the Sub-agent reached a durable terminal state.';
+    const now = subagentTimestamp();
+    for (const run of interruptedRuns) {
+      const structured = buildDelegatedAgentResult(
+        run,
+        {
+          status: 'failed',
+          resultText: run.result_text,
+          error: recoveryError,
+        },
+        run.result_text,
+        run.effective_provider_id,
+        run.effective_model,
+      );
+      dbInstance.prepare(`
+        UPDATE subagent_runs
+        SET status = 'failed',
+            phase = 'terminal',
+            dispatch_state = 'terminal',
+            terminal = 1,
+            result_json = ?,
+            current_activity = 'Sub-agent failed',
+            last_activity_at = ?,
+            error_json = ?,
+            updated_at = ?,
+            completed_at = ?
+        WHERE id = ? AND terminal = 0
+      `).run(
+        JSON.stringify(structured),
+        now,
+        JSON.stringify({ ...recoveryError, message: recoveryMessage }),
+        now,
+        now,
+        run.id,
+      );
+      insertSubagentRunEvent(dbInstance, run, {
+        type: 'terminal',
+        activity: 'Sub-agent failed',
+        payload: {
+          status: 'failed',
+          error: { ...recoveryError, message: recoveryMessage },
+          recoveredAfterRestart: true,
+        },
+        coalesceKey: 'terminal',
+      }, now);
+    }
+  })();
+}
+
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+function readRuntimeOwner(): RuntimeOwnerRecord | undefined {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(RUNTIME_OWNER_PATH, 'utf8')) as Partial<RuntimeOwnerRecord>;
+    if (
+      typeof parsed.pid === 'number'
+      && typeof parsed.token === 'string'
+      && typeof parsed.claimedAt === 'string'
+    ) {
+      return parsed as RuntimeOwnerRecord;
+    }
+  } catch {
+    // Missing/corrupt owner is treated as stale and replaced under the lock.
+  }
+  return undefined;
+}
+
+function writeRuntimeOwner(owner: RuntimeOwnerRecord): void {
+  // The runtime-owner lock is held by the caller, so a direct replacement is
+  // cross-platform safe (Windows rename cannot atomically replace an existing
+  // file). A torn write can only happen if this process dies; the next process
+  // treats the corrupt record as stale and performs recovery.
+  fs.writeFileSync(RUNTIME_OWNER_PATH, JSON.stringify(owner), {
+    encoding: 'utf8',
+    mode: 0o600,
+  });
+}
+
+function withRuntimeOwnerLock<T>(fn: () => T): T {
+  const maxWait = 10_000;
+  const startedAt = Date.now();
+  while (true) {
+    try {
+      const fd = fs.openSync(
+        RUNTIME_OWNER_LOCK_PATH,
+        fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY,
+        0o600,
+      );
+      fs.closeSync(fd);
+      try {
+        return fn();
+      } finally {
+        try { fs.unlinkSync(RUNTIME_OWNER_LOCK_PATH); } catch { /* ignore */ }
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      if (Date.now() - startedAt > maxWait) {
+        try { fs.unlinkSync(RUNTIME_OWNER_LOCK_PATH); } catch { /* ignore */ }
+        continue;
+      }
+      const waitUntil = Date.now() + 50 + Math.random() * 100;
+      while (Date.now() < waitUntil) { /* sync DB initialization */ }
+    }
+  }
+}
+
+function shouldSkipAutomaticRuntimeRecovery(): boolean {
+  if (process.env.CODEPILOT_DISABLE_DB_MIGRATION_IN_TESTS === '1') return true;
+  if (process.env.NEXT_PHASE === 'phase-production-build') return true;
+  return process.env.npm_lifecycle_event === 'build'
+    || process.env.npm_lifecycle_event === 'electron:build';
+}
+
+/**
+ * Claim the DB runtime owner once per live CodePilot server process.
+ *
+ * Multiple Next route/module instances share the claim through the owner file.
+ * A live PID always wins fail-closed: another module must not "recover" state
+ * that process may still own. A dead/missing PID is the only automatic signal
+ * that permits the destructive recovery sweep.
+ */
+export function runRuntimeStartupRecoveryOnce(
+  dbInstance: Database.Database = getDb(),
+): boolean {
+  if (shouldSkipAutomaticRuntimeRecovery()) return false;
+  const state = getDatabaseProcessState();
+  if (state.runtimeOwnerToken) return false;
+
+  return withRuntimeOwnerLock(() => {
+    const existing = readRuntimeOwner();
+    if (existing && isProcessAlive(existing.pid)) {
+      if (existing.pid === process.pid) {
+        state.runtimeOwnerToken = existing.token;
+      }
+      return false;
+    }
+
+    const owner: RuntimeOwnerRecord = {
+      pid: process.pid,
+      token: crypto.randomBytes(16).toString('hex'),
+      claimedAt: new Date().toISOString(),
+    };
+    writeRuntimeOwner(owner);
+    state.runtimeOwnerToken = owner.token;
+    recoverRuntimeStateAfterProcessRestart(dbInstance);
+    return true;
+  });
 }
 
 export function updateMessageHeartbeatAck(messageId: string, isAck: boolean): void {
@@ -1677,6 +3571,25 @@ export function setSetting(key: string, value: string): void {
   ).run(key, value);
 }
 
+/**
+ * Commit a setting only while it is still absent or blank.
+ *
+ * Default-assistant bootstrap uses this as its commit point. Filesystem
+ * initialization may race with an explicit Settings save, but the user's
+ * explicit non-blank value always wins because this decision is made by one
+ * SQLite statement instead of a read-then-write pair in application code.
+ */
+export function compareAndSetSettingIfBlank(key: string, value: string): boolean {
+  const db = getDb();
+  const result = db.prepare(`
+    INSERT INTO settings (key, value)
+    VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    WHERE trim(settings.value) = ''
+  `).run(key, value);
+  return result.changes === 1;
+}
+
 export function getAllSettings(): SettingsMap {
   const db = getDb();
   const rows = db.prepare('SELECT key, value FROM settings').all() as { key: string; value: string }[];
@@ -1790,19 +3703,152 @@ export function syncSdkTasks(
 // API Provider Operations
 // ==========================================
 
+interface ApiProviderStorageRow extends ApiProvider {
+  api_key_ciphertext: string;
+  api_key_storage: string;
+}
+
+interface StoredProviderSecret {
+  plaintext: string;
+  ciphertext: string;
+  storage: string;
+}
+
+const providerSecretErrors = new Map<string, string>();
+
+function providerSecretErrorCode(error: unknown): string {
+  if (!(error instanceof Error)) return 'provider_secret_unknown_error';
+  if (error.message.startsWith('provider_secret_')) return error.message;
+  return 'provider_secret_decrypt_failed';
+}
+
+function encodeProviderSecret(providerId: string, plaintext: string): StoredProviderSecret {
+  if (!plaintext) return { plaintext: '', ciphertext: '', storage: 'none' };
+  const environment = getProviderSecretEnvironmentStatus();
+  if (!environment.available) {
+    return { plaintext, ciphertext: '', storage: 'legacy_plaintext' };
+  }
+
+  const ciphertext = encryptProviderSecret(providerId, plaintext);
+  if (decryptProviderSecret(providerId, ciphertext) !== plaintext) {
+    throw new Error('provider_secret_roundtrip_failed');
+  }
+  return {
+    plaintext: '',
+    ciphertext,
+    storage: providerSecretStorageKind(),
+  };
+}
+
+function materializeProvider(row: ApiProviderStorageRow | undefined): ApiProvider | undefined {
+  if (!row) return undefined;
+  const { api_key_ciphertext: ciphertext, ...provider } = row;
+  // A non-empty plaintext column means migration did not complete or an older
+  // build wrote a newer key after rollback. In that mixed state the plaintext
+  // is the current user value; trusting the ciphertext can resurrect a stale
+  // key or make the provider unusable after moving the database to a machine
+  // with a different data-encryption key.
+  if (provider.api_key) return provider;
+  if (!ciphertext) return provider;
+  try {
+    provider.api_key = decryptProviderSecret(row.id, ciphertext);
+    providerSecretErrors.delete(row.id);
+  } catch (error) {
+    // Fail closed: a corrupt or inaccessible encrypted secret must never fall
+    // back to a stale plaintext column or leak ciphertext through the API.
+    provider.api_key = '';
+    providerSecretErrors.set(row.id, providerSecretErrorCode(error));
+  }
+  return provider;
+}
+
+/**
+ * Encrypt legacy plaintext provider keys in one transaction. Plaintext is
+ * cleared only after an authenticated decrypt round-trip succeeds.
+ */
+export function migrateProviderSecrets(db: Database.Database): number {
+  if (!getProviderSecretEnvironmentStatus().available) return 0;
+  const rows = db.prepare(
+    "SELECT id, api_key, api_key_ciphertext FROM api_providers WHERE api_key != ''",
+  ).all() as Array<{ id: string; api_key: string; api_key_ciphertext: string }>;
+  if (rows.length === 0) return 0;
+
+  const update = db.prepare(
+    "UPDATE api_providers SET api_key = '', api_key_ciphertext = ?, api_key_storage = ?, updated_at = datetime('now') WHERE id = ?",
+  );
+  let migrated = 0;
+  const transaction = db.transaction(() => {
+    for (const row of rows) {
+      try {
+        // Plaintext is authoritative whenever it exists. Always create a fresh
+        // envelope instead of trusting a ciphertext that may belong to an
+        // older key or another machine.
+        const ciphertext = encryptProviderSecret(row.id, row.api_key);
+        if (decryptProviderSecret(row.id, ciphertext) !== row.api_key) {
+          throw new Error('provider_secret_migration_verification_failed');
+        }
+        update.run(ciphertext, providerSecretStorageKind(), row.id);
+        providerSecretErrors.delete(row.id);
+        migrated += 1;
+      } catch (error) {
+        // One damaged row must not abort getDb()/application startup. Keep its
+        // plaintext intact so the user can still open Settings and repair it,
+        // while diagnostics expose a non-secret error code.
+        providerSecretErrors.set(row.id, providerSecretErrorCode(error));
+      }
+    }
+  });
+  transaction();
+  return migrated;
+}
+
+export interface ProviderSecretStorageDiagnostics {
+  available: boolean;
+  backend: string;
+  securityLevel: string;
+  encryptedProviders: number;
+  legacyPlaintextProviders: number;
+  emptyProviders: number;
+  lastErrorCode: string | null;
+}
+
+export function getProviderSecretStorageDiagnostics(): ProviderSecretStorageDiagnostics {
+  const db = getDb();
+  const counts = db.prepare(`
+    SELECT
+      SUM(CASE WHEN api_key_ciphertext != '' THEN 1 ELSE 0 END) AS encrypted,
+      SUM(CASE WHEN api_key != '' THEN 1 ELSE 0 END) AS legacy,
+      SUM(CASE WHEN api_key = '' AND api_key_ciphertext = '' THEN 1 ELSE 0 END) AS empty
+    FROM api_providers
+  `).get() as { encrypted: number | null; legacy: number | null; empty: number | null };
+  const environment = getProviderSecretEnvironmentStatus();
+  return {
+    available: environment.available,
+    backend: environment.backend,
+    securityLevel: environment.securityLevel,
+    encryptedProviders: counts.encrypted ?? 0,
+    legacyPlaintextProviders: counts.legacy ?? 0,
+    emptyProviders: counts.empty ?? 0,
+    lastErrorCode: providerSecretErrors.values().next().value ?? null,
+  };
+}
+
 export function getAllProviders(): ApiProvider[] {
   const db = getDb();
-  return db.prepare('SELECT * FROM api_providers ORDER BY sort_order ASC, created_at ASC').all() as ApiProvider[];
+  const rows = db.prepare('SELECT * FROM api_providers ORDER BY sort_order ASC, created_at ASC').all() as ApiProviderStorageRow[];
+  return rows.map(row => materializeProvider(row)!);
 }
 
 export function getProvider(id: string): ApiProvider | undefined {
   const db = getDb();
-  return db.prepare('SELECT * FROM api_providers WHERE id = ?').get(id) as ApiProvider | undefined;
+  const row = db.prepare('SELECT * FROM api_providers WHERE id = ?').get(id) as ApiProviderStorageRow | undefined;
+  return materializeProvider(row);
 }
 
 export function getActiveProvider(): ApiProvider | undefined {
   const db = getDb();
-  return db.prepare('SELECT * FROM api_providers WHERE is_active = 1 LIMIT 1').get() as ApiProvider | undefined;
+  const row = db.prepare('SELECT * FROM api_providers WHERE is_active = 1 LIMIT 1').get() as ApiProviderStorageRow | undefined;
+  return materializeProvider(row);
 }
 
 export function createProvider(data: CreateProviderRequest): ApiProvider {
@@ -1813,17 +3859,21 @@ export function createProvider(data: CreateProviderRequest): ApiProvider {
   // Get max sort_order to append at end
   const maxRow = db.prepare('SELECT MAX(sort_order) as max_order FROM api_providers').get() as { max_order: number | null };
   const sortOrder = (maxRow.max_order ?? -1) + 1;
+  const storedSecret = encodeProviderSecret(id, data.api_key || '');
 
   db.prepare(
-    `INSERT INTO api_providers (id, name, provider_type, protocol, base_url, api_key, is_active, sort_order, extra_env, headers_json, env_overrides_json, role_models_json, options_json, notes, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO api_providers (id, name, provider_type, preset_key, protocol, base_url, api_key, api_key_ciphertext, api_key_storage, is_active, sort_order, extra_env, headers_json, env_overrides_json, role_models_json, options_json, notes, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id,
     data.name,
     data.provider_type || 'anthropic',
+    data.preset_key || '',
     data.protocol || '',
     data.base_url || '',
-    data.api_key || '',
+    storedSecret.plaintext,
+    storedSecret.ciphertext,
+    storedSecret.storage,
     0,
     sortOrder,
     data.extra_env || '{}',
@@ -1841,15 +3891,22 @@ export function createProvider(data: CreateProviderRequest): ApiProvider {
 
 export function updateProvider(id: string, data: UpdateProviderRequest): ApiProvider | undefined {
   const db = getDb();
-  const existing = getProvider(id);
+  const existing = db.prepare('SELECT * FROM api_providers WHERE id = ?').get(id) as ApiProviderStorageRow | undefined;
   if (!existing) return undefined;
 
   const now = new Date().toISOString().replace('T', ' ').split('.')[0];
   const name = data.name ?? existing.name;
   const providerType = data.provider_type ?? existing.provider_type;
+  const presetKey = data.preset_key ?? existing.preset_key;
   const protocol = data.protocol ?? existing.protocol;
   const baseUrl = data.base_url ?? existing.base_url;
-  const apiKey = data.api_key ?? existing.api_key;
+  const storedSecret = data.api_key === undefined
+    ? {
+        plaintext: existing.api_key,
+        ciphertext: existing.api_key_ciphertext,
+        storage: existing.api_key_storage,
+      }
+    : encodeProviderSecret(id, data.api_key);
   const extraEnv = data.extra_env ?? existing.extra_env;
   const headersJson = data.headers_json ?? existing.headers_json;
   const envOverridesJson = data.env_overrides_json ?? existing.env_overrides_json;
@@ -1859,10 +3916,10 @@ export function updateProvider(id: string, data: UpdateProviderRequest): ApiProv
   const sortOrder = data.sort_order ?? existing.sort_order;
 
   db.prepare(
-    `UPDATE api_providers SET name = ?, provider_type = ?, protocol = ?, base_url = ?, api_key = ?,
+    `UPDATE api_providers SET name = ?, provider_type = ?, preset_key = ?, protocol = ?, base_url = ?, api_key = ?, api_key_ciphertext = ?, api_key_storage = ?,
      extra_env = ?, headers_json = ?, env_overrides_json = ?, role_models_json = ?, options_json = ?,
      notes = ?, sort_order = ?, updated_at = ? WHERE id = ?`
-  ).run(name, providerType, protocol, baseUrl, apiKey, extraEnv, headersJson, envOverridesJson, roleModelsJson, optionsJson, notes, sortOrder, now, id);
+  ).run(name, providerType, presetKey, protocol, baseUrl, storedSecret.plaintext, storedSecret.ciphertext, storedSecret.storage, extraEnv, headersJson, envOverridesJson, roleModelsJson, optionsJson, notes, sortOrder, now, id);
 
   return getProvider(id);
 }
@@ -1870,6 +3927,7 @@ export function updateProvider(id: string, data: UpdateProviderRequest): ApiProv
 export function deleteProvider(id: string): boolean {
   const db = getDb();
   const result = db.prepare('DELETE FROM api_providers WHERE id = ?').run(id);
+  providerSecretErrors.delete(id);
   return result.changes > 0;
 }
 
@@ -1997,9 +4055,40 @@ export function getAllModelsForProvider(providerId: string): import('@/types').P
  * A row with `enabled=0, enable_source='recommended'` is internally
  * inconsistent — the badge would say "system enabled" while it's hidden.
  */
+/**
+ * The catalog fields these sync helpers propagate into provider_models.
+ * Structural (not an import of CatalogModel) so db.ts stays free of a
+ * provider-catalog dependency; callers pass catalog entries directly.
+ */
+type CatalogSyncModel = {
+  modelId: string;
+  upstreamModelId?: string;
+  displayName: string;
+  capabilities?: Record<string, unknown> | undefined;
+};
+
+/**
+ * Serialize catalog capabilities for the DB, or null meaning "leave the
+ * existing column alone".
+ *
+ * Phase 1 fix (2026-07-17) — before this, both sync paths hard-wrote '{}',
+ * so a materialized GLM/Kimi row shadowed the catalog (models GET and
+ * provider-resolver both let a same-id DB row win) and the picker lost
+ * supportsEffort / supportedEffortLevels / effortNoteKey: the Auto/High/Max
+ * menu silently vanished for exactly the providers Phase 1 added it for.
+ *
+ * A catalog entry with no capabilities returns null rather than '{}': rows
+ * can also carry API-discovered capabilities, and a catalog that is merely
+ * silent must not erase them.
+ */
+function serializeCatalogCapabilities(m: CatalogSyncModel): string | null {
+  if (!m.capabilities || Object.keys(m.capabilities).length === 0) return null;
+  return JSON.stringify(m.capabilities);
+}
+
 export function alignEnabledWithCatalog(
   providerId: string,
-  catalogModels: { modelId: string; upstreamModelId?: string; displayName: string }[],
+  catalogModels: CatalogSyncModel[],
   options: { dryRun?: boolean } = {},
 ): { enabled: number; disabled: number; unchanged: number; inserted: number; pruned: number } {
   if (catalogModels.length === 0) {
@@ -2008,12 +4097,13 @@ export function alignEnabledWithCatalog(
   const db = getDb();
   const catalogByModelId = new Map(catalogModels.map(m => [m.modelId, m]));
   const rows = db
-    .prepare('SELECT model_id, enabled, display_name, upstream_model_id, user_edited, source, enable_source FROM provider_models WHERE provider_id = ?')
+    .prepare('SELECT model_id, enabled, display_name, upstream_model_id, capabilities_json, user_edited, source, enable_source FROM provider_models WHERE provider_id = ?')
     .all(providerId) as {
       model_id: string;
       enabled: number;
       display_name: string;
       upstream_model_id: string;
+      capabilities_json: string | null;
       user_edited: number;
       source: string;
       enable_source: import('@/types').ModelEnableSource;
@@ -2026,8 +4116,8 @@ export function alignEnabledWithCatalog(
   // `kind: 'enable'` always carries the next enable_source so we never
   // produce a row whose enabled/enable_source disagree.
   type Decision =
-    | { kind: 'insert'; modelId: string; upstreamModelId: string; displayName: string; sort_order: number }
-    | { kind: 'enable'; modelId: string; displayName: string; upstreamModelId: string }
+    | { kind: 'insert'; modelId: string; upstreamModelId: string; displayName: string; capabilitiesJson: string | null; sort_order: number }
+    | { kind: 'enable'; modelId: string; displayName: string; upstreamModelId: string; capabilitiesJson: string | null }
     | { kind: 'disable'; modelId: string }
     | { kind: 'prune'; modelId: string };
   const decisions: Decision[] = [];
@@ -2045,6 +4135,7 @@ export function alignEnabledWithCatalog(
         modelId: m.modelId,
         upstreamModelId: m.upstreamModelId || m.modelId,
         displayName: m.displayName || m.modelId,
+        capabilitiesJson: serializeCatalogCapabilities(m),
         sort_order: nextSort,
       });
       inserted++;
@@ -2068,16 +4159,19 @@ export function alignEnabledWithCatalog(
     const shouldEnable = !!catEntry;
     const targetDisplay = catEntry?.displayName || row.model_id;
     const targetUpstream = catEntry?.upstreamModelId || row.model_id;
+    // null = catalog says nothing about capabilities → keep the column as-is.
+    const targetCapabilities = catEntry ? serializeCatalogCapabilities(catEntry) : null;
 
     if (shouldEnable) {
       const fieldsAlreadyMatch = row.enabled === 1
         && row.enable_source === 'recommended'
         && row.display_name === targetDisplay
-        && row.upstream_model_id === targetUpstream;
+        && row.upstream_model_id === targetUpstream
+        && (targetCapabilities === null || row.capabilities_json === targetCapabilities);
       if (fieldsAlreadyMatch) {
         unchanged++;
       } else {
-        decisions.push({ kind: 'enable', modelId: row.model_id, displayName: targetDisplay, upstreamModelId: targetUpstream });
+        decisions.push({ kind: 'enable', modelId: row.model_id, displayName: targetDisplay, upstreamModelId: targetUpstream, capabilitiesJson: targetCapabilities });
         if (row.enabled === 1) unchanged++;
         else enabled++;
       }
@@ -2105,9 +4199,12 @@ export function alignEnabledWithCatalog(
   // to manual_* between phase 1 and phase 2 (race-free in practice
   // because we're in a single sync pass, but cheap belt-and-suspenders)
   // stays untouched.
+  // capabilities_json via COALESCE(?, capabilities_json): a null param leaves
+  // the stored value untouched (catalog silent → don't erase discovered caps).
   const enableStmt = db.prepare(
     `UPDATE provider_models
-     SET enabled = 1, display_name = ?, upstream_model_id = ?, enable_source = 'recommended'
+     SET enabled = 1, display_name = ?, upstream_model_id = ?,
+         capabilities_json = COALESCE(?, capabilities_json), enable_source = 'recommended'
      WHERE provider_id = ? AND model_id = ?
        AND user_edited = 0
        AND enable_source NOT IN ('manual_enabled', 'manual_hidden')`
@@ -2127,7 +4224,7 @@ export function alignEnabledWithCatalog(
   );
   const insertStmt = db.prepare(
     `INSERT INTO provider_models (id, provider_id, model_id, upstream_model_id, display_name, capabilities_json, variants_json, sort_order, enabled, created_at, source, last_refreshed_at, user_edited, enable_source)
-     VALUES (?, ?, ?, ?, ?, '{}', '{}', ?, 1, ?, 'catalog', NULL, 0, 'recommended')`
+     VALUES (?, ?, ?, ?, ?, ?, '{}', ?, 1, ?, 'catalog', NULL, 0, 'recommended')`
   );
   const now = new Date().toISOString().replace('T', ' ').split('.')[0];
 
@@ -2137,11 +4234,12 @@ export function alignEnabledWithCatalog(
         case 'insert':
           insertStmt.run(
             crypto.randomBytes(16).toString('hex'),
-            providerId, d.modelId, d.upstreamModelId, d.displayName, d.sort_order, now,
+            providerId, d.modelId, d.upstreamModelId, d.displayName,
+            d.capabilitiesJson ?? '{}', d.sort_order, now,
           );
           break;
         case 'enable':
-          enableStmt.run(d.displayName, d.upstreamModelId, providerId, d.modelId);
+          enableStmt.run(d.displayName, d.upstreamModelId, d.capabilitiesJson, providerId, d.modelId);
           break;
         case 'disable':
           disableStmt.run(providerId, d.modelId);
@@ -2167,7 +4265,7 @@ export function alignEnabledWithCatalog(
  */
 export function seedCatalogModelsIfEmpty(
   providerId: string,
-  catalogModels: { modelId: string; upstreamModelId?: string; displayName: string }[],
+  catalogModels: CatalogSyncModel[],
 ): number {
   if (catalogModels.length === 0) return 0;
   const db = getDb();
@@ -2179,7 +4277,7 @@ export function seedCatalogModelsIfEmpty(
   const now = new Date().toISOString().replace('T', ' ').split('.')[0];
   const stmt = db.prepare(
     `INSERT INTO provider_models (id, provider_id, model_id, upstream_model_id, display_name, capabilities_json, variants_json, sort_order, enabled, created_at, source, last_refreshed_at, user_edited, enable_source)
-     VALUES (?, ?, ?, ?, ?, '{}', '{}', ?, 1, ?, 'catalog', NULL, 0, 'catalog')`
+     VALUES (?, ?, ?, ?, ?, ?, '{}', ?, 1, ?, 'catalog', NULL, 0, 'catalog')`
   );
   const txn = db.transaction(() => {
     catalogModels.forEach((m, i) => {
@@ -2189,6 +4287,7 @@ export function seedCatalogModelsIfEmpty(
         m.modelId,
         m.upstreamModelId || m.modelId,
         m.displayName || m.modelId,
+        serializeCatalogCapabilities(m) ?? '{}',
         i,
         now,
       );
@@ -2904,6 +5003,25 @@ export function releaseSessionLock(sessionId: string, lockId: string): boolean {
     'DELETE FROM session_runtime_locks WHERE session_id = ? AND lock_id = ?'
   ).run(sessionId, lockId);
   return result.changes > 0;
+}
+
+/**
+ * Read-only ownership check: does `lockId` still own the lock row for
+ * `sessionId`? Pure SELECT — no writes, no side effects.
+ *
+ * Deliberately does NOT check `expires_at`. Ownership (who holds the lock)
+ * and liveness (TTL freshness) are separate concerns. A takeover only ever
+ * happens inside acquireSessionLock, which deletes the stale row and inserts
+ * a new one under a different lockId — so as long as THIS lockId's row still
+ * exists, this lockId is still the owner, even if its TTL has lapsed. Callers
+ * that also care about liveness must check TTL separately.
+ */
+export function isLockOwner(sessionId: string, lockId: string): boolean {
+  const db = getDb();
+  const row = db.prepare(
+    'SELECT 1 FROM session_runtime_locks WHERE session_id = ? AND lock_id = ?'
+  ).get(sessionId, lockId);
+  return !!row;
 }
 
 /**
@@ -3722,6 +5840,9 @@ const ALLOWED_TASK_RUN_STATUSES: ReadonlySet<string> = new Set([
   'failed',
   'waiting_for_permission',
   'cancelled',
+  'skipped_empty',
+  'skipped_reconcile_drift',
+  'blocked',
   // Legacy values still accepted on read; insert path also tolerates
   // them so v6 / Phase 3 Step 3 callers don't break before they're
   // migrated to the 5-state enum.
@@ -3943,6 +6064,7 @@ export function insertNotificationEvent(evt: {
   event_id: string;
   task_id?: string | null;
   session_id?: string | null;
+  action?: { type: string; payload: string } | null;
   source?: 'codepilot' | 'external';
   title: string;
   body: string;
@@ -3951,13 +6073,17 @@ export function insertNotificationEvent(evt: {
   const db = getDb();
   const id = crypto.randomBytes(8).toString('hex');
   db.prepare(
-    `INSERT INTO notification_events (id, event_id, task_id, session_id, source, title, body, priority, status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued')`,
+    `INSERT INTO notification_events (
+       id, event_id, task_id, session_id, action_type, action_payload,
+       source, title, body, priority, status
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')`,
   ).run(
     id,
     evt.event_id,
     evt.task_id ?? null,
     evt.session_id ?? null,
+    evt.action?.type ?? null,
+    evt.action?.payload ?? null,
     evt.source ?? 'codepilot',
     evt.title,
     evt.body,
@@ -4028,11 +6154,16 @@ export function listNotificationDeliveries(eventId: string): Array<{
   error: string | null;
   created_at: string;
   acked_at: string | null;
+  attempt_count: number;
+  last_attempt_at: string | null;
+  next_attempt_at: string | null;
 }> {
   const db = getDb();
   return db
     .prepare(
-      'SELECT id, event_id, channel, status, error, created_at, acked_at FROM notification_deliveries WHERE event_id = ? ORDER BY created_at ASC',
+      `SELECT id, event_id, channel, status, error, created_at, acked_at,
+              attempt_count, last_attempt_at, next_attempt_at
+       FROM notification_deliveries WHERE event_id = ? ORDER BY created_at ASC`,
     )
     .all(eventId) as Array<{
       id: string;
@@ -4042,7 +6173,127 @@ export function listNotificationDeliveries(eventId: string): Array<{
       error: string | null;
       created_at: string;
       acked_at: string | null;
+      attempt_count: number;
+      last_attempt_at: string | null;
+      next_attempt_at: string | null;
     }>;
+}
+
+export interface ClaimedNotificationDelivery {
+  delivery_id: string;
+  event_id: string;
+  channel: string;
+  attempt_count: number;
+  title: string;
+  body: string;
+  priority: 'low' | 'normal' | 'urgent';
+  task_id: string | null;
+  session_id: string | null;
+  action_type: string | null;
+  action_payload: string | null;
+}
+
+/** Atomically lease the oldest claimable delivery for one channel. */
+export function claimNotificationDelivery(args: {
+  channel: string;
+  owner: string;
+  now?: Date;
+  staleAfterMs?: number;
+}): ClaimedNotificationDelivery | null {
+  const db = getDb();
+  const now = args.now ?? new Date();
+  const nowIso = now.toISOString();
+  const staleIso = new Date(now.getTime() - (args.staleAfterMs ?? 30_000)).toISOString();
+  const claim = db.transaction(() => {
+    const candidate = db.prepare(`
+      SELECT d.id
+      FROM notification_deliveries d
+      WHERE d.channel = ?
+        AND d.status = 'queued'
+        AND (d.next_attempt_at IS NULL OR datetime(d.next_attempt_at) <= datetime(?))
+        AND (d.claim_owner IS NULL OR datetime(d.claimed_at) <= datetime(?))
+      ORDER BY datetime(d.created_at) ASC, d.id ASC
+      LIMIT 1
+    `).get(args.channel, nowIso, staleIso) as { id: string } | undefined;
+    if (!candidate) return null;
+
+    const updated = db.prepare(`
+      UPDATE notification_deliveries
+      SET claim_owner = ?, claimed_at = ?, last_attempt_at = ?,
+          attempt_count = attempt_count + 1
+      WHERE id = ?
+        AND status = 'queued'
+        AND (claim_owner IS NULL OR datetime(claimed_at) <= datetime(?))
+    `).run(args.owner, nowIso, nowIso, candidate.id, staleIso);
+    if (updated.changes !== 1) return null;
+
+    return db.prepare(`
+      SELECT d.id AS delivery_id, d.event_id, d.channel, d.attempt_count,
+             e.title, e.body, e.priority, e.task_id, e.session_id,
+             e.action_type, e.action_payload
+      FROM notification_deliveries d
+      JOIN notification_events e ON e.event_id = d.event_id
+      WHERE d.id = ?
+    `).get(candidate.id) as ClaimedNotificationDelivery;
+  });
+  return claim();
+}
+
+/** Settle a leased attempt without expanding the frozen status enum. */
+export function settleClaimedNotificationDelivery(args: {
+  deliveryId: string;
+  owner: string;
+  outcome: 'delivered' | 'error';
+  error?: string | null;
+  retryable?: boolean;
+  now?: Date;
+  maxAttempts?: number;
+}): { written: boolean; status: 'queued' | 'delivered' | 'error' | null } {
+  const db = getDb();
+  const now = args.now ?? new Date();
+  const row = db.prepare(`
+    SELECT status, attempt_count, claim_owner
+    FROM notification_deliveries
+    WHERE id = ?
+  `).get(args.deliveryId) as {
+    status: string;
+    attempt_count: number;
+    claim_owner: string | null;
+  } | undefined;
+  if (!row || row.status !== 'queued' || row.claim_owner !== args.owner) {
+    return { written: false, status: row?.status as 'queued' | 'delivered' | 'error' | null ?? null };
+  }
+
+  if (args.outcome === 'delivered') {
+    const result = db.prepare(`
+      UPDATE notification_deliveries
+      SET status = 'delivered', error = NULL, acked_at = ?,
+          claim_owner = NULL, claimed_at = NULL, next_attempt_at = NULL
+      WHERE id = ? AND status = 'queued' AND claim_owner = ?
+    `).run(now.toISOString(), args.deliveryId, args.owner);
+    return { written: result.changes === 1, status: result.changes === 1 ? 'delivered' : null };
+  }
+
+  const maxAttempts = Math.max(1, args.maxAttempts ?? 3);
+  if (args.retryable && row.attempt_count < maxAttempts) {
+    const backoffMs = Math.min(60_000, 2_000 * (2 ** Math.max(0, row.attempt_count - 1)));
+    const nextAttempt = new Date(now.getTime() + backoffMs).toISOString();
+    const result = db.prepare(`
+      UPDATE notification_deliveries
+      SET error = ?, claim_owner = NULL, claimed_at = NULL,
+          next_attempt_at = ?, acked_at = NULL
+      WHERE id = ? AND status = 'queued' AND claim_owner = ?
+    `).run(args.error ?? 'native notification failed', nextAttempt, args.deliveryId, args.owner);
+    return { written: result.changes === 1, status: result.changes === 1 ? 'queued' : null };
+  }
+
+  const result = db.prepare(`
+    UPDATE notification_deliveries
+    SET status = 'error', error = ?, acked_at = ?,
+        claim_owner = NULL, claimed_at = NULL, next_attempt_at = NULL
+    WHERE id = ? AND status = 'queued' AND claim_owner = ?
+  `).run(args.error ?? 'native notification failed', now.toISOString(), args.deliveryId, args.owner);
+  return { written: result.changes === 1, status: result.changes === 1 ? 'error' : null };
 }
 
 export function getNotificationEvent(eventId: string): {
@@ -4050,6 +6301,8 @@ export function getNotificationEvent(eventId: string): {
   event_id: string;
   task_id: string | null;
   session_id: string | null;
+  action_type: string | null;
+  action_payload: string | null;
   source: string;
   title: string;
   body: string;
@@ -4060,7 +6313,9 @@ export function getNotificationEvent(eventId: string): {
   const db = getDb();
   return db
     .prepare(
-      'SELECT id, event_id, task_id, session_id, source, title, body, priority, status, created_at FROM notification_events WHERE event_id = ?',
+      `SELECT id, event_id, task_id, session_id, action_type, action_payload,
+              source, title, body, priority, status, created_at
+       FROM notification_events WHERE event_id = ?`,
     )
     .get(eventId) as
       | {
@@ -4068,6 +6323,8 @@ export function getNotificationEvent(eventId: string): {
           event_id: string;
           task_id: string | null;
           session_id: string | null;
+          action_type: string | null;
+          action_payload: string | null;
           source: string;
           title: string;
           body: string;
@@ -4085,27 +6342,48 @@ export function deleteScheduledTask(id: string): boolean {
 }
 
 export function closeDb(): void {
-  if (db) {
+  const state = getDatabaseProcessState();
+  if (state.db) {
     try {
-      db.close();
+      state.db.close();
       console.log('[db] Database closed gracefully');
     } catch (err) {
       console.warn('[db] Error closing database:', err);
     }
-    db = null;
+    state.db = null;
   }
 }
 
 // Register shutdown handlers to close the database when the process exits.
 // This prevents WAL file accumulation and potential data loss.
 function registerShutdownHandlers(): void {
+  const target = globalThis as typeof globalThis & {
+    [DATABASE_SHUTDOWN_HANDLER_KEY]?: boolean;
+  };
+  if (target[DATABASE_SHUTDOWN_HANDLER_KEY]) return;
+  target[DATABASE_SHUTDOWN_HANDLER_KEY] = true;
   let shuttingDown = false;
 
   const shutdown = (signal: string) => {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`[db] Received ${signal}, closing database...`);
-    closeDb();
+    for (const [dbPath, state] of getDatabaseProcessStates()) {
+      if (state.db) {
+        try { state.db.close(); } catch { /* best effort */ }
+        state.db = null;
+      }
+      if (!state.runtimeOwnerToken) continue;
+      const ownerPath = `${dbPath}.runtime-owner.json`;
+      try {
+        const owner = JSON.parse(fs.readFileSync(ownerPath, 'utf8')) as RuntimeOwnerRecord;
+        if (owner.pid === process.pid && owner.token === state.runtimeOwnerToken) {
+          fs.unlinkSync(ownerPath);
+        }
+      } catch {
+        // Owner may already be gone (temporary test DB or abrupt cleanup).
+      }
+    }
   };
 
   // 'exit' fires synchronously when the process is about to exit

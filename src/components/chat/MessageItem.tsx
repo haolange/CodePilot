@@ -3,7 +3,7 @@
 import { useState, useCallback, useRef, useEffect, useMemo, memo } from 'react';
 import { motion } from 'motion/react';
 import { cn } from '@/lib/utils';
-import type { Message, TokenUsage, FileAttachment, MediaBlock } from '@/types';
+import type { Message, TokenUsage, FileAttachment, MediaBlock, ExternalSource } from '@/types';
 import {
   Message as AIMessage,
   MessageContent,
@@ -21,6 +21,7 @@ import { ImageGenCard } from './ImageGenCard';
 import { BatchPlanInlinePreview } from './batch-image-gen/BatchPlanInlinePreview';
 import { WidgetRenderer } from './WidgetRenderer';
 import { buildReferenceImages } from '@/lib/image-ref-store';
+import { useTranslation } from '@/hooks/useTranslation';
 // SPECIES_IMAGE_URL / EGG_IMAGE_URL / RARITY_BG_GRADIENT were used by
 // the assistant-chat avatar (removed 2026-05-21); the imports are kept
 // out to avoid stale references.
@@ -28,8 +29,18 @@ import { parseDBDate } from '@/lib/utils';
 import { usePanel } from '@/hooks/usePanel';
 import { classifyPath } from '@/lib/preview-source';
 import { isWriteTool, isCreateTool, extractWritePath, resolveToolPath } from '@/lib/file-write-tools';
+import { archiveHtmlAsset } from '@/lib/archive-html-asset-client';
+import { inspectLocalPath, openHtmlFileWithSystem } from '@/lib/local-path-navigation';
+import { showToast } from '@/hooks/useToast';
 import { DevOutputSegment } from './DevOutputChips';
 import type { PlannerOutput } from '@/types';
+import { SubagentCard } from './SubagentCard';
+import { SearchSources } from './SearchSources';
+import {
+  buildSubagentRunView,
+  collapseLogicalSubagentRuns,
+  isSubagentToolCall,
+} from '@/lib/subagent-view';
 
 interface ImageGenRequest {
   prompt: string;
@@ -427,6 +438,7 @@ interface ToolBlock {
   content?: string;
   is_error?: boolean;
   media?: MediaBlock[];
+  sources?: ExternalSource[];
 }
 
 function parseToolBlocks(content: string): { text: string; tools: ToolBlock[]; thinking?: string } {
@@ -468,6 +480,7 @@ function parseToolBlocks(content: string): { text: string; tools: ToolBlock[]; t
             content: block.content,
             is_error: block.is_error,
             media: (block as { media?: MediaBlock[] }).media,
+            sources: (block as { sources?: ExternalSource[] }).sources,
           });
         }
       }
@@ -507,18 +520,22 @@ function parseToolBlocks(content: string): { text: string; tools: ToolBlock[]; t
 }
 
 function pairTools(tools: ToolBlock[]): Array<{
+  id: string;
   name: string;
   input: unknown;
   result?: string;
   isError?: boolean;
   media?: MediaBlock[];
+  sources?: ExternalSource[];
 }> {
   const paired: Array<{
+    id: string;
     name: string;
     input: unknown;
     result?: string;
     isError?: boolean;
     media?: MediaBlock[];
+    sources?: ExternalSource[];
   }> = [];
 
   const resultMap = new Map<string, ToolBlock>();
@@ -532,11 +549,13 @@ function pairTools(tools: ToolBlock[]): Array<{
     if (t.type === 'tool_use' && t.name) {
       const result = t.id ? resultMap.get(t.id) : undefined;
       paired.push({
+        id: t.id || `tool-${paired.length}`,
         name: t.name,
         input: t.input,
         result: result?.content,
         isError: result?.is_error,
         media: result?.media,
+        sources: result?.sources,
       });
     }
   }
@@ -544,11 +563,13 @@ function pairTools(tools: ToolBlock[]): Array<{
   for (const t of tools) {
     if (t.type === 'tool_result' && !tools.some(u => u.type === 'tool_use' && u.id === t.id)) {
       paired.push({
+        id: t.id || `tool-result-${paired.length}`,
         name: 'tool_result',
         input: {},
         result: t.content,
         isError: t.is_error,
         media: t.media,
+        sources: t.sources,
       });
     }
   }
@@ -620,6 +641,7 @@ const COLLAPSE_HEIGHT = 300;
 
 export const MessageItem = memo(function MessageItem({ message, sessionId, isAssistantProject, assistantName }: MessageItemProps) {
   const isUser = message.role === 'user';
+  const { t } = useTranslation();
 
   // Collapse/expand state for long user messages (hooks must be called unconditionally)
   const [isExpanded, setIsExpanded] = useState(false);
@@ -639,6 +661,19 @@ export const MessageItem = memo(function MessageItem({ message, sessionId, isAss
     const pairedTools = pairTools(tools);
     return { text, pairedTools, thinking };
   }, [message.content]);
+  const subagentTools = pairedTools.filter(tool => (
+    isSubagentToolCall(tool.name, tool.input, tool.result)
+  ));
+  const subagentRuns = collapseLogicalSubagentRuns(subagentTools.map(tool => buildSubagentRunView({
+    id: tool.id,
+    name: tool.name,
+    toolInput: tool.input,
+    result: tool.result,
+    isError: tool.isError,
+  })));
+  const regularTools = pairedTools.filter(tool => (
+    !isSubagentToolCall(tool.name, tool.input, tool.result)
+  ));
 
   // Memoize file attachment parsing
   const { files, displayText } = useMemo(() => {
@@ -693,10 +728,10 @@ export const MessageItem = memo(function MessageItem({ message, sessionId, isAss
         )}
 
         {/* Tool calls + thinking for assistant messages — single collapsible group */}
-        {!isUser && (pairedTools.length > 0 || thinking) && (
+        {!isUser && (regularTools.length > 0 || thinking) && (
           <ToolActionsGroup
-            tools={pairedTools.map((tool, i) => ({
-              id: `hist-${i}`,
+            tools={regularTools.map((tool) => ({
+              id: tool.id,
               name: tool.name,
               input: tool.input,
               result: tool.result,
@@ -712,6 +747,10 @@ export const MessageItem = memo(function MessageItem({ message, sessionId, isAss
           const allMedia = pairedTools.flatMap(t => t.media || []);
           return allMedia.length > 0 ? <MediaPreview media={allMedia} /> : null;
         })()}
+
+        {!isUser && (
+          <SearchSources sources={pairedTools.flatMap(tool => tool.sources || [])} />
+        )}
 
         {/* Text content */}
         {displayText && (
@@ -764,6 +803,47 @@ export const MessageItem = memo(function MessageItem({ message, sessionId, isAss
             </div>
           ) : <AssistantContent displayText={displayText} messageId={message.id} sessionId={sessionId} />
         )}
+
+        {/* Compact Sub Agent capsules follow the assistant text and wrap on one
+            row when space allows. */}
+        {!isUser && subagentRuns.length > 0 && (
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            {subagentRuns.map(run => (
+              <SubagentCard
+                key={run.id}
+                run={run}
+                sessionId={sessionId}
+              />
+            ))}
+          </div>
+        )}
+
+        {!isUser && message.stream_status && message.stream_status !== 'completed' && (
+          <div
+            className={cn(
+              'mt-2 inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs',
+              message.stream_status === 'streaming'
+                ? 'border-border bg-muted/50 text-muted-foreground'
+                : message.stream_status === 'interrupted'
+                  ? 'border-status-warning-border bg-status-warning-muted text-status-warning-foreground'
+                  : 'border-status-error-border bg-status-error-muted text-status-error-foreground',
+            )}
+            role="status"
+          >
+            <span
+              className={cn(
+                'size-1.5 rounded-full',
+                message.stream_status === 'streaming'
+                  ? 'animate-pulse bg-muted-foreground'
+                  : message.stream_status === 'interrupted'
+                    ? 'bg-status-warning'
+                    : 'bg-status-error',
+              )}
+              aria-hidden
+            />
+            {t(`message.streamStatus.${message.stream_status}`)}
+          </div>
+        )}
       </MessageContent>
 
       {/* Diff summary for assistant messages with file modifications */}
@@ -780,7 +860,14 @@ export const MessageItem = memo(function MessageItem({ message, sessionId, isAss
             const resolvedPath = resolveToolPath(rawPath, workingDirectory);
             const parts = resolvedPath.split(/[/\\]/);
             const operation: 'created' | 'modified' = isCreateTool(t.name) ? 'created' : 'modified';
-            return { path: resolvedPath, name: parts[parts.length - 1] || resolvedPath, operation };
+            const archiveable =
+              classifyPath(resolvedPath, workingDirectory).trust === 'workspace';
+            return {
+              path: resolvedPath,
+              name: parts[parts.length - 1] || resolvedPath,
+              operation,
+              archiveable,
+            };
           })
           .filter(f => f.path);
         if (modifiedFiles.length === 0) return null;
@@ -808,6 +895,26 @@ export const MessageItem = memo(function MessageItem({ message, sessionId, isAss
                 ...(baseDir ? { baseDir } : {}),
                 readonly,
               });
+            }}
+            onOpenInSystemBrowser={async (file) => {
+              try {
+                if (!sessionId) throw new Error(t('localReference.unsupported'));
+                const inspection = await inspectLocalPath(file.path, { sessionId });
+                if (inspection.kind !== 'file') {
+                  throw new Error(t('localReference.unsupported'));
+                }
+                await openHtmlFileWithSystem({
+                  path: inspection.realPath,
+                  sessionId,
+                });
+              } catch (error) {
+                showToast({
+                  type: 'error',
+                  message: t('diffSummary.openSystemBrowserFailed', {
+                    reason: error instanceof Error ? error.message : String(error),
+                  }),
+                });
+              }
             }}
             // Phase 3: export long screenshot via the Electron IPC. Only
             // .html/.htm rows pass the PREVIEWABLE+LONGSHOT gate in
@@ -839,6 +946,14 @@ export const MessageItem = memo(function MessageItem({ message, sessionId, isAss
                 alert(`Export failed: ${err instanceof Error ? err.message : String(err)}`);
               }
             }}
+            onArchiveHtml={sessionId ? async (file) => {
+              await archiveHtmlAsset({
+                sessionId,
+                source: 'workspace',
+                filePath: file.path,
+                prompt: file.name,
+              });
+            } : undefined}
           />
         );
       })()}

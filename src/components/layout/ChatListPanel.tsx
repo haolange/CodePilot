@@ -23,6 +23,7 @@ import type { TranslationKey } from "@/i18n";
 import { useNativeFolderPicker } from "@/hooks/useNativeFolderPicker";
 import { showToast } from '@/hooks/useToast';
 import { cn } from "@/lib/utils";
+import { renameSession } from "@/lib/session-title-events";
 // ConnectionStatus removed from header — CLI status now lives in Settings > Claude CLI
 // ImportSessionDialog moved to Settings page
 import { SessionListItem } from "./SessionListItem";
@@ -38,6 +39,9 @@ import {
   COLLAPSED_INITIALIZED_KEY,
 } from "./chat-list-utils";
 import type { ChatSession } from "@/types";
+
+const previewAssistantOnboarding =
+  process.env.NEXT_PUBLIC_CODEPILOT_UI_PREVIEW === 'assistant-onboarding';
 
 interface ChatListPanelProps {
   open: boolean;
@@ -273,12 +277,7 @@ export function ChatListPanel({ open, hasUpdate, readyToInstall }: ChatListPanel
     return () => clearInterval(interval);
   }, [fetchSessions]);
 
-  const handleDeleteSession = async (
-    e: React.MouseEvent,
-    sessionId: string
-  ) => {
-    e.preventDefault();
-    e.stopPropagation();
+  const handleDeleteSession = async (sessionId: string) => {
     if (!confirm("Delete this conversation?")) return;
     setDeletingSession(sessionId);
     try {
@@ -303,25 +302,19 @@ export function ChatListPanel({ open, hasUpdate, readyToInstall }: ChatListPanel
   };
 
   const handleRenameSession = async (sessionId: string, newTitle: string) => {
-    try {
-      const res = await fetch(`/api/chat/sessions/${sessionId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: newTitle }),
-      });
-      if (res.ok) {
-        setSessions((prev) =>
-          prev.map((s) => (s.id === sessionId ? { ...s, title: newTitle } : s))
-        );
-        window.dispatchEvent(new CustomEvent("session-updated"));
-      }
-    } catch {
-      // Silently fail
-    }
+    // Canonical title from the server — PATCH clamps and single-lines, so
+    // `newTitle` is only what we asked for, not what the session is called.
+    // `renameSession` also broadcasts it, so the top bar and split view land on
+    // the same string immediately instead of waiting for their own re-read.
+    const canonical = await renameSession(sessionId, newTitle);
+    if (!canonical) return;
+    setSessions((prev) =>
+      prev.map((s) => (s.id === sessionId ? { ...s, title: canonical } : s))
+    );
   };
 
   const handleRemoveProject = async (workingDirectory: string) => {
-    if (!confirm(`Remove project "${workingDirectory.split('/').pop()}" and all its conversations?`)) return;
+    if (!confirm(`Remove project "${workingDirectory.split(/[\\/]/).pop()}" and all its conversations?`)) return;
     const projectSessions = sessions.filter((s) => s.working_directory === workingDirectory);
     const deletedIds = new Set<string>();
     for (const session of projectSessions) {
@@ -375,10 +368,19 @@ export function ChatListPanel({ open, hasUpdate, readyToInstall }: ChatListPanel
 
   const projectGroups = useMemo(() => {
     const groups = groupSessionsByProject(filteredSessions);
-    // Pin assistant workspace project to top
+    // A configured assistant exists before it has any chat sessions. Keep a
+    // synthetic zero-session group so the sidebar immediately exposes the
+    // primary "new assistant conversation" action after bootstrap.
     if (workspacePath) {
       const wsIdx = groups.findIndex(g => g.workingDirectory === workspacePath);
-      if (wsIdx > 0) {
+      if (wsIdx === -1) {
+        groups.unshift({
+          workingDirectory: workspacePath,
+          displayName: workspacePath.split(/[\\/]/).pop() || 'Assistant',
+          sessions: [],
+          latestUpdatedAt: 0,
+        });
+      } else if (wsIdx > 0) {
         const [wsGroup] = groups.splice(wsIdx, 1);
         groups.unshift(wsGroup);
       }
@@ -501,10 +503,14 @@ export function ChatListPanel({ open, hasUpdate, readyToInstall }: ChatListPanel
         <div className="flex flex-col pb-3">
 
           {/* Assistant promo card for unconfigured users */}
-          {assistantSummary && !assistantSummary.configured && !promoDismissed && (
+          {assistantSummary
+            && (!assistantSummary.configured || previewAssistantOnboarding)
+            && (!promoDismissed || previewAssistantOnboarding)
+            && (
             <AssistantPromoCard
               onSetup={() => router.push('/settings/assistant')}
               onDismiss={() => setPromoDismissed(true)}
+              preview={previewAssistantOnboarding}
             />
           )}
 
@@ -594,6 +600,7 @@ export function ChatListPanel({ open, hasUpdate, readyToInstall }: ChatListPanel
                         <div key={group.workingDirectory || "__no_project"}>
                           <ProjectGroupHeader
                             workingDirectory={group.workingDirectory}
+                            sessionId={group.sessions[0]?.id || ''}
                             displayName={group.displayName}
                             isCollapsed={isCollapsed}
                             isFolderHovered={isFolderHovered}

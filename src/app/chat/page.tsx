@@ -2,14 +2,17 @@
 
 import { Suspense, useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import type { Message, SSEEvent, SessionResponse, TokenUsage, PermissionRequestEvent, FileAttachment, MentionRef } from '@/types';
+import type { Message, SSEEvent, SessionResponse, TokenUsage, PermissionRequestEvent, FileAttachment, MentionRef, ExternalSource } from '@/types';
+import type { SessionPermissionProfile } from '@/lib/permission/profile';
 import { MessageList } from '@/components/chat/MessageList';
-import { MessageInput } from '@/components/chat/MessageInput';
+import { MessageInput, composerDraftKey } from '@/components/chat/MessageInput';
 import { ChatComposerActionBar } from '@/components/chat/ChatComposerActionBar';
 import { ModeIndicator } from '@/components/chat/ModeIndicator';
 import { ChatPermissionSelector } from '@/components/chat/ChatPermissionSelector';
 import { RuntimeSelector } from '@/components/chat/RuntimeSelector';
 import { agentRuntimeToChatRuntime, effectiveChatRuntime } from '@/lib/chat-runtime-shared';
+import { toWireEffort, resolveModelSwitchEffortEffect } from '@/lib/effort-levels';
+import { refreshSessionTitle } from '@/lib/session-title-events';
 import type { ChatRuntime } from '@/lib/chat-runtime-shared';
 import { PermissionPrompt } from '@/components/chat/PermissionPrompt';
 import { ChatEmptyState } from '@/components/chat/ChatEmptyState';
@@ -36,13 +39,21 @@ import { FolderPicker } from '@/components/chat/FolderPicker';
 import { useNativeFolderPicker } from '@/hooks/useNativeFolderPicker';
 import { useTranslation } from '@/hooks/useTranslation';
 import { usePanel } from '@/hooks/usePanel';
-import { maybeShowStatusToast } from '@/hooks/useSSEStream';
+import {
+  maybeShowStatusToast,
+  resolveInternalRuntimeStatus,
+  resolveSafeStatusFallback,
+} from '@/hooks/useSSEStream';
 import { seedSnapshotPatch } from '@/lib/stream-session-manager';
+import { createFirstTurnNavGuard, type FirstTurnNavGuard } from '@/lib/first-turn-navigation';
 // `runtime/effective` stays — it's needed for the local resolver effect
 // that produces `invalidDefault` (runtime-aware pinned-default check).
 // That's the only contributor to RunCheckpoint's pinned-invalid
 // reason on the new-chat page.
 import { resolveNewChatDefault } from '@/lib/runtime/effective';
+
+const previewAssistantOnboarding =
+  process.env.NEXT_PUBLIC_CODEPILOT_UI_PREVIEW === 'assistant-onboarding';
 
 interface ToolUseInfo {
   id: string;
@@ -54,6 +65,7 @@ interface ToolResultInfo {
   tool_use_id: string;
   content: string;
   is_error?: boolean;
+  sources?: ExternalSource[];
 }
 
 export default function NewChatPage() {
@@ -77,7 +89,31 @@ function NewChatPageInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const prefillText = searchParams.get('prefill') || '';
-  const { setPendingApprovalSessionId } = usePanel();
+  // #4/#5 (Codex P2) — the prefill enters the composer via `initialValue`, which
+  // MessageInput prioritises OVER the draft. So clearing only the sessionStorage
+  // draft at send-accept (below) leaves the URL prefill, and the accept-time
+  // composer remount re-seeds the just-sent text from `initialValue`. Track which
+  // prefill we've already sent and feed '' for it so the remount comes up empty;
+  // a genuinely NEW prefill (different text) still shows.
+  const [consumedPrefill, setConsumedPrefill] = useState<string | null>(null);
+  const effectivePrefill = prefillText && prefillText !== consumedPrefill ? prefillText : '';
+  // #4/#5 (Codex P2, warm-nav) — live ref to the URL prefill so the accept path
+  // in `sendFirstMessage` consumes the *current* prefill even after a warm
+  // navigation (/chat already mounted, then router.push to /chat?prefill=…).
+  // `sendFirstMessage` is a stable useCallback that intentionally omits
+  // prefillText from its deps — adding it would churn the callback identity and
+  // cascade through `handleCommand`. Reading prefillText from that stale closure
+  // saw the OLD (often empty) prefill, so `setConsumedPrefill` never fired and
+  // the prefill kept re-seeding the composer. The ref is synced in an effect
+  // (not during render — react-hooks/refs); the effect flushes before the next
+  // user event, so the accept-time consume always sees the live prefill.
+  const prefillTextRef = useRef(prefillText);
+  useEffect(() => { prefillTextRef.current = prefillText; }, [prefillText]);
+  const {
+    setPendingApprovalSessionId,
+    setSessionId: setPanelSessionId,
+    setWorkingDirectory: setPanelWorkingDirectory,
+  } = usePanel();
   const { t } = useTranslation();
   const { isElectron, openNativePicker } = useNativeFolderPicker();
   const [messages, setMessages] = useState<Message[]>([]);
@@ -90,7 +126,6 @@ function NewChatPageInner() {
   const [workingDir, setWorkingDir] = useState('');
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
   const [errorBanner, setErrorBanner] = useState<{ message: string; description?: string } | null>(null);
-  const [recentProjects, setRecentProjects] = useState<string[]>([]);
   const [hasProvider, setHasProvider] = useState(true); // assume true until checked
   // True when the runtime-filtered /api/providers/models call succeeded
   // but returned an empty list — i.e. user has providers configured but
@@ -139,9 +174,9 @@ function NewChatPageInner() {
     return '';
   });
   const [pendingPermission, setPendingPermission] = useState<PermissionRequestEvent | null>(null);
-  const [permissionResolved, setPermissionResolved] = useState<'allow' | 'deny' | null>(null);
+  const [permissionResolved, setPermissionResolved] = useState<'allow' | 'deny' | 'timeout' | null>(null);
   const [streamingToolOutput, setStreamingToolOutput] = useState('');
-  const [permissionProfile, setPermissionProfile] = useState<'default' | 'full_access'>('default');
+  const [permissionProfile, setPermissionProfile] = useState<SessionPermissionProfile>('default');
   const [pendingContextTokens, setPendingContextTokens] = useState(0);
   // Phase 6 Phase 3 — per-source split (attachment / mention / directory).
   // Flows through RunCockpit → useContextUsage → breakdown so the popover's
@@ -182,6 +217,7 @@ function NewChatPageInner() {
     // Same goes for OpenAI OAuth, which is also a virtual provider
     // (`/api/openai-oauth/status`-managed).
     if (currentProviderId === 'openai-oauth') return true;
+    if (currentProviderId === 'xai-oauth') return true;
     // Everything else still requires the legacy "provider set up"
     // signal so we don't accidentally route to an env-fallback
     // provider that the resolver synthesised but the user never
@@ -289,14 +325,33 @@ function NewChatPageInner() {
     [checkpointReasons],
   );
   const handleCheckpointAction = useCallback((actionId: string) => {
-    // The context-cost confirm unblocks the pending send; MessageInput
-    // listens for this event and re-runs submit with bypass=true.
+    // Generic confirm→bypass bridge (MessageInput listens for this event and
+    // re-runs submit with bypass=true). As of #632 no built-in reason emits
+    // 'confirm-context-cost' — context-cost is now a non-blocking heads-up;
+    // this is retained dormant for any future real-danger confirm reason.
     if (actionId === 'confirm-context-cost') {
       window.dispatchEvent(new Event('run-checkpoint-confirm-send'));
     }
   }, []);
   const [createdSessionId, setCreatedSessionId] = useState<string | undefined>();
   const abortControllerRef = useRef<AbortController | null>(null);
+  // Phase 2 ③ — first-turn navigation guard. The inline first-turn stream
+  // router.push()es to the new session on completion; if the user navigated
+  // away mid-stream (this page unmounted) that push must be suppressed so they
+  // aren't dragged back. The unmount cleanup below deactivates the guard and
+  // aborts the in-flight send controller.
+  const navGuardRef = useRef<FirstTurnNavGuard | null>(null);
+  if (!navGuardRef.current) navGuardRef.current = createFirstTurnNavGuard();
+  useEffect(() => {
+    const guard = navGuardRef.current;
+    // Re-arm on (re)mount so StrictMode's mount→unmount→remount (whose
+    // cleanup deactivates the guard) doesn't leave it permanently dead.
+    guard?.reactivate();
+    return () => {
+      guard?.deactivate();
+      abortControllerRef.current?.abort();
+    };
+  }, []);
   // #615: guards the first-message send while it's mid-flight. We defer the
   // isStreaming / optimistic-bubble flips until the backend ACCEPTS the message
   // (otherwise flipping `isNewChat` remounts the composer and eats the
@@ -517,14 +572,6 @@ function NewChatPageInner() {
     };
   }, []);
 
-  // Load recent projects for empty state
-  useEffect(() => {
-    fetch('/api/setup/recent-projects')
-      .then(r => r.ok ? r.json() : { projects: [] })
-      .then(data => setRecentProjects(data.projects || []))
-      .catch(() => {});
-  }, []);
-
   // Detect assistant workspace status
   useEffect(() => {
     fetch('/api/settings/workspace')
@@ -680,21 +727,29 @@ function NewChatPageInner() {
     setFolderPickerOpen(false);
   }, []);
 
-  const handleSelectProject = useCallback((path: string) => {
-    setWorkingDir(path);
-    localStorage.setItem('codepilot:last-working-directory', path);
-  }, []);
-
   const stopStreaming = useCallback(() => {
+    // Explicit Stop is the only action that cancels the server-owned turn.
+    // Navigation/unmount merely aborts this renderer's fetch below; the chat
+    // route intentionally keeps collecting and checkpointing in the background.
+    if (createdSessionId) {
+      void fetch('/api/chat/interrupt', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: createdSessionId }),
+      }).catch(() => {});
+    }
     abortControllerRef.current?.abort();
     abortControllerRef.current = null;
-  }, []);
+  }, [createdSessionId]);
 
   const handlePermissionResponse = useCallback(async (decision: 'allow' | 'allow_session' | 'deny', updatedInput?: Record<string, unknown>, denyMessage?: string) => {
     if (!pendingPermission) return;
 
-    const body: { permissionRequestId: string; decision: { behavior: 'allow'; updatedInput?: Record<string, unknown>; updatedPermissions?: unknown[] } | { behavior: 'deny'; message?: string } } = {
+    const body: { permissionRequestId: string; approvalToken?: string; decision: { behavior: 'allow'; updatedInput?: Record<string, unknown>; updatedPermissions?: unknown[] } | { behavior: 'deny'; message?: string } } = {
       permissionRequestId: pendingPermission.permissionRequestId,
+      // Echo the server-issued HMAC token; the route rejects responses
+      // without a valid one (Phase 4 ② hardening).
+      ...(pendingPermission.approvalToken ? { approvalToken: pendingPermission.approvalToken } : {}),
       decision: decision === 'deny'
         ? { behavior: 'deny', message: denyMessage || 'User denied permission' }
         : {
@@ -817,8 +872,14 @@ function NewChatPageInner() {
 
       try {
         // Create a new session with working directory + model/provider
+        // No `title` here on purpose. The client used to name the session at
+        // create time by cutting the first 50 characters with no ellipsis,
+        // while the chat route named it AGAIN from the same message under
+        // different rules — two writers, two answers. The session is now
+        // created as a placeholder and the route derives the one fallback
+        // title after the first real message is persisted;
+        // `refreshSessionTitle` below pulls it back for the UI.
         const createBody: Record<string, string> = {
-          title: content.slice(0, 50),
           mode,
           working_directory: workingDir.trim(),
           permission_profile: permissionProfile,
@@ -840,6 +901,12 @@ function NewChatPageInner() {
         const { session }: SessionResponse = await createRes.json();
         sessionId = session.id;
         setCreatedSessionId(sessionId);
+        // The first turn remains on /chat until streaming completes. Scope the
+        // workspace sidebar to the real session immediately so a completed
+        // sub-agent's Details button can open during the parent's remaining
+        // output instead of waiting for the /chat/[id] navigation.
+        setPanelSessionId(sessionId);
+        setPanelWorkingDirectory(session.working_directory || workingDir.trim());
 
         // Phase 2 Step 4c — if the user explicitly picked a runtime in
         // the composer's RuntimeSelector before sending, persist it now
@@ -885,9 +952,9 @@ function NewChatPageInner() {
             ...(files && files.length > 0 ? { files } : {}),
             ...(mentions && mentions.length > 0 ? { mentions } : {}),
             ...(systemPromptAppend ? { systemPromptAppend } : {}),
-            // 'auto' sentinel means "no explicit effort" — omit so Claude
+            // 'auto' sentinel means "no explicit effort" — omitted so Claude
             // Code CLI applies its per-model default (Opus 4.7 → xhigh).
-            ...(selectedEffort && selectedEffort !== 'auto' ? { effort: selectedEffort } : {}),
+            ...(toWireEffort(selectedEffort) ? { effort: toWireEffort(selectedEffort) } : {}),
             ...(thinkingConfig ? { thinking: thinkingConfig } : {}),
             ...(context1m ? { context_1m: true } : {}),
             ...(displayOverride ? { displayOverride } : {}),
@@ -911,6 +978,22 @@ function NewChatPageInner() {
         // stream is opening) — from here the screenshot is committed
         // server-side, so a later error must NOT preserve the composer (#615).
         accepted = true;
+        // #4/#5 — clear the persisted composer draft at accept. The imminent
+        // isStreaming flip REMOUNTS the composer, which re-seeds inputValue from
+        // this draft (the only composer state surviving the remount); without
+        // clearing it the just-sent text lingers all turn (CDP repro).
+        try { sessionStorage.removeItem(composerDraftKey()); } catch { /* unavailable */ }
+        // #4/#5 (Codex P2) — also mark the URL prefill consumed so the remount's
+        // `initialValue` (which outranks the draft) doesn't re-seed the sent text.
+        if (prefillTextRef.current) setConsumedPrefill(prefillTextRef.current);
+
+        // The route wrote the fallback title before returning this response —
+        // pull it back so the top bar / sidebar show the real title now
+        // instead of waiting on the sidebar's 5s poll. Not awaited: the title
+        // is cosmetic and must never delay the stream. Deliberately placed
+        // AFTER the draft clear, which `composer-first-message-clear.test.ts`
+        // pins to within 600 chars of `accepted = true`.
+        void refreshSessionTitle(session.id);
 
         // Flip the layout-driving state ONLY now: show streaming + push the
         // optimistic user bubble. Deferring to here keeps `isNewChat` true
@@ -982,7 +1065,21 @@ function NewChatPageInner() {
                   try {
                     const resultData = JSON.parse(event.data);
                     setStreamingToolOutput('');
-                    setToolResults((prev) => [...prev, { tool_use_id: resultData.tool_use_id, content: resultData.content }]);
+                    setToolResults((prev) => {
+                      const next: ToolResultInfo = {
+                        tool_use_id: resultData.tool_use_id,
+                        content: resultData.content,
+                        ...(resultData.is_error ? { is_error: true } : {}),
+                        ...(Array.isArray(resultData.sources) && resultData.sources.length > 0
+                          ? { sources: resultData.sources as ExternalSource[] }
+                          : {}),
+                      };
+                      const index = prev.findIndex(item => item.tool_use_id === next.tool_use_id);
+                      if (index < 0) return [...prev, next];
+                      const copy = [...prev];
+                      copy[index] = next;
+                      return copy;
+                    });
                   } catch { /* skip */ }
                   break;
                 }
@@ -1005,7 +1102,10 @@ function NewChatPageInner() {
                 case 'status': {
                   try {
                     const statusData = JSON.parse(event.data);
-                    if (statusData.session_id) {
+                    const internalRuntimeStatus = resolveInternalRuntimeStatus(statusData);
+                    if (internalRuntimeStatus.handled) {
+                      if (internalRuntimeStatus.text) setStatusText(internalRuntimeStatus.text);
+                    } else if (statusData.session_id) {
                       setStatusText(`Connected (${statusData.model || 'claude'})`);
                       setTimeout(() => setStatusText(undefined), 2000);
                     } else if (statusData.notification) {
@@ -1016,11 +1116,19 @@ function NewChatPageInner() {
                       // (useSSEStream via stream-session-manager).
                       maybeShowStatusToast(statusData);
                       setStatusText(statusData.message || statusData.title || undefined);
+                    } else if (statusData.apiRetry) {
+                      // #635 — show human copy, not raw JSON. The first-message
+                      // path doesn't run the idle checker, so this is display-only.
+                      setStatusText(
+                        typeof statusData.attempt === 'number'
+                          ? `Retrying upstream (attempt ${statusData.attempt})…`
+                          : 'Retrying upstream…',
+                      );
                     } else {
-                      setStatusText(event.data || undefined);
+                      setStatusText(resolveSafeStatusFallback(event.data, statusData));
                     }
                   } catch {
-                    setStatusText(event.data || undefined);
+                    setStatusText(resolveSafeStatusFallback(event.data));
                   }
                   break;
                 }
@@ -1088,6 +1196,25 @@ function NewChatPageInner() {
                   }
                   break;
                 }
+                case 'permission_resolved': {
+                  // A5 Step 2 — registry timed out the pending request and
+                  // auto-denied it. The inline first-message flow has a single
+                  // active prompt and the registry only emits this for a still-
+                  // unresolved request, so marking resolved without an explicit
+                  // id-guard is safe here (entry 2 / stream-session-manager
+                  // id-guards because it has fresh mutable snapshot access).
+                  // Also clear the sidebar "needs approval" badge: the prompt
+                  // now shows the timeout one-liner, nothing's left to approve
+                  // (A5 follow-up — without this the badge lingers till stream end).
+                  try {
+                    const data = JSON.parse(event.data) as { status: 'timeout' };
+                    setPermissionResolved(data.status);
+                    setPendingApprovalSessionId('');
+                  } catch {
+                    // skip malformed permission_resolved data
+                  }
+                  break;
+                }
                 case 'error': {
                   // Try to parse structured error JSON from classifier
                   let errorDisplay: string;
@@ -1139,13 +1266,19 @@ function NewChatPageInner() {
           setMessages((prev) => [...prev, assistantMessage]);
         }
 
-        // Navigate to the session page after response is complete
-        router.push(`/chat/${session.id}`);
+        // Navigate to the session page after response is complete — but ONLY
+        // if the user is still on this new-chat page. If they switched away
+        // mid-stream (navGuard deactivated on unmount), suppress the push so
+        // we don't drag them back to the just-created session (Phase 2 ③).
+        navGuardRef.current?.navigate(() => router.push(`/chat/${session.id}`));
       } catch (error) {
         if (error instanceof DOMException && error.name === 'AbortError') {
-          // User stopped - navigate to session if we have one
+          // Aborted — either the user hit stop, or the page unmounted (session
+          // switch) and the cleanup aborted the controller. Only navigate to
+          // the session if the guard is still active (user stopped while
+          // still here); a switch-away abort must NOT push them back.
           if (sessionId) {
-            router.push(`/chat/${sessionId}`);
+            navGuardRef.current?.navigate(() => router.push(`/chat/${sessionId}`));
           }
         } else {
           const errMsg = error instanceof Error ? error.message : 'Unknown error';
@@ -1171,7 +1304,7 @@ function NewChatPageInner() {
         firstSendInFlightRef.current = false;
       }
     },
-    [isStreaming, router, workingDir, mode, currentModel, currentProviderId, permissionProfile, selectedEffort, thinkingMode, context1m, setPendingApprovalSessionId, t, canSendWithCurrentProvider, modelReady, noCompatibleProvider, invalidDefault]
+    [isStreaming, router, workingDir, mode, currentModel, currentProviderId, runtimePin, permissionProfile, selectedEffort, thinkingMode, context1m, setPendingApprovalSessionId, setPanelSessionId, setPanelWorkingDirectory, t, canSendWithCurrentProvider, modelReady, noCompatibleProvider, invalidDefault]
   );
 
   const handleCommand = useCallback((command: string) => {
@@ -1216,16 +1349,17 @@ function NewChatPageInner() {
   // sends the first message (messages.length > 0 OR isStreaming),
   // we fall back to the traditional list-above + composer-below layout.
   const isNewChat = messages.length === 0 && !isStreaming;
-  const needsOnboardingCards = !workingDir.trim() || !hasSendableProviderForCurrentRuntime;
+  const needsOnboardingCards = previewAssistantOnboarding
+    || !workingDir.trim()
+    || !hasSendableProviderForCurrentRuntime;
 
   const chatEmptyStateNode = (
     <ChatEmptyState
       hasDirectory={!!workingDir.trim()}
       hasProvider={hasSendableProviderForCurrentRuntime}
       onSelectFolder={handleSelectFolder}
-      recentProjects={recentProjects}
-      onSelectProject={handleSelectProject}
       assistantConfigured={assistantConfigured}
+      preview={previewAssistantOnboarding}
       onOpenAssistant={() => {
         if (assistantConfigured) {
           // Navigate to the latest assistant session
@@ -1291,6 +1425,32 @@ function NewChatPageInner() {
         onProviderModelChange={(pid, model, opts) => {
           setCurrentProviderId(pid);
           setCurrentModel(model);
+          // s07 (reviewer fix run i31, 2026-07-18) — the new-chat composer had NO
+          // effort fallback at all: a manual or auto-correct switch to a model
+          // that doesn't offer the selected tier left it selected, so the first
+          // message sent an unsupported effort (or toWireEffort silently dropped
+          // it while the button still showed it). Mirror ChatView: clear the
+          // illegal transient tier on ANY effective model change — validated
+          // against the SAME picker feed via opts.supportedEffortLevels — and
+          // surface the one-shot sourced notice only when a reset actually fired.
+          // This runs BEFORE the isAuto persist-skip; isAuto still governs only
+          // the localStorage "recently used" writes, never the effort effect.
+          const effortEffect = resolveModelSwitchEffortEffect(
+            selectedEffort,
+            opts?.supportedEffortLevels,
+          );
+          if (effortEffect.resetEffort) {
+            setSelectedEffort(undefined);
+          }
+          if (effortEffect.showResetToast) {
+            import('@/hooks/useToast').then(({ showToast }) => {
+              showToast({
+                type: 'info',
+                message: t('messageInput.effort.resetOnModelSwitch'),
+                duration: 4000,
+              });
+            });
+          }
           if (opts?.isAuto) return;
           localStorage.setItem('codepilot:last-provider-id', pid);
           localStorage.setItem('codepilot:last-model', model);
@@ -1300,7 +1460,7 @@ function NewChatPageInner() {
         workingDirectory={workingDir}
         effort={selectedEffort}
         onEffortChange={setSelectedEffort}
-        initialValue={prefillText}
+        initialValue={effectivePrefill}
         onPendingContextTokensChange={setPendingContextTokens}
         onPendingContextSubTotalsChange={setPendingContextSubTotals}
         blockingReasonIds={blockingReasonIds}
@@ -1318,6 +1478,7 @@ function NewChatPageInner() {
             <ChatPermissionSelector
               permissionProfile={permissionProfile}
               onPermissionChange={setPermissionProfile}
+              runtime={sessionRuntimeParam}
             />
           </>
         }

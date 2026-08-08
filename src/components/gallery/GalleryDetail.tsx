@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { CodePilotIcon } from '@/components/ui/semantic-icon';
 import { cn, parseDBDate } from '@/lib/utils';
@@ -9,18 +9,45 @@ import { Button } from '@/components/ui/button';
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogTitle,
 } from '@/components/ui/dialog';
 import { useTranslation } from '@/hooks/useTranslation';
 import type { TranslationKey } from '@/i18n';
 import type { GalleryItem } from './GalleryGrid';
+import { GalleryTagEditor } from './GalleryTagEditor';
 
 interface GalleryDetailProps {
   item: GalleryItem | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onDelete?: (id: string) => void;
+  onDelete?: (id: string) => Promise<AssetMutationResult>;
   onToggleFavorite?: (id: string) => void;
+  onUpdateTags?: (
+    id: string,
+    tags: readonly string[],
+  ) => Promise<boolean>;
+}
+
+export interface AssetMutationResult {
+  ok: boolean;
+  error?: string;
+  code?: string;
+  consumers?: Array<{ label: string }>;
+}
+
+interface AssetDetailPayload {
+  lineage?: {
+    parents?: Array<{
+      parent_asset_id: string;
+      relation: string;
+    }>;
+    children?: Array<{
+      child_asset_id: string;
+      relation: string;
+    }>;
+  };
+  consumers?: Array<{ label: string }>;
 }
 
 function imageUrl(img: GalleryItem['images'][0]): string {
@@ -54,11 +81,15 @@ export function GalleryDetail({
   onOpenChange,
   onDelete,
   onToggleFavorite,
+  onUpdateTags,
 }: GalleryDetailProps) {
   const { t } = useTranslation();
   const router = useRouter();
   const [currentImageIndex, setCurrentImageIndex] = useState(0);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleteError, setDeleteError] = useState('');
+  const [mutating, setMutating] = useState(false);
+  const [assetDetail, setAssetDetail] = useState<AssetDetailPayload | null>(null);
 
   // Reset state when item changes (React-recommended ref pattern instead of useEffect+setState)
   const prevItemId = useRef(item?.id);
@@ -66,7 +97,23 @@ export function GalleryDetail({
     prevItemId.current = item?.id;
     setCurrentImageIndex(0);
     setConfirmDelete(false);
+    setDeleteError('');
+    setAssetDetail(null);
   }
+
+  useEffect(() => {
+    if (!open || !item) return;
+    let cancelled = false;
+    fetch(`/api/assets/${encodeURIComponent(item.id)}`)
+      .then((response) => response.ok ? response.json() : null)
+      .then((payload) => {
+        if (!cancelled && payload) setAssetDetail(payload);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [item, open]);
 
   const handleDownload = useCallback(async () => {
     if (!item) return;
@@ -93,35 +140,87 @@ export function GalleryDetail({
     }
   }, [item, currentImageIndex]);
 
-  const handleDelete = useCallback(() => {
+  const handleDelete = useCallback(async () => {
     if (!item) return;
     if (!confirmDelete) {
       setConfirmDelete(true);
       return;
     }
-    onDelete?.(item.id);
+    setMutating(true);
+    setDeleteError('');
+    const result = await onDelete?.(item.id);
+    setMutating(false);
+    if (!result?.ok) {
+      const consumers = result?.consumers?.map((entry) => entry.label).join(', ');
+      setDeleteError(
+        consumers
+          ? t('gallery.deleteBlocked', { consumers })
+          : t('gallery.deleteFailed'),
+      );
+      return;
+    }
     onOpenChange(false);
     setConfirmDelete(false);
-  }, [item, confirmDelete, onDelete, onOpenChange]);
+  }, [item, confirmDelete, onDelete, onOpenChange, t]);
 
   if (!item) return null;
 
   const currentImage = item.images[currentImageIndex];
   const hasMultipleImages = item.images.length > 1;
   const isVideo = item.type === 'video' || !!currentImage?.mimeType?.startsWith('video/');
+  const isAudio = item.type === 'audio' || !!currentImage?.mimeType?.startsWith('audio/');
+  const isHtml = item.type === 'html_bundle';
+  const integrityFailed =
+    item.integrityState && item.integrityState !== 'valid';
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-[calc(100vw-4rem)] sm:max-w-[calc(100vw-4rem)] max-h-[calc(100vh-4rem)] w-full h-[calc(100vh-4rem)] overflow-hidden p-0 gap-0 border-0" showCloseButton>
+      <DialogContent
+        className="h-[calc(100dvh-4rem)] max-h-[calc(100dvh-4rem)] w-full max-w-[calc(100vw-4rem)] grid-rows-[minmax(0,1fr)] overflow-hidden border-0 p-0 sm:max-w-[calc(100vw-4rem)]"
+        showCloseButton
+      >
         <DialogTitle className="sr-only">
-          {t('gallery.imageDetail' as TranslationKey)}
+          {t('gallery.mediaDetail' as TranslationKey)}
         </DialogTitle>
+        <DialogDescription className="sr-only">
+          {t('gallery.description' as TranslationKey)}
+        </DialogDescription>
 
-        <div className="flex flex-row h-full">
+        <div className="flex h-full min-h-0 flex-row overflow-hidden">
           {/* Left: Media preview */}
-          <div className="relative w-[70%] shrink-0 bg-black">
+          <div className="relative min-h-0 w-[70%] shrink-0 bg-black">
             <div className="absolute inset-0 flex items-center justify-center">
-              {currentImage && (
+              {integrityFailed ? (
+                <div className="flex max-w-md flex-col items-center gap-3 px-6 text-center text-white/80">
+                  <CodePilotIcon name="warning" size="xl" aria-hidden />
+                  <p className="text-sm">
+                    {t(
+                      item.integrityState === 'missing'
+                        ? 'gallery.integrity.missing'
+                        : 'gallery.integrity.modified',
+                    )}
+                  </p>
+                  {item.integrityReason && (
+                    <p className="text-xs text-white/50">{item.integrityReason}</p>
+                  )}
+                </div>
+              ) : isHtml ? (
+                item.thumbnailUrl ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    src={item.thumbnailUrl}
+                    alt={item.title?.trim() || item.prompt}
+                    className="max-h-full max-w-full object-contain"
+                  />
+                ) : (
+                  <CodePilotIcon
+                    name="web"
+                    size="xl"
+                    className="text-white/40"
+                    aria-hidden
+                  />
+                )
+              ) : currentImage && (
                 isVideo ? (
                    
                   <video
@@ -130,6 +229,16 @@ export function GalleryDetail({
                     preload="metadata"
                     className="max-w-full max-h-full object-contain"
                   />
+                ) : isAudio ? (
+                  <div className="flex w-full max-w-xl flex-col items-center gap-5 px-8">
+                    <CodePilotIcon name="media_audio" size="xl" className="text-white/70" aria-hidden />
+                    <audio
+                      src={imageUrl(currentImage)}
+                      controls
+                      preload="metadata"
+                      className="w-full"
+                    />
+                  </div>
                 ) : (
                   // eslint-disable-next-line @next/next/no-img-element
                   <img
@@ -167,23 +276,24 @@ export function GalleryDetail({
           </div>
 
           {/* Right: Info panel */}
-          <div className="flex-1 min-w-0 border-l border-border/50 overflow-y-auto p-6 space-y-5">
+          <div className="min-h-0 min-w-0 flex-1 space-y-5 overflow-y-auto overscroll-contain border-l border-border/50 p-6 [scrollbar-gutter:stable]">
             {/* Favorite button */}
             <Button
-              variant="ghost"
+              variant="outline"
               size="sm"
               onClick={() => onToggleFavorite?.(item.id)}
-              className={cn(
-                'gap-1.5',
-                item.favorited
-                  ? 'text-status-error-foreground'
-                  : 'text-muted-foreground hover:text-status-error-foreground',
-              )}
+              className="gap-1.5 text-foreground"
             >
               <CodePilotIcon
                 name="favorite"
                 size="lg"
-                strokeWidth={item.favorited ? 2 : undefined}
+                strokeWidth={1.5}
+                className={cn(
+                  '[&_path]:fill-current',
+                  item.favorited
+                    ? 'text-status-error-foreground'
+                    : 'text-muted-foreground',
+                )}
                 aria-hidden
               />
               {item.favorited
@@ -201,6 +311,11 @@ export function GalleryDetail({
 
             {/* Metadata badges */}
             <div className="flex items-center gap-1.5 flex-wrap">
+              {item.kind && (
+                <Badge variant="outline" className="text-[10px]">
+                  {item.kind}
+                </Badge>
+              )}
               {item.model && (
                 <Badge variant="secondary" className="text-[10px] gap-1">
                   <CodePilotIcon name="appearance" size={12} aria-hidden />
@@ -218,6 +333,142 @@ export function GalleryDetail({
                 </Badge>
               )}
             </div>
+
+            <div>
+              <div className="mb-1.5 text-xs font-medium text-muted-foreground">
+                {t('gallery.tags')}
+              </div>
+              <GalleryTagEditor
+                tags={item.tags}
+                onChange={(tags) => (
+                  onUpdateTags
+                    ? onUpdateTags(item.id, tags)
+                    : Promise.resolve(false)
+                )}
+              />
+            </div>
+
+            <div className="space-y-2 text-xs">
+              {item.producerId && (
+                <div>
+                  <span className="text-muted-foreground">{t('gallery.source')}: </span>
+                  <span className="break-all">{item.producerId}</span>
+                </div>
+              )}
+              {item.projectId && (
+                <div>
+                  <span className="text-muted-foreground">{t('gallery.project')}: </span>
+                  <span className="break-all">{item.projectId}</span>
+                </div>
+              )}
+              {item.runtimeId && (
+                <div>
+                  <span className="text-muted-foreground">{t('gallery.runtime')}: </span>
+                  <span>{item.runtimeId}</span>
+                </div>
+              )}
+              {item.methodRef && (
+                <div>
+                  <span className="text-muted-foreground">{t('gallery.method')}: </span>
+                  <span className="break-all">{item.methodRef}</span>
+                </div>
+              )}
+              {item.integrityState && (
+                <div>
+                  <span className="text-muted-foreground">{t('gallery.integrity')}: </span>
+                  <span>
+                    {t(`gallery.integrity.${item.integrityState}` as TranslationKey)}
+                  </span>
+                </div>
+              )}
+              {item.generationStatus && (
+                <div>
+                  <span className="text-muted-foreground">
+                    {t('gallery.generationStatus')}:{' '}
+                  </span>
+                  <span>{item.generationStatus}</span>
+                </div>
+              )}
+            </div>
+
+            {isHtml && (
+              <p className="rounded-md bg-muted/40 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
+                {t('gallery.staticWebPreviewHint')}
+              </p>
+            )}
+
+            {isHtml && item.externalUrls && item.externalUrls.length > 0 && (
+              <div className="space-y-2">
+                <div>
+                  <div className="text-xs font-medium text-muted-foreground">
+                    {t('gallery.externalResources')}
+                  </div>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {t('gallery.externalResourcesHint')}
+                  </p>
+                </div>
+                <ul className="space-y-1 text-[11px] text-foreground">
+                  {item.externalUrls.slice(0, 10).map((url) => (
+                    <li
+                      key={url}
+                      className="break-all rounded-md bg-muted/40 px-2 py-1.5"
+                    >
+                      {url}
+                    </li>
+                  ))}
+                </ul>
+                {item.externalUrls.length > 10 && (
+                  <p className="text-[11px] text-muted-foreground">
+                    {t('gallery.externalResourcesMore', {
+                      count: item.externalUrls.length - 10,
+                    })}
+                  </p>
+                )}
+              </div>
+            )}
+
+            {assetDetail && (
+              <div>
+                <div className="mb-1 text-xs font-medium text-muted-foreground">
+                  {t('gallery.lineage')}
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  <Badge variant="secondary" className="border-0 text-[10px]">
+                    {t('gallery.parents', {
+                      count: assetDetail.lineage?.parents?.length || 0,
+                    })}
+                  </Badge>
+                  <Badge variant="secondary" className="border-0 text-[10px]">
+                    {t('gallery.children', {
+                      count: assetDetail.lineage?.children?.length || 0,
+                    })}
+                  </Badge>
+                  <Badge variant="secondary" className="border-0 text-[10px]">
+                    {t('gallery.consumers', {
+                      count: assetDetail.consumers?.length || 0,
+                    })}
+                  </Badge>
+                </div>
+                {(assetDetail.lineage?.parents?.length || 0) > 0 && (
+                  <div className="mt-2 space-y-1 text-[10px] text-muted-foreground">
+                    {assetDetail.lineage?.parents?.map((parent) => (
+                      <div key={`${parent.parent_asset_id}:${parent.relation}`}>
+                        ← {parent.relation} · {parent.parent_asset_id.slice(0, 12)}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {(assetDetail.lineage?.children?.length || 0) > 0 && (
+                  <div className="mt-2 space-y-1 text-[10px] text-muted-foreground">
+                    {assetDetail.lineage?.children?.map((child) => (
+                      <div key={`${child.child_asset_id}:${child.relation}`}>
+                        → {child.relation} · {child.child_asset_id.slice(0, 12)}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Reference images */}
             {item.referenceImages && item.referenceImages.length > 0 && (
@@ -262,23 +513,47 @@ export function GalleryDetail({
                   {t('gallery.openChat' as TranslationKey)}
                 </Button>
               )}
-              <Button variant="outline" size="sm" onClick={handleDownload}>
-                <CodePilotIcon name="download" size="sm" aria-hidden />
-                {t('gallery.download' as TranslationKey)}
-              </Button>
-              <div className="ml-auto">
+              {!isHtml && !integrityFailed && (
+                <Button variant="outline" size="sm" onClick={handleDownload}>
+                  <CodePilotIcon name="download" size="sm" aria-hidden />
+                  {t('gallery.download' as TranslationKey)}
+                </Button>
+              )}
+              <div className="ml-auto flex items-center gap-1.5">
+                {confirmDelete && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setConfirmDelete(false);
+                      setDeleteError('');
+                    }}
+                    disabled={mutating}
+                  >
+                    {t('gallery.cancel')}
+                  </Button>
+                )}
                 <Button
-                  variant={confirmDelete ? 'destructive' : 'ghost'}
+                  variant={confirmDelete ? 'destructive' : 'outline'}
                   size="sm"
                   onClick={handleDelete}
+                  disabled={mutating}
                 >
                   <CodePilotIcon name="delete" size="sm" aria-hidden />
                   {confirmDelete
-                    ? t('gallery.confirmDelete' as TranslationKey)
-                    : t('gallery.delete' as TranslationKey)}
+                    ? t('gallery.confirmDelete')
+                    : t('gallery.delete')}
                 </Button>
               </div>
             </div>
+            {confirmDelete && !deleteError && (
+              <p className="text-xs text-destructive">
+                {t('gallery.deleteConfirm')}
+              </p>
+            )}
+            {deleteError && (
+              <p className="text-xs text-destructive">{deleteError}</p>
+            )}
           </div>
         </div>
       </DialogContent>

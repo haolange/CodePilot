@@ -2,8 +2,9 @@ name: Build & Package
 
 # Stable tag-release workflow.
 #
-# Triggers on `v*` tags → builds macOS (arm64 + x64) and Windows packages, then
-# creates a real GitHub Release (NOT a prerelease) whose body is RELEASE_NOTES.md.
+# Triggers on `v*` tags → builds macOS (arm64 + x64), Windows x64, and Linux
+# (x64 + arm64) packages, then creates a real GitHub Release (NOT a prerelease)
+# whose body is RELEASE_NOTES.md.
 # The internal tester channel lives in `preview-build.yml` / `preview-release.yml`
 # (artifacts-only / prerelease) — those are intentionally separate and untouched.
 #
@@ -14,6 +15,7 @@ name: Build & Package
 #   - P0 startup regression pins (codex binary discovery, app-server client
 #     fast-fail, provider resolver / catalog)
 #   - packaged better-sqlite3 native ABI loads under the Electron runtime
+#   - every packaged standalone server boots and contains no source maps
 
 on:
   workflow_dispatch:
@@ -27,6 +29,12 @@ on:
           - all
           - windows
           - macos
+          - linux
+      telemetry_smoke:
+        description: "Compile and run isolated Sentry smoke fixtures (manual macOS only)"
+        required: true
+        default: false
+        type: boolean
   push:
     tags:
       - "v*"
@@ -162,15 +170,33 @@ jobs:
 
       - run: npm ci
 
-      - name: Build + package macOS (arm64 + x64)
+      - name: Build macOS release bundles
         timeout-minutes: 45
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-        run: |
-          npm run electron:build
-          npx electron-builder --mac --arm64 --x64 --config electron-builder.yml --publish never
+          CODEPILOT_APP_CHANNEL: stable
+          CODEPILOT_SOURCE_MAPS: "1"
+          CODEPILOT_TELEMETRY_SMOKE: ${{ inputs.telemetry_smoke && '1' || '0' }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: npm run electron:build
 
-      - name: Verify packaged version and native ABI
+      - name: Upload macOS source maps to Sentry
+        env:
+          CODEPILOT_APP_CHANNEL: stable
+          CODEPILOT_SOURCE_MAPS: "1"
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+        run: npm run sentry:sourcemaps:upload
+
+      - name: Package macOS (arm64 + x64)
+        timeout-minutes: 45
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npx electron-builder --mac --arm64 --x64 --config electron-builder.yml --publish never
+
+      - name: Verify packaged version, native ABI, and server startup
         env:
           EXPECTED_VERSION: ${{ needs.verify-source.outputs.version }}
         run: |
@@ -193,11 +219,80 @@ jobs:
           SQLITE=$(find "$APP/Contents/Resources" -path "*better-sqlite3*" -name "*.node" | head -1)
           [ -n "$SQLITE" ] || { echo "::error::better-sqlite3 .node not found"; exit 1; }
           ELECTRON_RUN_AS_NODE=1 "$APP/Contents/MacOS/CodePilot" -e "const path = require('node:path'); require(path.resolve(process.argv[1])); console.log('better-sqlite3 OK, ABI=' + process.versions.modules)" "$SQLITE"
+          node scripts/verify-packaged-server.mjs "$APP/Contents/MacOS/CodePilot" "$APP/Contents/Resources"
+
+      - name: Run packaged Sentry synthetic events
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.telemetry_smoke }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP=$(find release -maxdepth 4 -path "*mac-arm64*" -name "CodePilot.app" -type d | head -1)
+          [ -n "$APP" ] || APP=$(find release -maxdepth 4 -name "CodePilot.app" -type d | head -1)
+          [ -n "$APP" ] || { echo "::error::CodePilot.app not found for telemetry smoke"; exit 1; }
+          LOG="$RUNNER_TEMP/codepilot-telemetry-smoke.log"
+          "$APP/Contents/MacOS/CodePilot" >"$LOG" 2>&1 &
+          APP_PID=$!
+          for _ in $(seq 1 45); do
+            if grep -q "layer=next_server" "$LOG" && grep -q "layer=electron_main" "$LOG"; then
+              break
+            fi
+            if ! kill -0 "$APP_PID" 2>/dev/null; then
+              echo "::error::packaged telemetry smoke app exited early"
+              tail -80 "$LOG"
+              exit 1
+            fi
+            sleep 1
+          done
+          grep -q "layer=next_server" "$LOG" || { echo "::error::Next server smoke event missing"; tail -80 "$LOG"; exit 1; }
+          grep -q "layer=electron_main" "$LOG" || { echo "::error::Electron main smoke event missing"; tail -80 "$LOG"; exit 1; }
+          sleep 8
+          kill "$APP_PID" 2>/dev/null || true
+          wait "$APP_PID" 2>/dev/null || true
+          echo "Packaged JS telemetry smoke emitted; renderer delivery is verified in Sentry"
+
+      - name: Run packaged Sentry native crash fixture
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.telemetry_smoke }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP=$(find release -maxdepth 4 -path "*mac-arm64*" -name "CodePilot.app" -type d | head -1)
+          [ -n "$APP" ] || APP=$(find release -maxdepth 4 -name "CodePilot.app" -type d | head -1)
+          [ -n "$APP" ] || { echo "::error::CodePilot.app not found for native crash smoke"; exit 1; }
+          LOG="$RUNNER_TEMP/codepilot-native-crash-smoke.log"
+          set +e
+          CODEPILOT_NATIVE_CRASH_SMOKE=1 "$APP/Contents/MacOS/CodePilot" >"$LOG" 2>&1
+          STATUS=$?
+          set -e
+          [ "$STATUS" -ne 0 ] || { echo "::error::native crash fixture exited successfully"; exit 1; }
+          grep -q "native crash fixture armed" "$LOG" || { echo "::error::native crash fixture did not arm"; tail -80 "$LOG"; exit 1; }
+          # SentryMinidump deliberately sets Electron crashReporter uploadToServer=false;
+          # the SDK reads and uploads completed Crashpad dumps on the next app start.
+          # Relaunch without the runtime crash flag so the pending dump can drain.
+          RECOVERY_LOG="$RUNNER_TEMP/codepilot-native-crash-recovery.log"
+          "$APP/Contents/MacOS/CodePilot" >"$RECOVERY_LOG" 2>&1 &
+          RECOVERY_PID=$!
+          for _ in $(seq 1 20); do
+            if grep -q "layer=electron_main" "$RECOVERY_LOG"; then
+              break
+            fi
+            if ! kill -0 "$RECOVERY_PID" 2>/dev/null; then
+              echo "::error::native crash recovery launch exited early"
+              tail -80 "$RECOVERY_LOG"
+              exit 1
+            fi
+            sleep 1
+          done
+          grep -q "layer=electron_main" "$RECOVERY_LOG" || { echo "::error::Sentry did not initialize on native crash recovery launch"; tail -80 "$RECOVERY_LOG"; exit 1; }
+          sleep 20
+          kill "$RECOVERY_PID" 2>/dev/null || true
+          wait "$RECOVERY_PID" 2>/dev/null || true
+          echo "Native crash fixture exited with expected non-zero status $STATUS; recovery launch drained pending minidumps"
 
       - name: Checksums
         run: cd release && shasum -a 256 CodePilot-*.dmg CodePilot-*.zip 2>/dev/null | tee checksums-macos.sha256
 
       - uses: actions/upload-artifact@v4
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.telemetry_smoke) }}
         with:
           name: release-macos
           path: |
@@ -209,7 +304,11 @@ jobs:
   build-windows:
     needs: verify-source
     if: ${{ github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'windows' }}
-    runs-on: windows-latest
+    # Pinned to windows-2022 (VS 2022 / MSVC v17). `windows-latest` rolled to a
+    # VS 18 image whose toolchain the bundled node-gyp can't detect ("unknown
+    # version undefined"), breaking native builds (zlib-sync / better-sqlite3)
+    # at `npm ci`. See v0.56.1 release failure.
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
 
@@ -220,13 +319,29 @@ jobs:
 
       - run: npm ci
 
-      - name: Build + package Windows x64
+      - name: Build Windows release bundles
         timeout-minutes: 35
-        run: |
-          npm run electron:build
-          npx electron-builder --win --x64 --config electron-builder.yml --publish never
+        env:
+          CODEPILOT_APP_CHANNEL: stable
+          CODEPILOT_SOURCE_MAPS: "1"
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: npm run electron:build
 
-      - name: Verify packaged version and native ABI
+      - name: Upload Windows source maps to Sentry
+        env:
+          CODEPILOT_APP_CHANNEL: stable
+          CODEPILOT_SOURCE_MAPS: "1"
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+        run: npm run sentry:sourcemaps:upload
+
+      - name: Package Windows x64
+        timeout-minutes: 35
+        run: npx electron-builder --win --x64 --config electron-builder.yml --publish never
+
+      - name: Verify packaged version, native ABI, and server startup
         shell: bash
         env:
           EXPECTED_VERSION: ${{ needs.verify-source.outputs.version }}
@@ -239,6 +354,7 @@ jobs:
           [ -n "$SQLITE" ] || { echo "::error::better-sqlite3 .node not found"; exit 1; }
           BIN=$(find release/win-unpacked -maxdepth 1 -name "CodePilot.exe" | head -1)
           ELECTRON_RUN_AS_NODE=1 "$BIN" -e "const path = require('node:path'); require(path.resolve(process.argv[1])); console.log('better-sqlite3 OK, ABI=' + process.versions.modules)" "$SQLITE"
+          node scripts/verify-packaged-server.mjs "$BIN" "$(dirname "$BIN")/resources"
 
       - name: Checksums
         shell: bash
@@ -252,11 +368,117 @@ jobs:
             release/checksums-windows.sha256
           retention-days: 7
 
+  build-linux:
+    needs: verify-source
+    if: ${{ github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'linux' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-22.04
+            deb_arch: amd64
+            rpm_arch: x86_64
+            file_arch: x86-64
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+            deb_arch: arm64
+            rpm_arch: aarch64
+            file_arch: ARM aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install RPM packaging support
+        run: sudo apt-get update && sudo apt-get install -y rpm
+
+      - run: npm ci
+
+      - name: Build Linux release bundle
+        timeout-minutes: 35
+        env:
+          CODEPILOT_APP_CHANNEL: stable
+          CODEPILOT_SOURCE_MAPS: "1"
+          CODEPILOT_TELEMETRY_SMOKE: "0"
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: npm run electron:build
+
+      - name: Upload Linux source maps to Sentry
+        env:
+          CODEPILOT_APP_CHANNEL: stable
+          CODEPILOT_SOURCE_MAPS: "1"
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+        run: npm run sentry:sourcemaps:upload
+
+      - name: Package Linux ${{ matrix.arch }}
+        timeout-minutes: 35
+        run: npx electron-builder --linux --${{ matrix.arch }} --config electron-builder.yml --publish never
+
+      - name: Verify Linux package architecture, native ABI, and server startup
+        env:
+          EXPECTED_VERSION: ${{ needs.verify-source.outputs.version }}
+          EXPECTED_DEB_ARCH: ${{ matrix.deb_arch }}
+          EXPECTED_RPM_ARCH: ${{ matrix.rpm_arch }}
+          EXPECTED_FILE_ARCH: ${{ matrix.file_arch }}
+        run: |
+          set -euo pipefail
+          APPIMAGE=$(find release -maxdepth 1 -name "CodePilot-*.AppImage" | head -1)
+          DEB=$(find release -maxdepth 1 -name "CodePilot-*.deb" | head -1)
+          RPM=$(find release -maxdepth 1 -name "CodePilot-*.rpm" | head -1)
+          for PACKAGE in "$APPIMAGE" "$DEB" "$RPM"; do
+            [ -n "$PACKAGE" ] || { echo "::error::missing Linux package"; exit 1; }
+            case "$PACKAGE" in *"$EXPECTED_VERSION"*) ;; *) echo "::error::$PACKAGE lacks version $EXPECTED_VERSION"; exit 1 ;; esac
+          done
+          [ "$(dpkg-deb -f "$DEB" Architecture)" = "$EXPECTED_DEB_ARCH" ] || {
+            echo "::error::DEB architecture does not match $EXPECTED_DEB_ARCH"
+            exit 1
+          }
+          [ "$(rpm -qp --qf '%{ARCH}' "$RPM")" = "$EXPECTED_RPM_ARCH" ] || {
+            echo "::error::RPM architecture does not match $EXPECTED_RPM_ARCH"
+            exit 1
+          }
+          UNPACKED=$(find release -maxdepth 1 -type d -name "linux*unpacked" | head -1)
+          [ -n "$UNPACKED" ] || { echo "::error::Linux unpacked app not found"; exit 1; }
+          BIN="$UNPACKED/codepilot"
+          [ -x "$BIN" ] || BIN="$UNPACKED/CodePilot"
+          [ -x "$BIN" ] || { echo "::error::CodePilot Linux executable not found"; exit 1; }
+          file "$BIN" | grep -F "$EXPECTED_FILE_ARCH" || {
+            echo "::error::Linux executable architecture does not match $EXPECTED_FILE_ARCH"
+            file "$BIN"
+            exit 1
+          }
+          SQLITE=$(find "$UNPACKED/resources" -path "*better-sqlite3*" -name "*.node" | head -1)
+          [ -n "$SQLITE" ] || { echo "::error::better-sqlite3 .node not found"; exit 1; }
+          ELECTRON_RUN_AS_NODE=1 "$BIN" -e "const path = require('node:path'); require(path.resolve(process.argv[1])); console.log('better-sqlite3 OK, ABI=' + process.versions.modules)" "$SQLITE"
+          node scripts/verify-packaged-server.mjs "$BIN" "$UNPACKED/resources"
+          echo "Linux build baseline: $(getconf GNU_LIBC_VERSION)"
+
+      - name: Checksums
+        run: cd release && sha256sum CodePilot-*.AppImage CodePilot-*.deb CodePilot-*.rpm | tee "checksums-linux-${{ matrix.arch }}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: |
+            release/CodePilot-*.AppImage
+            release/CodePilot-*.deb
+            release/CodePilot-*.rpm
+            release/checksums-linux-${{ matrix.arch }}.sha256
+          retention-days: 7
+
   release:
-    # Only on a `v*` tag push, and only after both build jobs succeed (default
+    # Only on a `v*` tag push, and only after all build jobs succeed (default
     # `needs` semantics skip this job if any dependency fails).
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
-    needs: [build-macos, build-windows]
+    needs: [build-macos, build-windows, build-linux]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -297,7 +519,7 @@ jobs:
           FILES=()
           while IFS= read -r f; do
             FILES+=("$f")
-          done < <(find artifacts -type f \( -name "*.dmg" -o -name "*.zip" -o -name "*.exe" \) | sort)
+          done < <(find artifacts -type f \( -name "*.dmg" -o -name "*.zip" -o -name "*.exe" -o -name "*.AppImage" -o -name "*.deb" -o -name "*.rpm" \) | sort)
           FILES+=("artifacts/SHA256SUMS.txt")
           echo "=== Release assets ==="
           printf '%s\n' "${FILES[@]}"

@@ -33,6 +33,11 @@ const GLOBALS_SOURCE = readFileSync(
   "utf-8",
 );
 
+const ELECTRON_MAIN_SOURCE = readFileSync(
+  resolve(__dirname, "../../../electron/main.ts"),
+  "utf-8",
+);
+
 test("layout.tsx stamps data-platform on <html> before hydration", () => {
   // The inline script must call setAttribute with 'data-platform' so
   // [data-platform="darwin"] CSS cascades apply on first paint, not
@@ -76,6 +81,7 @@ test("globals.css declares the --platform-* token layer", () => {
     "--platform-radius-window",
     "--platform-radius-control",
     "--platform-hover-alpha",
+    "--platform-surface-window",
     "--platform-surface-sidebar",
     "--platform-surface-bar",
     "--platform-surface-popover",
@@ -140,4 +146,60 @@ test("globals.css does NOT shadow content-layer tokens inside the macOS profile"
       `macOS profile must NOT override content-layer token ${forbidden} (HIG: content stays opaque)`,
     );
   }
+});
+
+test("macOS light and dark profiles preserve native material translucency", () => {
+  const macBlockMatch = GLOBALS_SOURCE.match(
+    /html\[data-platform="darwin"\]\[data-shell="electron"\]\[data-platform-style="auto"\]\s*\{([^}]*)\}/,
+  );
+  ok(macBlockMatch, "expected to find the macOS Electron profile block");
+  const macBlock = macBlockMatch![1];
+  ok(
+    macBlock.includes("--platform-surface-window: transparent"),
+    "light macOS shell must not cover the native material",
+  );
+  ok(
+    macBlock.includes(
+      "--platform-surface-sidebar: color-mix(in oklch, white 40%, transparent)",
+    ),
+    "light macOS sidebar must keep a low-alpha card tint",
+  );
+
+  const darkMacBlockMatch = GLOBALS_SOURCE.match(
+    /html\.dark\[data-platform="darwin"\]\[data-shell="electron"\]\[data-platform-style="auto"\]\s*\{([^}]*)\}/,
+  );
+  ok(
+    darkMacBlockMatch,
+    "expected to find the dark macOS Electron profile block in globals.css",
+  );
+  const darkMacBlock = darkMacBlockMatch![1];
+  ok(
+    darkMacBlock.includes("--platform-surface-window: transparent"),
+    "dark macOS shell must not cover the native material",
+  );
+  ok(
+    darkMacBlock.includes(
+      "--platform-surface-sidebar: color-mix(in oklch, var(--sidebar) 40%, transparent)",
+    ),
+    "dark macOS sidebar must keep a low-alpha card tint",
+  );
+  ok(
+    GLOBALS_SOURCE.includes(
+      "background-color: var(--platform-surface-window)",
+    ),
+    "the macOS Electron body must consume the platform window tint token",
+  );
+});
+
+test("macOS defaults to the lighter under-window material while retaining override support", () => {
+  ok(
+    ELECTRON_MAIN_SOURCE.includes("const envVibrancy = process.env.ELECTRON_VIBRANCY"),
+    "expected the macOS material override to remain available for diagnostics",
+  );
+  ok(
+    /const vibrancyChoice[\s\S]*\?\s*envVibrancy\s*:\s*['"]under-window['"]/.test(
+      ELECTRON_MAIN_SOURCE,
+    ),
+    "expected under-window to remain the default macOS material",
+  );
 });

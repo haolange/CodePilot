@@ -46,6 +46,7 @@ import {
   makeRunFailed,
   makeUnknownItem,
 } from '@/lib/runtime/event-adapter';
+import { diagnoseCodexNetworkError } from './error-diagnostics';
 
 interface CodexMappingContext {
   sessionId: string;
@@ -223,11 +224,18 @@ export function translateCodexNotification(
       const status = p.turn?.status;
       if (status === 'failed') {
         const err = p.turn?.error;
-        const message =
+        const rawMessage =
           (err?.message && err.message.trim().length > 0 ? err.message : null) ??
           err?.additionalDetails ??
           'Codex turn failed';
-        return makeRunFailed(base, { code: 'codex_turn_failed', message });
+        const diagnosticInput = [rawMessage, err?.additionalDetails]
+          .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+          .join(' ');
+        const diagnosis = diagnoseCodexNetworkError(diagnosticInput);
+        return makeRunFailed(base, {
+          code: diagnosis.code ?? 'codex_turn_failed',
+          message: diagnosis.code ? diagnosis.message : rawMessage,
+        });
       }
       // For completed / interrupted / inProgress (and missing status —
       // be conservative): preserve the real status as finishReason so
@@ -258,12 +266,18 @@ export function translateCodexNotification(
         willRetry?: boolean;
         turnId?: string;
       };
-      const baseMessage = p.error?.message?.trim() || 'Codex error (no message)';
+      const rawBaseMessage = p.error?.message?.trim() || 'Codex error (no message)';
       const additional = p.error?.additionalDetails?.trim();
+      const diagnosticInput = [rawBaseMessage, additional]
+        .filter((value): value is string => typeof value === 'string' && value.length > 0)
+        .join(' ');
+      const diagnosis = diagnoseCodexNetworkError(diagnosticInput);
+      const wasDiagnosed = diagnosis.code !== undefined;
+      const baseMessage = wasDiagnosed ? diagnosis.message : rawBaseMessage;
       const errorInfo = p.error?.codexErrorInfo;
       const classification = describeCodexErrorInfo(errorInfo);
       const parts = [baseMessage];
-      if (additional && additional !== baseMessage) parts.push(additional);
+      if (!wasDiagnosed && additional && additional !== baseMessage) parts.push(additional);
       if (classification) parts.push(`(${classification})`);
 
       // Phase 5b smoke round 6 (2026-05-18, user-driven) — willRetry
@@ -305,11 +319,13 @@ export function translateCodexNotification(
       }
 
       return makeRunFailed(base, {
-        code: typeof errorInfo === 'string'
-          ? errorInfo
-          : typeof errorInfo === 'object' && errorInfo
-            ? `codex:${Object.keys(errorInfo as Record<string, unknown>)[0] ?? 'unknown'}`
-            : 'codex_error',
+        code: diagnosis.code ?? (
+          typeof errorInfo === 'string'
+            ? errorInfo
+            : typeof errorInfo === 'object' && errorInfo
+              ? `codex:${Object.keys(errorInfo as Record<string, unknown>)[0] ?? 'unknown'}`
+              : 'codex_error'
+        ),
         message: parts.join(' '),
       });
     }
@@ -338,22 +354,19 @@ export function translateCodexNotification(
     case 'item/plan/delta':
     case 'item/reasoning/summaryPartAdded':
     case 'mcpServer/startupStatus/updated': {
-      // Phase 8 Phase 3 — MCP server lifecycle must not be silent. A
-      // `failed` startup surfaces as a visible (non-terminal) diagnostic
-      // so a broken Memory / user MCP is explainable in chat instead of
-      // just a missing tool; `ready` confirms it came up. `starting`
-      // (transient) stays quiet to avoid noise.
+      // Phase 8 Phase 3 — a failed MCP startup must remain diagnosable so a
+      // broken Memory / user MCP is explainable instead of looking like a
+      // missing tool. Successful readiness, however, is internal lifecycle
+      // noise: surfacing it through the generic status fallback exposes the
+      // raw `{ kind, payload }` envelope in the chat Thinking area. Keep
+      // `ready` and the transient `starting` state quiet; only failures cross
+      // the canonical boundary, where the clients render human copy while
+      // retaining the structured payload for diagnostics.
       const sp = params as { name?: string; status?: string; error?: string | null };
       if (sp.status === 'failed') {
         return makeUnknownItem(base, {
           sourceType: 'codex.mcpServerStartupFailed',
           payload: { server: sp.name ?? null, error: sp.error ?? null },
-        });
-      }
-      if (sp.status === 'ready') {
-        return makeUnknownItem(base, {
-          sourceType: 'codex.mcpServerReady',
-          payload: { server: sp.name ?? null },
         });
       }
       return null;
@@ -433,6 +446,17 @@ interface ThreadItemLike {
   // generic tool-call status / args
   status?: string;
   arguments?: unknown;
+  // collabAgentToolCall. `id` is the collaboration action id, not a
+  // child-thread id. A child identity exists only when app-server reports it
+  // through receiverThreadIds / agentsStates.
+  receiverThreadIds?: ReadonlyArray<string>;
+  agentsStates?: Readonly<Record<string, {
+    status?: string;
+    message?: string | null;
+  }>>;
+  model?: string | null;
+  prompt?: string | null;
+  reasoningEffort?: string | null;
   // mcpToolCall failure detail (McpToolCallError = { message })
   error?: { message?: string } | null;
   // fileChange
@@ -471,6 +495,10 @@ const TOOL_LIKE_ITEM_TYPES = new Set<string>([
   'webSearch',
   'imageGeneration',
   'imageView',
+  // Codex app-server owns the worker lifecycle. Surface it as a real tool
+  // card instead of hiding it in chat-only status; model fields are preserved
+  // verbatim when the installed app-server reports them.
+  'collabAgentToolCall',
 ]);
 
 /**
@@ -498,7 +526,6 @@ const CHAT_ONLY_ITEM_TYPES = new Set<string>([
   'enteredReviewMode',
   'exitedReviewMode',
   'contextCompaction',
-  'collabAgentToolCall',
   // NOTE: imageGeneration / imageView are NOT chat-only — they have no
   // streaming delta channel and their final item/completed is the only
   // way the result reaches the user. See TOOL_LIKE_ITEM_TYPES above for
@@ -566,6 +593,13 @@ function translateItemStarted(
       input: { path: item.path },
     });
   }
+  if (item.type === 'collabAgentToolCall') {
+    return makeToolStarted(base, {
+      toolId: id,
+      name: codexCollabToolName(item),
+      input: item,
+    });
+  }
   // Known chat-only item types — text / reasoning / review markers
   // etc. carry no extra info in the lifecycle event; the actual
   // content streams through dedicated delta methods. Return null
@@ -625,6 +659,20 @@ function translateItemCompleted(
       ...(media ? { media: [media] } : {}),
     });
   }
+  if (item.type === 'collabAgentToolCall') {
+    const isChildLifecycle = getSingleCodexCollabChildId(item) !== undefined;
+    return makeToolCompleted(base, {
+      toolId: id,
+      output: item,
+      // The outer status belongs to this collaboration action (wait,
+      // sendInput, closeAgent…), not to the child. Only anonymous/ambiguous
+      // collaboration activities surface that action failure as a tool error.
+      // Identity-bound child status is derived separately from agentsStates.
+      error: !isChildLifecycle && item.status === 'failed'
+        ? `Codex collaboration ${item.tool || 'action'} failed`
+        : undefined,
+    });
+  }
   // mcpToolCall — Phase 8 Phase 3. Surface the MCP tool error into the
   // canonical `error` field (not just buried in the output payload) so a
   // failed Memory / user MCP call renders as an errored tool card, the
@@ -652,6 +700,34 @@ function translateItemCompleted(
     });
   }
   return null;
+}
+
+/**
+ * Native Codex collaboration notifications describe collaboration actions,
+ * not necessarily child lifecycles. The app-server item id is per action, so
+ * treating every wait/sendInput/close call as a child creates duplicate
+ * capsules. Only an item that proves exactly one child identity may enter the
+ * Sub-agent rendering path. Anonymous or multi-child actions stay ordinary
+ * collaboration tool activity.
+ */
+function codexCollabToolName(item: ThreadItemLike): string {
+  if (getSingleCodexCollabChildId(item)) return 'codex_subagent';
+  const action = typeof item.tool === 'string' && item.tool.trim()
+    ? item.tool.trim().replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase()
+    : 'action';
+  return `codex_collaboration_${action}`;
+}
+
+function getSingleCodexCollabChildId(item: ThreadItemLike): string | undefined {
+  const ids = new Set<string>();
+  for (const id of item.receiverThreadIds || []) {
+    if (typeof id === 'string' && id.trim()) ids.add(id.trim());
+  }
+  for (const id of Object.keys(item.agentsStates || {})) {
+    if (id.trim()) ids.add(id.trim());
+  }
+  if (ids.size !== 1) return undefined;
+  return ids.values().next().value;
 }
 
 /**
@@ -771,13 +847,33 @@ export function translateCodexApproval(args: {
     }
 
     case 'item/permissions/requestApproval': {
-      const p = params as { reason?: string };
+      const p = params as {
+        reason?: string | null;
+        cwd?: string;
+        environmentId?: string | null;
+        permissions?: unknown;
+      };
       return {
         type: 'permission_request',
         ...base,
         toolName: 'Permissions',
+        toolInput: {
+          permissions: p.permissions ?? {},
+          ...(p.cwd ? { cwd: p.cwd } : {}),
+          ...(p.environmentId !== undefined ? { environmentId: p.environmentId } : {}),
+        },
         subject: 'Codex requests elevated permissions',
         details: p.reason ?? undefined,
+        // The generic UI exposes "Allow for session" only when at least one
+        // suggestion is present. The response bridge never trusts this
+        // renderer-round-tripped object as the grant itself: it echoes only
+        // the subset originally requested by Codex and uses this hint solely
+        // to select the session scope.
+        permissionHints: [{
+          type: 'codexPermissionGrant',
+          behavior: 'allow',
+          destination: 'session',
+        }],
         nativeRequestRef: {
           runtimeId: 'codex_runtime',
           raw: { method, params },
@@ -882,15 +978,18 @@ function buildImageGenerationMedia(item: ThreadItemLike): import('@/types').Medi
   // but no model id on this item, so we tag with the fixed identifier
   // 'codex-image' that downstream UI / filters can recognize.)
   const revisedPrompt = typeof item.revisedPrompt === 'string' ? item.revisedPrompt : undefined;
-  const sourceMetadata = revisedPrompt
-    ? { prompt: revisedPrompt, model: 'codex-image' }
-    : undefined;
+  const sourceMetadata = {
+    ...(revisedPrompt
+      ? { prompt: revisedPrompt, model: 'codex-image' }
+      : {}),
+    persistence: 'durable_asset' as const,
+  };
   return {
     type: 'image',
     mimeType,
     ...(savedPath ? { localPath: savedPath } : {}),
     ...(result && !savedPath ? { data: result } : {}),
-    ...(sourceMetadata ? { sourceMetadata } : {}),
+    sourceMetadata,
   };
 }
 
@@ -910,6 +1009,9 @@ function buildImageViewMedia(item: ThreadItemLike): import('@/types').MediaBlock
     type: 'image',
     mimeType: mimeTypeFromPath(path) ?? 'image/png',
     localPath: path,
+    sourceMetadata: {
+      persistence: 'preview_only',
+    },
   };
 }
 

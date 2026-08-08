@@ -32,8 +32,9 @@ export function assertContained(workspaceDir: string, relativePath: string): str
 
   // If the resolved path exists, check it's not a symlink pointing outside
   try {
-    const real = fs.realpathSync(resolved);
-    if (real !== normalizedWorkspace && !real.startsWith(normalizedWorkspace + path.sep)) {
+    const realWorkspace = fs.realpathSync.native(normalizedWorkspace);
+    const real = fs.realpathSync.native(resolved);
+    if (real !== realWorkspace && !real.startsWith(realWorkspace + path.sep)) {
       throw new Error(`Symlink target escapes workspace boundary: ${relativePath}`);
     }
   } catch (e) {

@@ -19,51 +19,63 @@
  */
 export async function register() {
   if (process.env.NEXT_RUNTIME === 'nodejs') {
+    // Electron passes the provider data-encryption key only to this packaged
+    // server process. Consume it into process-global memory immediately and
+    // delete the env entries before any Agent/tool subprocess can inherit it.
+    const { consumeProviderSecretEnvironment } = await import('@/lib/provider-secret-crypto');
+    consumeProviderSecretEnvironment();
+
     if (process.env.NODE_ENV !== 'development') {
       // Initialize Sentry for server-side error capture (respects opt-out marker file)
-      const dsn = process.env.NEXT_PUBLIC_SENTRY_DSN;
-      if (dsn) {
-        const fs = await import('fs');
-        const path = await import('path');
-        const os = await import('os');
-        const markerPath = path.join(os.homedir(), '.codepilot', 'sentry-disabled');
-        const optedOut = fs.existsSync(markerPath) && fs.readFileSync(markerPath, 'utf-8').trim() === 'true';
-        if (!optedOut) {
-          const Sentry = await import('@sentry/node');
-          Sentry.init({
-            dsn,
-            environment: process.env.NODE_ENV,
-            release: `codepilot@${process.env.NEXT_PUBLIC_APP_VERSION}`,
-            tracesSampleRate: 0,
-            ignoreErrors: [
-              // Aborts — user/client cancellation, not bugs
-              'AbortError',
-              'Operation aborted',
-              'The operation was aborted',
-              'signal is aborted',
-              // Electron renderer doesn't implement window.prompt — known and handled with PromptDialog
-              'prompt() is not supported',
-              // Browser quirk: not a real error but Chromium reports it
-              'ResizeObserver loop',
-            ],
-            beforeSend(event) {
-              // Strip auth headers
-              if (event.request?.headers) {
-                delete event.request.headers['x-api-key'];
-                delete event.request.headers['authorization'];
-                delete event.request.headers['anthropic-api-key'];
-              }
-              // Add server context
-              event.tags = {
-                ...event.tags,
-                runtime: 'server',
-                'os.platform': process.platform,
-                'os.arch': process.arch,
-                'node.version': process.version,
-              };
-              return event;
-            },
-          });
+      const fs = await import('fs');
+      const path = await import('path');
+      const os = await import('os');
+      const { configureNextServerIntegrations, resolveTelemetryConfig, TELEMETRY_IGNORE_ERRORS } = await import('@/lib/telemetry/contract');
+      const { isProviderFailureHandled } = await import('@/lib/telemetry/provider-marker');
+      const { sanitizeTelemetryBreadcrumb, sanitizeTelemetryEvent } = await import('@/lib/telemetry/sanitize');
+      const markerPath = path.join(os.homedir(), '.codepilot', 'sentry-disabled');
+      const optedOut = fs.existsSync(markerPath) && fs.readFileSync(markerPath, 'utf-8').trim() === 'true';
+      const config = resolveTelemetryConfig({
+        dsn: process.env.NEXT_PUBLIC_SENTRY_DSN,
+        channel: process.env.NEXT_PUBLIC_CODEPILOT_CHANNEL,
+        version: process.env.NEXT_PUBLIC_APP_VERSION,
+        nodeEnv: process.env.NODE_ENV,
+        optedOut,
+      });
+      if (config.enabled) {
+        const Sentry = await import('@sentry/node');
+        const { createTelemetrySmokeError, telemetrySmokeEnabled } = await import('@/lib/telemetry/smoke');
+        Sentry.init({
+          dsn: config.dsn,
+          environment: config.environment,
+          release: config.release,
+          sendDefaultPii: false,
+          tracesSampleRate: 0,
+          ignoreErrors: TELEMETRY_IGNORE_ERRORS,
+          integrations: (defaults) => configureNextServerIntegrations(
+            defaults,
+            Sentry.httpIntegration({
+              trackIncomingRequestsAsSessions: false,
+              maxIncomingRequestBodySize: 'none',
+            }),
+          ),
+          beforeBreadcrumb(breadcrumb) {
+            return sanitizeTelemetryBreadcrumb(breadcrumb);
+          },
+          beforeSend(event, hint) {
+            if (isProviderFailureHandled(hint.originalException)) return null;
+            return sanitizeTelemetryEvent(event, {
+              layer: 'next_server',
+              channel: config.channel,
+              platform: process.platform,
+              arch: process.arch,
+            });
+          },
+        });
+        if (telemetrySmokeEnabled(process.env.NEXT_PUBLIC_CODEPILOT_TELEMETRY_SMOKE)) {
+          const eventId = Sentry.captureException(createTelemetrySmokeError('next_server'));
+          console.log(`[telemetry-smoke] layer=next_server event_id=${eventId}`);
+          await Sentry.flush(5_000);
         }
       }
     }
@@ -71,8 +83,16 @@ export async function register() {
     const { initRuntimeLog } = await import('@/lib/runtime-log');
     initRuntimeLog();
 
-    // Start the task scheduler so persisted tasks resume on cold boot
-    // (previously only started as a side effect of /api/chat)
+    // Reconcile assistant heartbeat desired state before the scheduler starts
+    // scanning due rows. This repairs missing/drifted rows on cold boot and
+    // removes disabled rows without waiting for the Settings page to open.
+    const { reconcileAssistantHeartbeat } = await import('@/lib/assistant-heartbeat');
+    const heartbeat = await reconcileAssistantHeartbeat();
+    if (heartbeat.status === 'blocked') {
+      console.warn('[heartbeat] startup reconciliation blocked:', heartbeat.reason);
+    }
+
+    // Start the task scheduler so persisted tasks resume on cold boot.
     const { ensureSchedulerRunning } = await import('@/lib/task-scheduler');
     ensureSchedulerRunning();
   }

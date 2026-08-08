@@ -1,7 +1,7 @@
 # Issue Tracker — 统一问题跟踪
 
 > 创建时间：2026-04-13
-> 最后更新：2026-06-06（新增 B-024 Codex Runtime Stop 后恢复发送：#578 前端 force-abort 已修，但 `/api/chat/interrupt` 漏掉 `codex_runtime` fan-out，待 Claude Code 按 [codex-stop-recovery.md](codex-stop-recovery.md) 修）
+> 最后更新：2026-07-20（Codex CLI/登录发布 smoke 回写；B-029 打包污染与签名阻断已修复）
 > 合并自：`open-issues-2026-03-12.md` + `v0.48-post-release-issues.md` + GitHub Issues 最新盘点
 
 **AI 须知：**
@@ -9,6 +9,22 @@
 - 修复后标注状态、修复版本、关键 commit
 - 定期检查 Sentry 和 GitHub Issues 是否有新增项
 - 状态说明：🔴 未修复 | 🟡 部分修复 | 🟢 已修复 | ⚪ 需验证 | 🔵 设计如此
+
+---
+
+## 〇、v0.56.x Stability / Trust 治理 issue（2026-06-19 纳入）
+
+GitHub milestone `v0.56.x Stability / Trust`（#1）+ P0/P1 label 体系已建（见 [.github/TRIAGE.md](../../../.github/TRIAGE.md)）。以下 7 个 issue 已用**当前源码**重新核验（不采信 issue 自述根因），逐条证据与修法见 [v0.56.x-stability-trust.md](v0.56.x-stability-trust.md) 的「2026-06-19 Claude Code 源码复核」表，此处只做看板索引、不重复分析。
+
+| Issue | 复核 | label | Phase | 状态 |
+|-------|------|-------|-------|------|
+| [#635](https://github.com/op7418/CodePilot/issues/635) 频繁自动中断 | 根因已定（SDK 排队期 app 层完全静默：keep_alive 被 SDK 传输层过滤、api_retry 仅失败后发被丢、首 token 前无 stream_event）；分级超时核心已实现（首字节前 600s / 后 330s）+ api_retry 接线 | P0-crash-or-interrupt, needs-repro | 2 | 🟡 分级超时核心已实现（防误杀），待真实慢 proxy smoke + 首条 /chat UI follow-up |
+| [#632](https://github.com/op7418/CodePilot/issues/632) 上下文膨胀/>100% | ">100%" 确认显示 bug；跨会话不成立；假%/>100% 已修（effective-base-URL 写入 gate + 渲染期 trusted gate + clamp） | P1-context | 2 | 🟡 假%已修，item3 分母对齐待续 |
+| [#629](https://github.com/op7418/CodePilot/issues/629) resume 400 空 assistant | POC-B 实证 4 proxy 文案 → 读 errors[] 判别 + 补 `no conversation found` pattern + claude-client 清 id；Codex 复审 smoke 抓到 route.ts 把 result.session_id **无条件写回覆盖了清理**（P1）+ is_error result 不落错误气泡（P2），已补：route 对 session-state is_error 不写回坏 id + 用 errors 设 errorMessage | P1-runtime-session | 2 | 🟢 已修 + GitHub 已关闭（2026-06-29 Phase 7A，v0.56.2）（Codex 端到端 smoke 通过：两轮坏 resume → 第二轮 fresh、不再 No conversation found） |
+| [#628](https://github.com/op7418/CodePilot/issues/628) @file 误改上传副本 | 真实风险（fileResponseToAttachment 丢真实路径 → route 把 mention 也写 .codepilot-uploads 副本 → AI 改副本）；核心已修：FileAttachment 加 originPath、mention 保留真实路径、route 校验 cwd 内（复用 `assertRealPathInBase` + `rejectIfSymlink`，拒 in-tree symlink 逃逸，Codex P1）后引真实路径跳过 copy，AI Read/Edit 落真实文件 | P1-file-reference | 3 | 🟢 已修 + GitHub 已关闭（2026-06-29 Phase 7A，v0.56.2）（Codex 真机 smoke 通过：@file → AI Edit → git diff 真实文件变更；symlink 走降级不逃逸） |
+| [#634](https://github.com/op7418/CodePilot/issues/634) Native 工具不可用 | 根因不成立——工具齐全；疑旧版 | P1-runtime-session, needs-repro | — | ⚪ 待 Native smoke + 版本 |
+| [#626](https://github.com/op7418/CodePilot/issues/626) 更新提示高 CPU | polling 排除；候选 pulse 动画×backdrop blur | P1-performance | 4 | 🔴 待 profiler |
+| [#633](https://github.com/op7418/CodePilot/issues/633) Win11 装不上 | mac 无法复现；NSIS-only+未签名+无 portable+CI 不验安装 | P1-installer-update, needs-repro | 4 | 🔴 待 Windows repro |
 
 ---
 
@@ -55,14 +71,19 @@
   - 触发条件：升级 `@anthropic-ai/claude-agent-sdk` 时主动跑一次
 
 #### B-002 Sentry: AI_NoOutputGeneratedError 持续增长
-- **状态:** 🟡 部分修复（v0.48.1 修了 eventCount→hasContent 误报）
+- **状态:** 🟡 应用侧恢复修复完成，真实 provider 成功 smoke 仍被开发机 DNS 阻断。无 DNS 时已从 111–285s 空等改为约 3.2s 明确失败；正常终态延迟遥测已接入。
 - **Sentry 数据:** 107x → 170x（2026-04-11）
 - **已修复:** 空响应误报（agent-loop.ts eventCount→hasContent）
 - **残留原因：**
   - sdkProxyOnly provider 被 native runtime 错误调用
   - 第三方代理模型 ID 不识别
   - 请求格式不匹配
-- **下一步:** 在 Sentry 上报中加 provider/model 信息定位具体来源
+- **2026-07-19 现场证据：**
+  - DeepSeek Claude Code 轮次约 111s，只落 83 字诊断内容，terminal result 为 `error_during_execution`；GLM 约 285s、OpenCode Go 约 206s，后两条均为用户中止。以上是总轮次时间，不能当作 TTFT。
+  - Agent SDK 提供的 `stream_event.ttft_ms`、result `duration_ms/duration_api_ms` 现已写入 assistant `token_usage.runtime_latency`；同时记录 CodePilot wall clock、真实 `api_retry` 事件数、terminal subtype 与 fresh/resume/fallback，不记录 prompt/工具参数/凭据。
+  - 本机直连 Kimi、GLM、Google Fonts 都卡在 DNS；`scutil --dns` 返回 `No DNS configuration available`，无 HTTP proxy 配置，`127.0.0.1:7890` 也未监听。当前所有真实 provider smoke 都会被网络超时污染。
+- **2026-07-19 恢复验证:** Claude Code × GLM 临时真实 route 会话在当前 `No DNS configuration available` 环境中 **3188ms** 返回 `NETWORK_UNREACHABLE`，并自动删除测试 session；不再等待 10 分钟首字 fuse。DNS preflight 只解析 hostname，代理配置/localhost/IP 会跳过，避免破坏代理远端解析。
+- **下一步:** 恢复开发机 DNS 后，以同一会话/同一模型重跑并读取持久化的 TTFT、API/总时长、retry、terminal 与 resume 字段。若仍慢，再按 provider/model 与 resume/fresh session 分层定位。
 
 ---
 
@@ -151,6 +172,28 @@
 - **Sentry 数据:** 8x → 145x（大增，部分是用户配错模型名如 `gemma:e4b`）
 - **根因:** native runtime 的 `createModel()` 短别名映射在某些路径被绕过；第三方代理不接受短别名
 - **下一步:** 确保所有路径经过 `isShortAlias()` 映射；对用户输入的无效模型名给出明确错误提示
+
+#### B-028 Codex CLI 安装变化后不会重新发现可用版本
+- **状态:** 🟡 代码、Tier 2、production UI、最终签名 arm64 `.app`/DMG/ZIP 的动态发现与刷新 smoke 已完成（2026-07-20）；仅真实 Homebrew 旧版 + ChatGPT.app 双安装终验待完成
+- **计划:** [codex-cli-discovery-refresh.md](codex-cli-discovery-refresh.md)
+- **现象:** 机器曾同时存在低版本 Homebrew Codex CLI 与客户端内置的新 CLI，CodePilot 实际使用了旧 `/opt/homebrew/bin/codex`；用户卸载旧版本后，设置页刷新仍不会自动切换到客户端内置 CLI。
+- **现场证据:** 0.58.1 日志在 2026-07-08 尚能发现 `/Applications/Codex.app/Contents/Resources/codex` 0.142.5，并在两个候选中正确选择新版；2026-07-13 起却把 Homebrew 0.45.0 记为 `reason: 'sole candidate'`。当前真机核实 OpenAI 客户端已变为 `/Applications/ChatGPT.app`（bundle id 仍为 `com.openai.codex`），内置 `/Applications/ChatGPT.app/Contents/Resources/codex` 版本为 0.145.0-alpha.18，而旧 `/Applications/Codex.app` 已不存在。说明主因是客户端 bundle 改名后候选漏检，不是版本比较函数把两个已发现候选排错。
+- **源码根因 1（缓存失效）:** `findCodexBinary()` 首次解析后把路径写入进程级 `resolvedBinaryCache`，之后直接返回；既不检查缓存路径是否仍存在，也不发现运行期间新增的更高版本候选。`resetCodexBinaryCacheForTests()` 仅供测试；`disposeCodexAppServer()` 也不清 binary/version cache。
+- **源码根因 2（刷新是假刷新）:** `RuntimePanel.refreshCodexStatus()` 只让前端再次 GET `/api/codex/status`；status route 调用 `getCodexAvailability()`，最终仍读取同一缓存。按钮语义是“刷新”，实现却没有重新扫描安装状态。
+- **源码根因 3（bundle 改名 + 路径覆盖窄）:** macOS 客户端 fallback 只硬编码旧 `/Applications/Codex.app/Contents/Resources/codex`；没有覆盖当前 `/Applications/ChatGPT.app/Contents/Resources/codex`，也没有覆盖两种 bundle 名的 `~/Applications/...` 用户级安装位置。
+- **影响:** 可用的新 CLI 已存在时，Codex Runtime 仍被已删除或过旧的路径锁死，必须完全退出 CodePilot 的 server 进程才可能恢复；如果客户端安装在未覆盖路径，重启也无效。属于 Runtime resolver 的 P1 功能阻断。
+- **修复方向:** ① 保留旧 `Codex.app` 兼容，同时加入系统/用户 Applications 下的 `ChatGPT.app` 候选；所有已发现候选仍按可解析版本最高者胜出。② 缓存命中前校验候选集合/已选路径；安装变化时原子清除 binary/version/失败 availability 并重扫。③ 提供 production rescan，由设置页刷新显式触发；已有 healthy app-server/active turn 时不热杀进程，避免“修刷新”引入会话中断。④ UI 展示实际选中的路径与版本，让“正在用哪个 Codex”可验证。
+- **验证要求（Tier 2）:** 单测覆盖 `ChatGPT.app` 新路径、旧 `Codex.app` 兼容、“旧 PATH 先缓存→新增较新客户端→显式刷新改选”“已选路径被卸载→自动重扫”“系统/用户 Applications 候选”“两个候选仍选最高版本”；API/component test 断言刷新按钮确实触发后端 rescan；打包 smoke 在两版本共存、运行中卸载旧版本、仅新版客户端三种状态下验证 selected breadcrumb 与 app-server 可用性。
+- **已落地:** 新增 `ChatGPT.app` / 旧 `Codex.app` 的系统与用户级四类候选；候选 fingerprint 变化会同步失效 resolution、version probe 与 failure availability；status POST 提供安全强制重扫，healthy app-server 不热切；Runtime 展示真实 CLI path。targeted 104/104、最终全量 unit 4422/4422、typecheck、production build 均通过；本机无 PATH CLI 时已从 `ChatGPT.app` 成功 initialize 到 ready 后正常 dispose。
+- **smoke（2026-07-20）:** 仓库 `@smoke` 19/19；production UI 与可启动 arm64 `.app` 均验证临时旧路径 spawn_failed → 路径消失 → 点击刷新改选 ChatGPT.app，失败状态清除。真实 Codex Runtime turn 返回 `SMOKE_OK`，运行中刷新前后 app-server PID 不变；最终 0.58.2 签名 `.app` 的隔离 server smoke 中 health 200，Codex status GET/POST 均返回 `/Applications/ChatGPT.app/Contents/Resources/codex`。临时 shim 不等同真实 Homebrew 0.45.0，因此双安装真机终验仍保留。
+- **已知未覆盖:** Windows 仍只覆盖 PATH `.exe` / `.cmd` shim；Windows ChatGPT/Codex 客户端是否内置 CLI、bundle 路径与升级行为尚无真机证据，已作为 tech debt 记录，不阻断本次 macOS 修复。
+
+#### B-029 macOS standalone 误打包工作树内 release，codesign 失败
+- **状态:** 🟢 已修复（2026-07-20）；0.58.2 arm64 `.app`/DMG/ZIP 已生成并完成签名、内容与启动 smoke
+- **现象:** `electron:pack:mac` 已完成 Next/Electron build、arm64 app layout 与 `better-sqlite3` Electron ABI rebuild，但最终 codesign 递归进入 `CodePilot.app/Contents/Resources/standalone/.claude/worktrees/product-refactor-research/release/.../Electron Framework.framework` 后报 `bundle format unrecognized, invalid, or unsuitable`，命令退出 1。
+- **根因证据:** Next/Turbopack 的 instrumentation NFT 不应用 route 级 `outputFileTracingExcludes`，动态 HOME/workspace 文件访问把整个项目根误判为运行依赖。除 `.claude/worktrees/**/release` 的嵌套 Electron 产物外，审计还发现本地 `data/*.db`、`.codepilot`、上传文件与文档被复制进 standalone；前者使递归 codesign 失败，后者构成不可接受的发布数据泄漏风险。
+- **修复:** Electron production build 先精确清理 `release/.next/dist-electron`；动态 HOME 扫描增加 Turbopack ignore 边界；Next build 后以严格根目录 allowlist 只保留 `.next`、`node_modules`、`server.js`、`package.json`、`cache-handler.js`，移除其余误追踪内容并 fail-closed 复核。新增 4 条行为/合同测试覆盖安全清理、泄漏阻断、最小 allowlist 与构建顺序。
+- **验证:** 最终 0.58.2 arm64 `.app` 的 standalone 只有 Next runtime 5 项，electron-builder 额外加入受控 `public/themes`；包内无本地 DB、上传、`.codepilot/.claude/.git`。`codesign --verify --deep --strict` 通过；DMG `hdiutil verify` 通过；隔离启动最终 packaged server 后 health 200，Codex status GET/POST 均真实选中 ChatGPT.app CLI。生成 `CodePilot-0.58.2-arm64.dmg` 与 `.zip`，B-029 不再阻断发布。
 
 ---
 
@@ -276,20 +319,34 @@
 - **影响:** 日志暴涨会吃磁盘；无界 `serverErrors` 会把同一批 tracing 噪声留在主进程内存里，是 Codex Runtime 闪退/卡死的高置信候选根因。当前日志没有 `panic` / OOM / uncaught 栈，仍需 live smoke 和 crash breadcrumb 定案。
 - **下一步:** Claude Code 优先修 P0 logging 上限：主日志 size rotation、`serverErrors` ring buffer、Codex tracing 默认降级/过滤；随后补 `render-process-gone` / `child-process-gone` / uncaught breadcrumb，并跑真实 Codex `require_escalated` / network approval smoke。
 
+#### B-026 Kimi for Coding 首轮不会生成语义会话标题
+- **状态:** 🟢 已修复，真实 provider wire smoke 通过；待用户用新会话复验 UI 即时同步（2026-07-19）
+- **现象:** Kimi for Coding 能正常回复，侧栏标题却一直停在首条消息 fallback；同版本 GLM + Claude Code 可正常生成标题。
+- **根因:** Kimi Code `/coding/` 模型为 always-thinking；标题辅助调用却强制 `MAX_THINKING_TOKENS=0`，且 `CLAUDE_CODE_MAX_OUTPUT_TOKENS=16` 由 thinking 与 final 共享，8 秒 timeout 也短于现场普通回复约 10 秒。错误被自动命名的静默降级合同吞掉，所以 UI 只呈现 fallback。
+- **修复:** 按精确官方 endpoint（`api.kimi.com/coding/`）选择 provider-managed thinking profile：移除继承的 `MAX_THINKING_TOKENS`，输出预算 2048，后台 timeout 30 秒；不按可编辑 provider 名称或 Moonshot 品牌猜测。默认 provider 继续保持 16 tokens / 8 秒 / thinking disabled，用户可见标题始终钳到 50 grapheme。
+- **验证:** 标题相关定向测试 68/68；真实现有 Kimi 凭据 synthetic wire smoke 4043ms 生成可用标题；详见 [automatic-chat-titles.md](automatic-chat-titles.md) Smoke Ledger。旧 session 已消耗一次 attempt，不自动重试，避免重复外发首条消息。
+
+#### B-027 Codex Account 添加失败时点击无可见反馈
+- **状态:** 🟢 UI 修复、targeted guardrail、production UI 与可启动 arm64 `.app` 失败 smoke 均完成（2026-07-20）
+- **现象:** 执行引擎页显示 Codex「应用服务启动失败」；服务商 → 添加服务 → 点击 Codex Account 后添加弹窗关闭，但没有登录弹窗、错误提示或后续动作，用户感知为“点击卡片没反应”。
+- **现场根因:** 该机器只剩 `/opt/homebrew/bin/codex`（日志为 `reason: 'sole candidate'`；历史 probe 明确是 `codex-cli 0.45.0`），而 `~/.codex/config.toml` 含 `model_reasoning_effort = "xhigh"`。旧 CLI 仅接受 `minimal/low/medium/high`，`app-server` 启动即 fatal；0.58.1 的快速失败防线正确 kill 子进程，但多个 status/login/models 请求仍会再次 spawn。
+- **UI 根因:** `ProviderManager.handleCodexLogin()` 失败时会 `setCodexError(...)`，但添加卡片的 `onClick` 先执行 `setAddServiceOpen(false)`；而 `codexError` 只渲染在 `(openaiAuth?.authenticated || codexAccount?.kind === 'logged_in')` 条件内。首次配置且未登录任何 OAuth 服务时该 section 不存在，所以错误被状态树吞掉。
+- **影响:** 环境/版本错误本可操作（升级 Codex CLI，或临时把旧 CLI 不支持的配置降到 `high`），UI 却不给原因和恢复入口；同时重复点击/刷新产生 app-server 重启风暴。属于 Provider/Runtime 状态的假静默，违反用户可见状态须有真实 source breadcrumb 的语义验收规则。
+- **修复方向:** ① 添加服务请求失败时保持弹窗并显示 inline error，或使用页面级 toast；错误呈现不能依赖已有 OAuth 连接。② 将 app-server 的原始失败分类为可操作提示，至少展示选中的 binary 路径、探测版本和不兼容配置字段，避免只写「启动失败」。③ 对确定性的启动期 fatal 增加短期失败缓存/单航班，刷新或用户显式重试再解除，避免同一页面多个消费者反复 spawn。
+- **验证要求（Tier 2）:** targeted component test 覆盖 `logged_out + POST /api/codex/login 失败`，断言错误可见且入口可重试；app-server manager/status/login 并发测试断言同一 fatal 不产生 spawn 风暴；`npm run test`；打包或等价 UI smoke 覆盖首次配置 Codex、旧 CLI + 不兼容 config、升级后刷新恢复三条路径。
+- **已落地:** Codex Account 添加卡片不再在请求前关闭弹窗；只有登录启动成功才切换到登录弹窗，失败会在当前 Add Service 弹窗以 `role=alert` 展示后端错误，按钮解除 loading 后可直接重试。targeted source/component guardrail 已通过。
+
 ---
 
 #### B-018 macOS 启动 / 新对话时弹 "找不到用于储存 'apple' 的钥匙串" 对话框
 - **Issue:** [#501](https://github.com/op7418/CodePilot/issues/501)
-- **状态:** 🟡 非代码缺陷 + 有规避方案未落地（2026-04-16 诊断）
-- **现象:** v0.50.3 上部分 macOS 用户启动或点"新对话"时，系统弹 `Cannot find keychain to store 'apple'` 对话框；仅"取消/还原为默认"两选项，点取消后反复弹（3-5 次），不影响最终功能但体验阻塞
-- **维护者环境不复现**（两台机器均未触发）；报告者（vivi2886）使用第三方 API Key，CodePilot DB 无 OAuth token 记录也仍触发
-- **根因诊断:**
-  - 我们自己的代码**零处**调用 keychain / safeStorage / keytar（grep `'apple'` / `safeStorage` / `keytar` 于 `src/` 和 `electron/` 均无命中；仅 `claude-client.ts:1723` 的注释和 `main.ts:744` 的 CSS font-family 含 "apple"）
-  - "apple" 这个 service name 是 **Electron 底层 Chromium 在 macOS 访问 login keychain 的默认行为**（Chromium 用 keychain 加密 cookie / password manager 数据）
-  - 用户本机 login keychain 状态异常时（常见：系统重装后未迁移、第三方清理软件动过、登录密码重置过 keychain 未同步解锁）Chromium 初始化尝试访问 keychain 就会弹这个系统对话框
-- **规避方案（未实施）:** `electron/main.ts` 顶部加 `app.commandLine.appendSwitch('password-store', 'basic')`，让 Chromium 不碰系统 keychain，改用 profile 本地加密。副作用：Chromium 存的 cookie 不再经 keychain 加密——对我们这种本地 Electron 应用没敏感 cookie（所有凭据都在我们自己的 sqlite），影响可接受
-- **下一步:** 下个小版本（0.50.4 或独立 hotfix）加 `password-store=basic` 开关；issue 里可先回复用户说明"环境相关非代码 bug + 系统 Keychain Access 修复步骤 + 下版会加规避开关"
-- **Sentry 可见度:** 这个对话框是 macOS 系统级弹窗，不走 Electron renderer 的 JS 异常通道，Sentry 不会采到——所以只能靠 GitHub Issue 观测规模
+- **状态:** 🟢 代码修复 + 定向回归完成；待受影响 Mac packaged smoke（2026-08-07）
+- **Signal:** v0.50.3 已有用户在启动/新对话时看到 `Cannot find keychain to store 'apple'`；2026-08-05 又收到会话生成阶段的真实截图，文本为“找不到用于储存 `kevinyoung` 的钥匙串”，按钮仅“取消/还原为默认”。用户名随报告者变化，说明它不是固定 service name。
+- **更正后的根因:** 旧诊断把弹窗归因于 Chromium 且建议 `password-store=basic`，现已被直接调用链证据推翻。当前 bundled Claude CLI 会在每个 CLI subprocess 启动时以 `process.env.USER || os.userInfo().username` 作为 `-a`，并通过 PATH 调用 `security find-generic-password ... -s 'Claude Code*'` 做两次 eager prefetch；截图中的 `kevinyoung` 正好是该 account 参数。旧报告发生于 CodePilot 引入 `safeStorage` 之前，也排除了 provider secret 是历史主因。v0.65+ 的 Electron `safeStorage` 现在构成第二条可能触发链，需一并前置门控。
+- **Fix:** 新增只读 `/usr/bin/security default-keychain -d user` 探测，只解析配置路径并检查文件存在，不读取/解锁/创建/修复任何 credential item。确认 default keychain 缺失、未配置或 probe 失败时：① Electron Main 在进入 `safeStorage` 前跳过 provider DEK 初始化；② packaged Next child 收到脱敏状态码；③ 每个 Claude subprocess 的 PATH 前置 packaged `security` shim。shim 只对 `Claude Code*` service 的 find/add/delete 和无参数 `show-keychain-info` 非交互返回失败，让 Claude 使用已有环境变量/文件 fallback；其余命令以固定 `/usr/bin/security "$@"` 原样转发。健康 keychain 不改 PATH、不改变 OAuth/Provider 行为。复核所有 SDK `query()` 后又关闭一条“偶发”漏口：`CONTEXT_TOO_LONG` 压缩重试原先直接复制 `process.env`，现复用同一 request 已构建的 guarded/provider-isolated env。
+- **明确不采用:** 不设置 `password-store=basic`——Chromium 该 switch 的 `basic` backend 是 Linux 路径，不能作为 macOS 修复；不设置 `CLAUDE_CODE_SIMPLE` / `--bare`——它会同时关闭 hooks、插件同步、项目指令发现等正常能力。
+- **Verify:** `macos-keychain-guard.test.ts` 覆盖 available/missing/unconfigured/timeout、非 macOS no-op、shim 精确拒绝与 argv 固定转发、bundled Claude CLI 仍经 PATH lookup；`provider-secret-electron-contract.test.ts` 锁定 unavailable 分支在 safeStorage 之前；`electron-packaging-hygiene.test.ts` 锁定资源进包；源码钉禁止 reactive retry 重新使用 raw `process.env`。定向回归 58/58、Tier 1 全量 5131 pass / 0 fail / 1 skip，Electron Main one-shot bundle、targeted ESLint、hook/docs-drift lint 均通过。本机真实 default-keychain probe 为 `available`。维护者未破坏/改写本机钥匙串来制造复现；发布前仍需在报告者或隔离 macOS 账户上做 packaged smoke。
+- **可观测性:** Main log 只记录 `default_keychain_*` 原因码；Provider Doctor 增加 `auth.macos-default-keychain-unavailable` warning，不记录用户名、keychain 路径或凭据。系统 modal 本身仍不进入 Sentry。
 
 ---
 
@@ -382,6 +439,8 @@
 | ClaudeCodeCompat 503/500/400 | 9x | ↑ | — | 第三方代理 |
 | AI_MissingToolResultsError | 5x | → | — | 🔴 |
 | HMAC apikey not found | 4x | → | — | 特定 Provider |
+
+2026-08-07 补充：official 0.65 累计确认 57 条 `AI_MissingToolResultsError`，真实 stack 位于下一轮 AI SDK prompt conversion。未来 terminal 与 legacy history 的配对修复已在 [production-observation-remediation-2026-08-07.md](production-observation-remediation-2026-08-07.md) 落地并有真实 SDK 正/反对照；状态改为 **🟡 Code complete，待新 stable cohort 验证**。上表 5x 保留为 2026-04-11 历史快照，不覆盖历史计数。
 
 ---
 

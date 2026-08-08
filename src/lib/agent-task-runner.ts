@@ -46,6 +46,8 @@
  */
 
 import type { ScheduledTask, TaskRunStatus } from '@/types';
+import { normalizePermissionProfile } from '@/lib/permission/profile';
+import { classifyHeartbeatOutcome, isHeartbeatContentEmpty } from '@/lib/heartbeat';
 
 export interface AgentTaskRunResult {
   status: TaskRunStatus;
@@ -146,9 +148,10 @@ export async function ensureTaskBoundSession(task: ScheduledTask): Promise<strin
     || undefined;
   const inheritedProviderId = originSession?.provider_id || undefined;
   const inheritedModel = originSession?.model || undefined;
-  const inheritedPermissionProfile =
-    (originSession?.permission_profile as 'default' | 'full_access' | undefined)
-    || 'default';
+  // Inherit the origin session's profile — never upgrade. A background task
+  // has no foreground UI to raise a prompt in, which is an argument for
+  // asking less, not for granting more.
+  const inheritedPermissionProfile = normalizePermissionProfile(originSession?.permission_profile);
 
   const newSession = createSession(
     `[Task] ${task.name}`,
@@ -159,6 +162,9 @@ export async function ensureTaskBoundSession(task: ScheduledTask): Promise<strin
     inheritedProviderId,
     inheritedPermissionProfile,
     'task',
+    // The task's name is the session's identity — never re-derive it from
+    // whatever prompt the runner happens to send first.
+    'system',
   );
   // Inherit runtime_pin separately — createSession doesn't take it as
   // an arg today (it's a Phase 2 column added later). Lift the same
@@ -228,6 +234,10 @@ async function resolveBuddySessionId(): Promise<string | undefined> {
     undefined,
     'default',
     'user',
+    // 'system' even though source is 'user': the user can chat here later, but
+    // "Assistant heartbeat" is what makes this session findable in the list.
+    // Renaming it from the user's first reply would lose that.
+    'system',
   );
   return fresh.id;
 }
@@ -239,12 +249,10 @@ async function resolveBuddySessionId(): Promise<string | undefined> {
  * in the file. Missing file → empty string (the prompt itself still
  * tells the model what to do).
  */
-async function readHeartbeatMd(): Promise<string> {
+async function readHeartbeatMd(workspacePath?: string | null): Promise<string> {
   try {
-    const { getSetting } = await import('@/lib/db');
     const path = await import('node:path');
     const fs = await import('node:fs/promises');
-    const workspacePath = getSetting('assistant_workspace_path');
     if (!workspacePath) return '';
     const filePath = path.resolve(workspacePath, 'HEARTBEAT.md');
     return await fs.readFile(filePath, 'utf-8');
@@ -261,7 +269,9 @@ async function readHeartbeatMd(): Promise<string> {
  * mentions HEARTBEAT_OK in passing but actually has things to say.
  */
 export function isHeartbeatSilent(modelOutput: string): boolean {
-  return modelOutput.trim() === 'HEARTBEAT_OK';
+  // Kept as a compatibility export for existing callers/tests; the shared
+  // classifier in heartbeat.ts is the sole protocol definition.
+  return classifyHeartbeatOutcome(modelOutput).kind === 'silent';
 }
 
 /**
@@ -292,9 +302,44 @@ export async function runScheduledAgentTask(
     ?? insertTaskRunLog({ task_id: task.id, status: 'running' }).runId;
 
   try {
+    const isHeartbeat = task.source === 'assistant_heartbeat';
+    let heartbeatContent: string | undefined;
+
+    // Cost-safety gate: re-read file-owned desired state immediately before
+    // any session resolution or Provider work. A stale derived row cannot run
+    // after disable/workspace switch, even if reconciliation cleanup failed.
+    if (isHeartbeat) {
+      const { readAssistantHeartbeatDesiredState, heartbeatTaskMatchesDesired } =
+        await import('@/lib/assistant-heartbeat');
+      const desired = readAssistantHeartbeatDesiredState();
+      if (!heartbeatTaskMatchesDesired(task, desired)) {
+        const reason = desired.ok
+          ? 'heartbeat desired state is disabled or points at another workspace'
+          : `heartbeat desired state is unverifiable: ${desired.reason}`;
+        updateTaskRunLog(runId, {
+          status: 'skipped_reconcile_drift',
+          result: reason,
+          duration_ms: Date.now() - startedAt,
+        });
+        void import('@/lib/assistant-heartbeat')
+          .then(({ reconcileAssistantHeartbeat }) => reconcileAssistantHeartbeat())
+          .catch(() => {});
+        return { runId, status: 'skipped_reconcile_drift', result: reason };
+      }
+
+      heartbeatContent = await readHeartbeatMd(desired.desired.workspacePath);
+      if (isHeartbeatContentEmpty(heartbeatContent)) {
+        updateTaskRunLog(runId, {
+          status: 'skipped_empty',
+          result: 'HEARTBEAT.md is empty',
+          duration_ms: Date.now() - startedAt,
+        });
+        return { runId, status: 'skipped_empty', result: 'HEARTBEAT.md is empty' };
+      }
+    }
+
     // 2. Resolve which session this run writes to.
     let sessionId: string;
-    const isHeartbeat = task.source === 'assistant_heartbeat';
     if (isHeartbeat) {
       const buddyId = await resolveBuddySessionId();
       if (!buddyId) {
@@ -314,12 +359,11 @@ export async function runScheduledAgentTask(
     // 3. Build the prompt the model will see.
     let prompt: string;
     if (isHeartbeat) {
-      const heartbeatMd = await readHeartbeatMd();
       prompt = [
         task.prompt,
         '',
         '## HEARTBEAT.md content',
-        heartbeatMd || '(file missing or empty — assume nothing to report)',
+        heartbeatContent,
         '',
         'If there is nothing the user needs to know about, respond with EXACTLY the literal string `HEARTBEAT_OK` and nothing else.',
         'Otherwise, write a short message to the user about what needs attention.',
@@ -396,7 +440,10 @@ export async function runScheduledAgentTask(
         provider_id: session?.provider_id || '',
         model: session?.model || '',
       },
-      { runtime: effectiveSessionRuntime },
+      {
+        runtime: effectiveSessionRuntime,
+        callScene: isHeartbeat ? 'assistant_heartbeat' : 'scheduled_task',
+      },
     );
     if (resolved.invalidReason) {
       const reasonLabel =
@@ -491,6 +538,7 @@ export async function runScheduledAgentTask(
 
     const headless = await runClaudeHeadless({
       prompt,
+      callScene: isHeartbeat ? 'assistant_heartbeat' : 'scheduled_task',
       sessionId,
       // SDK session resume — when present, streamClaude continues the
       // existing SDK conversation instead of starting from scratch.
@@ -633,7 +681,12 @@ export async function runScheduledAgentTask(
 
     // status === 'succeeded' from here on.
 
-    if (isHeartbeat && isHeartbeatSilent(trimmed)) {
+    const heartbeatOutcome = isHeartbeat ? classifyHeartbeatOutcome(trimmed) : null;
+    if (isHeartbeat && heartbeatOutcome) {
+      const { recordAssistantHeartbeatOutcome } = await import('@/lib/assistant-heartbeat');
+      recordAssistantHeartbeatOutcome(task, heartbeatOutcome);
+    }
+    if (heartbeatOutcome?.kind === 'silent') {
       updateTaskRunLog(runId, {
         status: 'succeeded',
         result: 'silent',

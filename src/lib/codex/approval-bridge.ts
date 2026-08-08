@@ -35,9 +35,8 @@
  *       'decline' | 'cancel'
  *   - `item/permissions/requestApproval` →
  *     PermissionsRequestApprovalResponse = { permissions, scope,
- *       strictAutoReview? } — entirely different shape; MVP throws an
- *     error which Codex treats as a failed approval (effectively decline).
- *     Phase 6 wires the full UI for granting specific permission profiles.
+ *       strictAutoReview? }. `permissions` is always a subset of the
+ *       original request; an empty object is denial.
  *   - Legacy `execCommandApproval` + `applyPatchApproval` →
  *     ApplyPatchApprovalResponse = { decision: ReviewDecision }
  *     where ReviewDecision = 'approved' | 'approved_for_session' |
@@ -48,7 +47,8 @@ import type { PermissionRequestEvent, PermissionSuggestion } from '@/types';
 import type { NativePermissionResult } from '@/lib/types/agent-types';
 import { translateCodexApproval } from './event-mapper';
 import { createPermissionRequest, getPermissionRequest } from '@/lib/db';
-import { registerPendingPermission } from '@/lib/permission-registry';
+import { issueApprovalToken } from '@/lib/permission-approval-token';
+import { registerPendingPermission, buildPermissionResolvedEvent } from '@/lib/permission-registry';
 
 /**
  * Generate a stable permissionRequestId from the Codex JSON-RPC id.
@@ -117,6 +117,77 @@ interface HandleArgs {
   emitSse: (line: string) => void;
 }
 
+interface CodexRequestedPermissionProfile {
+  network?: { enabled?: boolean | null } | null;
+  fileSystem?: {
+    read?: string[] | null;
+    write?: string[] | null;
+    globScanMaxDepth?: number;
+    entries?: unknown[];
+  } | null;
+}
+
+interface CodexPermissionsApprovalParams {
+  permissions?: CodexRequestedPermissionProfile | null;
+}
+
+interface CodexPermissionsApprovalResponse {
+  permissions: CodexRequestedPermissionProfile;
+  scope: 'turn' | 'session';
+}
+
+/**
+ * Keep the grant tied to the app-server request. Renderer-provided
+ * `updatedPermissions` is only a scope signal; it must never be allowed to
+ * widen the requested network/filesystem profile.
+ */
+export function resultToCodexPermissionsResponse(
+  result: NativePermissionResult,
+  params: unknown,
+): CodexPermissionsApprovalResponse {
+  const requested = (params as CodexPermissionsApprovalParams | null)?.permissions;
+  const sessionScope =
+    result.behavior === 'allow'
+    && Array.isArray(result.updatedPermissions)
+    && result.updatedPermissions.length > 0;
+  return {
+    permissions: result.behavior === 'allow' && requested
+      ? structuredCloneRequestedPermissions(requested)
+      : {},
+    scope: sessionScope ? 'session' : 'turn',
+  };
+}
+
+function structuredCloneRequestedPermissions(
+  requested: CodexRequestedPermissionProfile,
+): CodexRequestedPermissionProfile {
+  const granted: CodexRequestedPermissionProfile = {};
+  if (requested.network && typeof requested.network === 'object') {
+    granted.network = {
+      ...(typeof requested.network.enabled === 'boolean'
+        || requested.network.enabled === null
+        ? { enabled: requested.network.enabled }
+        : {}),
+    };
+  }
+  if (requested.fileSystem && typeof requested.fileSystem === 'object') {
+    const fs = requested.fileSystem;
+    granted.fileSystem = {
+      ...(Array.isArray(fs.read) || fs.read === null
+        ? { read: fs.read === null ? null : [...fs.read] }
+        : {}),
+      ...(Array.isArray(fs.write) || fs.write === null
+        ? { write: fs.write === null ? null : [...fs.write] }
+        : {}),
+      ...(typeof fs.globScanMaxDepth === 'number'
+        ? { globScanMaxDepth: fs.globScanMaxDepth }
+        : {}),
+      ...(Array.isArray(fs.entries) ? { entries: [...fs.entries] } : {}),
+    };
+  }
+  return granted;
+}
+
 /**
  * Handle one Codex approval request end-to-end. Resolves with the
  * runtime-specific response shape Codex expects, OR throws to surface
@@ -148,7 +219,7 @@ export async function handleCodexApprovalRequest(args: HandleArgs): Promise<unkn
       // Already resolved — replay the stored decision so Codex sees
       // the same response it would have gotten for the original RPC.
       const stored = decodeStoredPermission(existing);
-      return resultToCodexResponse(stored, args.method);
+      return resultToCodexResponse(stored, args.method, args.params);
     }
     // Still pending — the user is mid-decision on the original prompt.
     // Don't emit a duplicate UI prompt and don't overwrite the in-
@@ -159,6 +230,7 @@ export async function handleCodexApprovalRequest(args: HandleArgs): Promise<unkn
     return resultToCodexResponse(
       { behavior: 'deny', message: 'Duplicate approval request — original prompt still pending' },
       args.method,
+      args.params,
     );
   }
 
@@ -182,6 +254,7 @@ export async function handleCodexApprovalRequest(args: HandleArgs): Promise<unkn
   // existing useSSEStream / PermissionPrompt pipeline picks it up
   // unchanged. UI doesn't care about runtime; the bridge does the
   // shape adaptation.
+  const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
   const sdkPermission: PermissionRequestEvent = {
     permissionRequestId: requestId,
     toolName: canonical.toolName,
@@ -195,6 +268,9 @@ export async function handleCodexApprovalRequest(args: HandleArgs): Promise<unkn
       ...(h.behavior !== undefined ? { behavior: h.behavior } : {}),
       ...(h.destination !== undefined ? { destination: h.destination } : {}),
     })),
+    // HMAC over (id, expiresAt) — /api/chat/permission rejects approvals
+    // that don't echo it (Phase 4 ② hardening).
+    approvalToken: issueApprovalToken(requestId, expiresAt),
   };
 
   // Persist to permission_requests so the existing /api/chat/permission
@@ -206,7 +282,7 @@ export async function handleCodexApprovalRequest(args: HandleArgs): Promise<unkn
       toolName: canonical.toolName,
       toolInput: JSON.stringify(canonical.toolInput ?? {}),
       decisionReason: canonical.details,
-      expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+      expiresAt,
     });
   } catch (err) {
     // Logging-only failure; the in-memory registry is the source of
@@ -225,9 +301,22 @@ export async function handleCodexApprovalRequest(args: HandleArgs): Promise<unkn
   // Wait for the user's decision. registerPendingPermission resolves
   // via /api/chat/permission → resolvePendingPermission — the same
   // path the SDK uses, so PermissionPrompt's existing wire-up works.
-  const result = await registerPendingPermission(requestId, canonical.toolInput ?? {});
+  // onTimeout mirrors the SDK path: push permission_resolved(timeout) so a
+  // Codex approval that times out shows the same auto-deny UI (A5 Step 2).
+  const result = await registerPendingPermission(
+    requestId,
+    canonical.toolInput ?? {},
+    undefined,
+    () => {
+      try {
+        args.emitSse(`data: ${JSON.stringify(buildPermissionResolvedEvent(requestId))}\n\n`);
+      } catch {
+        // stream already closed — deny still applies
+      }
+    },
+  );
 
-  return resultToCodexResponse(result, args.method);
+  return resultToCodexResponse(result, args.method, args.params);
 }
 
 /**
@@ -244,10 +333,7 @@ export async function handleCodexApprovalRequest(args: HandleArgs): Promise<unkn
  *                                          / "denied" (legacy)
  *
  * `item/permissions/requestApproval` requires an entirely different
- * shape; for MVP we don't reach this fn for that method — the
- * handleCodexApprovalRequest path throws above. Phase 6 wires the
- * full permission-grant UI and replaces the throw with a structured
- * GrantedPermissionProfile.
+ * shape. It is handled first and returns the granted subset plus scope.
  */
 /**
  * Exported for unit testing the mapping table. Not part of the
@@ -257,7 +343,11 @@ export async function handleCodexApprovalRequest(args: HandleArgs): Promise<unkn
 export function resultToCodexResponse(
   result: NativePermissionResult,
   method: string,
-): { decision: string } {
+  params?: unknown,
+): { decision: string } | CodexPermissionsApprovalResponse {
+  if (method === 'item/permissions/requestApproval') {
+    return resultToCodexPermissionsResponse(result, params);
+  }
   const legacy = method === 'execCommandApproval' || method === 'applyPatchApproval';
   const sessionScope =
     result.behavior === 'allow' &&

@@ -128,12 +128,11 @@ describe('scheduler — reminder kind path', () => {
     assert.equal(events.length, 1, 'one notification_events row per logical task notification (v4 fix #2)');
     assert.match(events[0].title, /Drink water/);
 
-    // notification_deliveries: one row per candidate channel.
-    // For priority='normal' that's renderer-toast + electron-native.
+    // notification_deliveries: normal priority has one native candidate.
     const deliveries = db.listNotificationDeliveries(events[0].event_id);
     const channels = new Set(deliveries.map((d) => d.channel));
-    assert.ok(channels.has('renderer-toast'), 'renderer-toast delivery row missing');
     assert.ok(channels.has('electron-native'), 'electron-native delivery row missing for normal priority');
+    assert.ok(!channels.has('renderer-toast'), 'normal priority must not duplicate as an in-app toast');
     assert.ok(
       ![...channels].some((c) => c.startsWith('bridge-')),
       'non-urgent priority must NOT write any bridge-* delivery row (v4 fix #3 — Bridge is urgent-only candidate)',
@@ -188,6 +187,23 @@ describe('scheduler — runScheduledTaskNow concurrency', () => {
 });
 
 describe('scheduler — stale running recovery', () => {
+  it('does not start or touch runtime state during the Next production build phase', async () => {
+    const previousPhase = process.env.NEXT_PHASE;
+    process.env.NEXT_PHASE = 'phase-production-build';
+    delete (globalThis as Record<string, unknown>).__codepilot_scheduler__;
+    try {
+      const { ensureSchedulerRunning } = await import('../../lib/task-scheduler');
+      ensureSchedulerRunning();
+      assert.equal(
+        (globalThis as Record<string, unknown>).__codepilot_scheduler__,
+        undefined,
+      );
+    } finally {
+      if (previousPhase === undefined) delete process.env.NEXT_PHASE;
+      else process.env.NEXT_PHASE = previousPhase;
+    }
+  });
+
   it('ensureSchedulerRunning resets stale running rows to error with backoff', async () => {
     const db = await import('../../lib/db');
     const past = new Date(Date.now() - 60 * 60 * 1000).toISOString(); // 1h ago

@@ -20,6 +20,7 @@ import { z } from 'zod';
 export type Protocol =
   | 'anthropic'           // Native Anthropic API (official + third-party compatible)
   | 'openai-compatible'   // OpenAI-compatible REST API
+  | 'xai'                 // Native xAI Responses API
   | 'openrouter'          // OpenRouter (OpenAI-compatible with extra headers)
   | 'bedrock'             // AWS Bedrock (env-based auth, CLAUDE_CODE_USE_BEDROCK)
   | 'vertex'              // Google Vertex AI (env-based auth, CLAUDE_CODE_USE_VERTEX)
@@ -40,6 +41,9 @@ export type AuthStyle =
  * Model role — semantic purpose, maps to ANTHROPIC_DEFAULT_*, ANTHROPIC_MODEL, etc.
  */
 export type ModelRole = 'default' | 'reasoning' | 'small' | 'haiku' | 'sonnet' | 'opus';
+
+/** Reasoning-effort tiers exposed by provider model catalogs. */
+export type ProviderEffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 /**
  * A model entry in the catalog.
@@ -63,9 +67,26 @@ export interface CatalogModel {
     /** Whether this model supports effort levels (reasoning effort) */
     supportsEffort?: boolean;
     /** Allowed effort levels for this model (Opus 4.7 adds 'xhigh') */
-    supportedEffortLevels?: ('low' | 'medium' | 'high' | 'xhigh' | 'max')[];
+    supportedEffortLevels?: ProviderEffortLevel[];
+    /**
+     * i18n key for a one-line note under the effort menu, used when the tier
+     * list alone would misread. Phase 1 (2026-07-17): GLM collapses Claude
+     * Code's six `/effort` tokens onto two real tiers, and Kimi's only vendor
+     * tier is `max` — in both cases the user needs to know what the shown
+     * tiers mean before picking one. Must resolve to an existing key in
+     * `src/i18n/en.ts` + `zh.ts`.
+     */
+    effortNoteKey?: string;
     /** Whether this model supports adaptive thinking */
     supportsAdaptiveThinking?: boolean;
+    /** Vendor-documented thinking mode when it is not user-switchable. */
+    thinkingMode?: 'always' | 'adaptive';
+    /** Vendor default effort when the user leaves the selector on Auto. */
+    defaultEffortLevel?: ProviderEffortLevel;
+    /** Vendor sampling defaults/limits that must be represented honestly. */
+    thinkingTemperatureDefault?: number;
+    thinkingTemperatureMin?: number;
+    temperatureClampBehavior?: 'upstream_clamps_below_min';
   };
 }
 
@@ -119,6 +140,27 @@ export interface VendorPreset {
    * Anthropic Messages API.
    */
   sdkProxyOnly?: boolean;
+  /** Whether this credential may be used outside an immediate user interaction. */
+  usagePolicy?: 'general' | 'interactive_only';
+  /**
+   * Provider-specific wire capabilities that have been verified against the
+   * vendor's own API contract. These declarations are deliberately separate
+   * from model UI capabilities: an aggregator may list the same model without
+   * implementing the same transport or effort fields.
+   */
+  wireCapabilities?: {
+    /** Anthropic-compatible models that accept GA `output_config.effort`. */
+    anthropicEffort?: {
+      modelIds: string[];
+    };
+    /** Native Responses transport used only when Codex Runtime selects a listed model. */
+    codexResponses?: {
+      baseUrl: string;
+      modelIds: string[];
+      /** Whether the endpoint accepts OpenAI's optional reasoning summary field. */
+      supportsReasoningSummary?: boolean;
+    };
+  };
   /** Provider meta info for user guidance and error recovery */
   meta?: {
     /** URL where user can obtain/manage API key */
@@ -133,6 +175,10 @@ export interface VendorPreset {
     billingModel: 'pay_as_you_go' | 'coding_plan' | 'token_plan' | 'free' | 'self_hosted';
     /** Notes/warnings shown during provider configuration */
     notes?: string[];
+    /** Chinese notes; falls back to `notes` when omitted. */
+    notesZh?: string[];
+    /** Official purchase/manage-plan entry, distinct from docs and key creation. */
+    purchaseUrl?: string;
     /**
      * Whether this anthropic-compat preset has been verified end-to-end:
      * tool calling, thinking, model aliases, and `/v1/messages` quirks all
@@ -161,8 +207,38 @@ export interface VendorPreset {
      * SKUs are normal usage, not drift.
      */
     fixedCatalog?: boolean;
+    /**
+     * Model discovery posture. `'catalog_only'` = the shipped `defaultModels`
+     * lineup is the ONLY truth: no `/v1/models` refresh, no search-and-add, and
+     * `classifyProvider` returns `unsupported`. Used for subscription gateways
+     * whose model endpoint either needs a key, mixes wire protocols, or returns
+     * a superset of the plan whitelist (ClinePass, OpenCode Go). Distinct from
+     * the `sdkProxyOnly && coding_plan` plan gate: those keep search-and-add ON
+     * (their `/v1/models` is a clean per-vendor list), this turns it OFF.
+     * Phase 2 may add a `'filtered_models_endpoint'` mode with allowlist/prefix.
+     */
+    modelDiscoveryMode?: 'catalog_only';
   };
 }
+
+/**
+ * Minimum record needed to resolve a persisted provider product identity.
+ * `preset_key` is intentionally required: legacy callers must pass `''` so
+ * TypeScript makes every inference site acknowledge that it is using the
+ * conservative fallback path.
+ */
+export interface ProviderPresetIdentityRecord {
+  preset_key: string;
+  provider_type: string;
+  protocol: string;
+  base_url: string;
+}
+
+export type ProviderPresetIdentityResolution =
+  | { status: 'resolved'; preset: VendorPreset; source: 'preset_key' | 'legacy_exact' | 'legacy_fuzzy' | 'legacy_type' }
+  | { status: 'ambiguous'; candidateKeys: string[] }
+  | { status: 'invalid'; candidateKeys: string[] }
+  | { status: 'unmatched'; candidateKeys: [] };
 
 // ── Zod Schema for preset validation ──────────────────────────────
 
@@ -173,8 +249,11 @@ const PresetMetaSchema = z.object({
   statusPageUrl: z.string().optional(),
   billingModel: z.enum(['pay_as_you_go', 'coding_plan', 'token_plan', 'free', 'self_hosted']),
   notes: z.array(z.string()).optional(),
+  notesZh: z.array(z.string()).optional(),
+  purchaseUrl: z.string().optional(),
   claudeCodeVerified: z.boolean().optional(),
   fixedCatalog: z.boolean().optional(),
+  modelDiscoveryMode: z.enum(['catalog_only']).optional(),
 });
 
 export const PresetSchema = z.object({
@@ -182,7 +261,7 @@ export const PresetSchema = z.object({
   name: z.string().min(1),
   description: z.string(),
   descriptionZh: z.string(),
-  protocol: z.enum(['anthropic', 'openai-compatible', 'openrouter', 'bedrock', 'vertex', 'google', 'gemini-image', 'openai-image']),
+  protocol: z.enum(['anthropic', 'openai-compatible', 'xai', 'openrouter', 'bedrock', 'vertex', 'google', 'gemini-image', 'openai-image']),
   authStyle: z.enum(['api_key', 'auth_token', 'env_only', 'custom_header']),
   baseUrl: z.string(),
   defaultEnvOverrides: z.record(z.string(), z.string()),
@@ -197,11 +276,31 @@ export const PresetSchema = z.object({
       vision: z.boolean().optional(),
       pdf: z.boolean().optional(),
       contextWindow: z.number().optional(),
+      supportsEffort: z.boolean().optional(),
+      supportedEffortLevels: z.array(z.enum(['low', 'medium', 'high', 'xhigh', 'max'])).optional(),
+      effortNoteKey: z.string().optional(),
+      supportsAdaptiveThinking: z.boolean().optional(),
+      thinkingMode: z.enum(['always', 'adaptive']).optional(),
+      defaultEffortLevel: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional(),
+      thinkingTemperatureDefault: z.number().optional(),
+      thinkingTemperatureMin: z.number().optional(),
+      temperatureClampBehavior: z.enum(['upstream_clamps_below_min']).optional(),
     }).optional(),
   })),
   fields: z.array(z.string()),
   iconKey: z.string(),
   sdkProxyOnly: z.boolean().optional(),
+  usagePolicy: z.enum(['general', 'interactive_only']).optional(),
+  wireCapabilities: z.object({
+    anthropicEffort: z.object({
+      modelIds: z.array(z.string().min(1)).min(1),
+    }).optional(),
+    codexResponses: z.object({
+      baseUrl: z.string().url(),
+      modelIds: z.array(z.string().min(1)).min(1),
+      supportsReasoningSummary: z.boolean().optional(),
+    }).optional(),
+  }).optional(),
   category: z.enum(['chat', 'media']).optional(),
   defaultRoleModels: z.record(z.string(), z.string()).optional(),
   meta: PresetMetaSchema.optional(),
@@ -346,6 +445,30 @@ const ANTHROPIC_FIRST_PARTY_MODELS: CatalogModel[] = [
     },
   },
   {
+    modelId: 'sonnet-5',
+    upstreamModelId: 'claude-sonnet-5',
+    displayName: 'Sonnet 5',
+    // No `role`: Sonnet 5 is an explicit pick, NOT the default `sonnet` role
+    // target (which stays claude-sonnet-4-6). Existing sessions pinned to
+    // Sonnet 4.6 must NOT auto-migrate — same pinned-default discipline as
+    // opus-4-8 / fable-5.
+    //
+    // Official contract (whats-new-sonnet-5 migration guide, verified
+    // 2026-07-17): adaptive thinking is the DEFAULT but — unlike Fable 5 —
+    // can be explicitly turned off with thinking:{type:'disabled'} (Fable 5
+    // 400s on that). Manual extended thinking ({enabled,budgetTokens}) is
+    // removed and 400s. Non-default temperature/top_p/top_k 400. effort
+    // low/medium/high(default)/xhigh/max. New tokenizer ⇒ same text ≈ +30%
+    // tokens vs 4.6. Wire handling lives in claude-model-options.ts +
+    // agent-loop.ts (effort now sent on native — @ai-sdk/anthropic 4.0.5
+    // ships GA output_config.effort, no deprecated beta header).
+    capabilities: {
+      supportsEffort: true,
+      supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+      supportsAdaptiveThinking: true,
+    },
+  },
+  {
     modelId: 'opus',
     upstreamModelId: 'claude-opus-4-7',
     displayName: 'Opus 4.7',
@@ -367,6 +490,24 @@ const ANTHROPIC_FIRST_PARTY_MODELS: CatalogModel[] = [
       supportsEffort: true,
       // Same levels as 4.7; the effort DEFAULT (high) is applied by the
       // Claude Code CLI/SDK when effort is unset, not here.
+      supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+      supportsAdaptiveThinking: true,
+    },
+  },
+  {
+    modelId: 'opus-5',
+    upstreamModelId: 'claude-opus-5',
+    displayName: 'Opus 5',
+    // No `role`: Opus 5 is an explicit pick. Keep the existing `opus`
+    // role pinned to 4.7 so saved sessions and defaults do not silently
+    // change model after an application update.
+    //
+    // Official contract (2026-07-24): 1M context, adaptive thinking on by
+    // default, effort low/medium/high(default)/xhigh/max. When thinking is
+    // explicitly disabled, xhigh/max are invalid; the shared sanitizer keeps
+    // thinking off and lowers effort to high with a visible notice.
+    capabilities: {
+      supportsEffort: true,
       supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
       supportsAdaptiveThinking: true,
     },
@@ -450,6 +591,57 @@ const BEDROCK_VERTEX_DEFAULT_MODELS: CatalogModel[] = [
   },
 ];
 
+/**
+ * GLM Coding Plan catalog — shared by the CN and Global presets (identical
+ * plan, different region endpoint). Phase 1 (2026-07-17).
+ *
+ * Effort: GLM's Claude Code adapter collapses the SIX `/effort` tokens onto
+ * TWO real tiers — low/medium/high → high, xhigh/max/ultracode → max
+ * (source: docs.bigmodel.cn/cn/guide/develop/claude, recorded in
+ * docs/research/foundation-experience-refresh-2026-07-17.md). So the honest
+ * menu is exactly `high` + `max`: offering five tiers would let the user pick
+ * `low` and pay for `high`, which is the fake-precision this plan exists to
+ * remove. `effortNoteKey` states the collapse in the menu so two tiers don't
+ * read as "GLM only has two speeds".
+ *
+ * Model rows: GLM-5.2 is the current Coding Plan generation (superseding the
+ * GLM-5-Turbo / GLM-5.1 pair this catalog used to list). Both the sonnet and
+ * opus role slots map to it (see defaultEnvOverrides), so it is listed ONCE —
+ * two rows both reading "GLM-5.2" would be two names for one model, i.e. the
+ * same fake differentiation in the model picker.
+ *
+ * Not verified without a real key (tracked in the plan's Smoke Ledger):
+ * whether the sonnet slot has its own distinct 5.2-generation turbo SKU, the
+ * `[1m]` long-context variant, and whether haiku still resolves to
+ * glm-4.5-air (left as-is — nothing in the baseline says it moved).
+ */
+const GLM_CODING_PLAN_MODELS: CatalogModel[] = [
+  {
+    modelId: 'sonnet',
+    // Self-referential upstream: GLM's gateway resolves the bare
+    // sonnet/opus/haiku aliases server-side, so the wire keeps sending the
+    // alias. Unchanged this round — retargeting GLM onto explicit SKU ids is
+    // a wire change no credential-less round should make.
+    upstreamModelId: 'sonnet',
+    displayName: 'GLM-5.2',
+    role: 'sonnet',
+    capabilities: {
+      supportsEffort: true,
+      supportedEffortLevels: ['high', 'max'],
+      effortNoteKey: 'messageInput.effort.note.glmTwoTier',
+    },
+  },
+  {
+    modelId: 'haiku',
+    upstreamModelId: 'haiku',
+    displayName: 'GLM-4.5-Air',
+    role: 'haiku',
+    // No effort capability declared: the baseline only attests the two-tier
+    // mapping for the coding models. Absent → the selector hides rather than
+    // guessing (see src/lib/effort-levels.ts).
+  },
+];
+
 // ── Vendor presets ──────────────────────────────────────────────
 
 export const VENDOR_PRESETS: VendorPreset[] = [
@@ -516,6 +708,41 @@ export const VENDOR_PRESETS: VendorPreset[] = [
     },
   },
 
+  // ── xAI official Responses API ──
+  // Keep this branded and separate from the generic OpenAI-compatible preset:
+  // Grok 4.5's supported product path is /v1/responses via @ai-sdk/xai.
+  {
+    key: 'xai',
+    name: 'xAI API Key',
+    description: 'Official xAI API using the Responses API (CodePilot / Codex runtimes)',
+    descriptionZh: 'xAI 官方 API Key，使用 Responses API（用于 CodePilot / Codex 运行时）',
+    protocol: 'xai',
+    authStyle: 'api_key',
+    baseUrl: 'https://api.x.ai/v1',
+    defaultEnvOverrides: {},
+    defaultModels: [
+      { modelId: 'grok-4.5', displayName: 'Grok 4.5' },
+    ],
+    defaultRoleModels: { default: 'grok-4.5' },
+    fields: ['api_key'],
+    iconKey: 'xai',
+    meta: {
+      apiKeyUrl: 'https://console.x.ai/',
+      docsUrl: 'https://docs.x.ai/docs/overview',
+      pricingUrl: 'https://x.ai/api',
+      billingModel: 'pay_as_you_go',
+      modelDiscoveryMode: 'catalog_only',
+      notes: [
+        'Uses xAI API billing. This is separate from a SuperGrok subscription login.',
+        'API keys are stored using CodePilot’s current local SQLite credential boundary; encrypted-at-rest migration remains tracked separately.',
+      ],
+      notesZh: [
+        '使用 xAI API 账户计费，与 SuperGrok 订阅登录相互独立。',
+        'API Key 沿用 CodePilot 当前本地 SQLite 凭据边界；加密落盘迁移仍由独立技术债跟踪。',
+      ],
+    },
+  },
+
   // ── OpenRouter ──
   {
     key: 'openrouter',
@@ -552,12 +779,8 @@ export const VENDOR_PRESETS: VendorPreset[] = [
     protocol: 'anthropic',
     authStyle: 'auth_token',
     baseUrl: 'https://open.bigmodel.cn/api/anthropic',
-    defaultEnvOverrides: { API_TIMEOUT_MS: '3000000', ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.5-air', ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-5-turbo', ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.1' },
-    defaultModels: [
-      { modelId: 'sonnet', upstreamModelId: 'sonnet', displayName: 'GLM-5-Turbo', role: 'sonnet' },
-      { modelId: 'opus', upstreamModelId: 'opus', displayName: 'GLM-5.1', role: 'opus' },
-      { modelId: 'haiku', upstreamModelId: 'haiku', displayName: 'GLM-4.5-Air', role: 'haiku' },
-    ],
+    defaultEnvOverrides: { API_TIMEOUT_MS: '3000000', ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.5-air', ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-5.2', ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.2' },
+    defaultModels: GLM_CODING_PLAN_MODELS,
     fields: ['api_key'],
     iconKey: 'zhipu',
     sdkProxyOnly: true,
@@ -579,12 +802,8 @@ export const VENDOR_PRESETS: VendorPreset[] = [
     protocol: 'anthropic',
     authStyle: 'auth_token',
     baseUrl: 'https://api.z.ai/api/anthropic',
-    defaultEnvOverrides: { API_TIMEOUT_MS: '3000000', ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.5-air', ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-5-turbo', ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.1' },
-    defaultModels: [
-      { modelId: 'sonnet', upstreamModelId: 'sonnet', displayName: 'GLM-5-Turbo', role: 'sonnet' },
-      { modelId: 'opus', upstreamModelId: 'opus', displayName: 'GLM-5.1', role: 'opus' },
-      { modelId: 'haiku', upstreamModelId: 'haiku', displayName: 'GLM-4.5-Air', role: 'haiku' },
-    ],
+    defaultEnvOverrides: { API_TIMEOUT_MS: '3000000', ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.5-air', ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-5.2', ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.2' },
+    defaultModels: GLM_CODING_PLAN_MODELS,
     fields: ['api_key'],
     iconKey: 'zhipu',
     sdkProxyOnly: true,
@@ -607,8 +826,40 @@ export const VENDOR_PRESETS: VendorPreset[] = [
     authStyle: 'api_key',
     baseUrl: 'https://api.kimi.com/coding/',
     defaultEnvOverrides: { ENABLE_TOOL_SEARCH: 'false' },
+    // Phase 1 (2026-07-17, reaffirmed 2026-07-19) — `Kimi for Coding` is the
+    // product/channel the user picks. The vendor also publishes versioned IDs
+    // such as `k3`; they are NOT aliases we can infer from this display name.
+    // Per the product decision, CodePilot sends the channel's own documented
+    // `kimi-for-coding` wire ID and deliberately keeps the backing/version name
+    // out of the UI. No explicit `k3` row is added and no K3 compatibility
+    // branch is needed when the channel's backing implementation changes.
     defaultModels: [
-      { modelId: 'sonnet', displayName: 'Kimi K2.5', role: 'default' },
+      {
+        // `sonnet` is a legacy UI/DB alias, NOT a Kimi model: existing
+        // providers have a provider_models row and sessions pinned to this
+        // id, so renaming it would strand them. It stays the id; the wire
+        // truth is upstreamModelId.
+        modelId: 'sonnet',
+        // Explicit upstream so the request carries the product channel's own
+        // wire id — never a version id inferred from the display name.
+        // Previously absent, which left resolveProvider falling through to
+        // its single-model alias fallback (provider-resolver.ts:~590) and
+        // shipping the bare string `sonnet` to Kimi.
+        upstreamModelId: 'kimi-for-coding',
+        displayName: 'Kimi for Coding',
+        role: 'default',
+        capabilities: {
+          supportsEffort: true,
+          // Kimi's 2026-07-16 K3 release notes document low/high/max for the
+          // model currently served by Kimi Code. Keep the product/channel name
+          // stable in the UI while exposing the channel's current effort
+          // contract. `auto` remains CodePilot's own
+          // "send no effort at all" option (src/lib/effort-levels.ts), not a
+          // Kimi tier; the note key makes that distinction explicit.
+          supportedEffortLevels: ['low', 'high', 'max'],
+          effortNoteKey: 'messageInput.effort.note.kimiAuto',
+        },
+      },
     ],
     fields: ['api_key'],
     iconKey: 'kimi',
@@ -843,15 +1094,11 @@ export const VENDOR_PRESETS: VendorPreset[] = [
     authStyle: 'auth_token',
     baseUrl: 'https://coding.dashscope.aliyuncs.com/apps/anthropic',
     defaultEnvOverrides: {},
-    // Bailian Coding Plan whitelist — verified against
-    // https://help.aliyun.com/zh/model-studio/coding-plan (2026-05-06).
-    // Page splits models into "推荐" (qwen3.6-plus, kimi-k2.5, glm-5,
-    // MiniMax-M2.5) and "更多模型" (qwen3.5-plus, qwen3-max-2026-01-23,
-    // qwen3-coder-next, qwen3-coder-plus, glm-4.7). MiniMax stays at M2.5
-    // here even though standalone minimax-cn/global have moved to M2.7
-    // — Bailian's own page still lists M2.5 and that's what their plan
-    // accepts. Don't infer from the standalone provider.
+    // Exact Coding Plan text whitelist, verified against the official page on
+    // 2026-07-21. This product has a separate host and lifecycle from Qwen
+    // Token Plan; do not merge the identities even though both use sk-sp keys.
     defaultModels: [
+      { modelId: 'qwen3.7-plus', displayName: 'Qwen 3.7 Plus' },
       { modelId: 'qwen3.6-plus', displayName: 'Qwen 3.6 Plus', role: 'default' },
       { modelId: 'qwen3.5-plus', displayName: 'Qwen 3.5 Plus' },
       { modelId: 'qwen3-max-2026-01-23', displayName: 'Qwen 3 Max (2026-01-23)' },
@@ -865,67 +1112,304 @@ export const VENDOR_PRESETS: VendorPreset[] = [
     fields: ['api_key'],
     iconKey: 'bailian',
     sdkProxyOnly: true,
+    usagePolicy: 'interactive_only',
     meta: {
       apiKeyUrl: 'https://bailian.console.aliyun.com',
       docsUrl: 'https://help.aliyun.com/zh/model-studio/coding-plan',
+      purchaseUrl: 'https://bailian.console.aliyun.com/?tab=model#/efm/coding_plan',
       billingModel: 'coding_plan',
-      notes: ['必须使用 Coding Plan 专用 Key（以 sk-sp- 开头）', '普通 DashScope Key 无法使用', '禁止用于自动化脚本'],
+      notes: [
+        'Use a Coding Plan key (sk-sp-); regular DashScope keys are not interchangeable.',
+        'Lite is available only to existing subscribers and no longer supports new purchases or renewal; Pro is sold in limited availability.',
+        'Coding Plan is metered by model calls and is limited to interactive coding tools, not automation scripts or application backends.',
+      ],
+      notesZh: [
+        '必须使用 Coding Plan 专用 Key（以 sk-sp- 开头），普通 DashScope Key 不通用。',
+        'Lite 仅供存量用户使用，已停止新购和续费；Pro 限量可购。',
+        'Coding Plan 按模型调用次数计量，仅限交互式编程工具，不得用于自动化脚本或应用后端。',
+      ],
       claudeCodeVerified: true,
     },
   },
 
-  // ── Aliyun Bailian Token Plan 团队版 ──
-  // Separate channel from Coding Plan: different host
-  // (`token-plan.cn-beijing.maas.aliyuncs.com`), different Key family (Token
-  // Plan team-tier keys are not interchangeable with Coding Plan sk-sp-…),
-  // and a narrower whitelist. DeepSeek V3.2 is intentionally NOT included:
-  // the Bailian docs explicitly state DeepSeek V3.2 isn't served via the
-  // Anthropic protocol on Token Plan and must use OpenCode instead — listing
-  // it here would silently mismatch when Claude Code resolves the alias.
+  // ── Qwen Token Plan 个人版 ──
+  // Personal and team share the same endpoint. `preset_key` is therefore the
+  // only product identity; URL matching deliberately returns ambiguous.
   {
-    key: 'bailian-token-plan-cn',
-    name: 'Aliyun Bailian Token Plan',
-    description: 'Aliyun Bailian Token Plan team tier — Qwen / GLM / MiniMax (cn-beijing only)',
-    descriptionZh: '阿里云百炼 Token Plan 团队版 — 通义千问 / GLM / MiniMax（仅华北2北京）',
+    key: 'qwen-token-plan-personal-cn',
+    name: 'Qwen Token Plan Personal',
+    description: 'Qwen Token Plan Personal — rolling credits for individual interactive coding and agent tools',
+    descriptionZh: '千问 Token Plan 个人版 — 面向个人交互式编程与智能体工具的滚动额度套餐',
     protocol: 'anthropic',
     authStyle: 'auth_token',
     baseUrl: 'https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic',
-    defaultEnvOverrides: {},
-    // Token Plan 团队版 whitelist — sourced from
-    // 《阿里云-百炼-Token Plan 团队版.md》(2026-05-06):
-    //   - qwen3.6-plus（推荐，Token Plan 默认配置全角色都用它）
-    //   - glm-5
-    //   - MiniMax-M2.5
-    // Plan docs also list deepseek-v3.2 as a Token Plan model BUT
-    // explicitly note "不支持 Anthropic 协议，仅可在 OpenCode 中使用"。
-    // We're an Anthropic / Claude Code preset, so deepseek-v3.2 is
-    // omitted on purpose — adding it would silently mis-route.
+    defaultEnvOverrides: {
+      CLAUDE_CODE_SUBAGENT_MODEL: 'qwen3.7-max',
+    },
     defaultModels: [
-      { modelId: 'qwen3.6-plus', displayName: 'Qwen 3.6 Plus', role: 'default' },
-      { modelId: 'glm-5', displayName: 'GLM-5' },
-      { modelId: 'MiniMax-M2.5', displayName: 'MiniMax-M2.5' },
+      {
+        modelId: 'qwen3.8-max-preview',
+        displayName: 'Qwen 3.8 Max Preview',
+        role: 'default',
+        capabilities: {
+          reasoning: true,
+          contextWindow: 983616,
+          supportsEffort: true,
+          supportedEffortLevels: ['low', 'high', 'xhigh'],
+          thinkingMode: 'always',
+          defaultEffortLevel: 'xhigh',
+          thinkingTemperatureDefault: 0.6,
+          thinkingTemperatureMin: 0.6,
+          temperatureClampBehavior: 'upstream_clamps_below_min',
+        },
+      },
+      { modelId: 'qwen3.7-max', displayName: 'Qwen 3.7 Max' },
+      { modelId: 'qwen3.7-plus', displayName: 'Qwen 3.7 Plus' },
+      { modelId: 'qwen3.6-flash', displayName: 'Qwen 3.6 Flash', role: 'haiku' },
+      { modelId: 'glm-5.2', displayName: 'GLM-5.2' },
+      { modelId: 'deepseek-v4-pro', displayName: 'DeepSeek V4 Pro' },
     ],
-    // Token Plan 团队版 文档示例配置：所有角色（default/sonnet/opus/haiku）
-    // 都默认指向 qwen3.6-plus。用户可以在前端自行切换其他白名单 SKU。
     defaultRoleModels: {
-      default: 'qwen3.6-plus',
-      sonnet: 'qwen3.6-plus',
-      opus: 'qwen3.6-plus',
-      haiku: 'qwen3.6-plus',
+      default: 'qwen3.8-max-preview',
+      sonnet: 'qwen3.8-max-preview',
+      opus: 'qwen3.8-max-preview',
+      haiku: 'qwen3.6-flash',
     },
     fields: ['api_key'],
     iconKey: 'bailian',
     sdkProxyOnly: true,
+    usagePolicy: 'interactive_only',
     meta: {
-      apiKeyUrl: 'https://bailian.console.aliyun.com',
-      docsUrl: 'https://help.aliyun.com/zh/model-studio/token-plan',
+      apiKeyUrl: 'https://platform.qianwenai.com/docs/api-reference/preparation/api-key',
+      docsUrl: 'https://platform.qianwenai.com/docs/token-plan/personal/token-plan-personal-overview',
+      purchaseUrl: 'https://platform.qianwenai.com/token-plan',
       billingModel: 'token_plan',
       notes: [
-        '团队版 Key 与 Coding Plan / 普通 DashScope Key 不通用',
-        '仅华北2（北京）地域提供服务',
-        'DeepSeek V3.2 不支持 Anthropic 协议，需切换 OpenCode 使用',
+        'Personal credits use rolling 5-hour and 7-day windows; one plan may be purchased per verified identity.',
+        'Personal usage includes the plan’s data-optimization authorization. Review the official terms before connecting.',
+        'The plan key is shown in full only when created or reset. Store it before leaving the Qwen platform.',
+        'For interactive coding and agent tools only; automation scripts, application backends, and batch jobs are not allowed.',
       ],
-      claudeCodeVerified: true,
+      notesZh: [
+        '个人版额度按 5 小时与 7 天滚动窗口计算；同一实名认证主体限购一份。',
+        '个人版包含套餐的数据优化授权，请在连接前阅读官方条款。',
+        '套餐 Key 仅在创建或重置时完整显示一次，请先妥善保存。',
+        '仅限交互式编程与智能体工具，不得用于自动化脚本、应用后端或批量任务。',
+      ],
+    },
+  },
+
+  // ── Qwen Token Plan 团队版 ──
+  {
+    key: 'bailian-token-plan-cn',
+    name: 'Qwen Token Plan Team',
+    description: 'Qwen Token Plan Team — seat-based credits for interactive coding and agent tools',
+    descriptionZh: '千问 Token Plan 团队版 — 面向团队交互式编程与智能体工具的席位制额度套餐',
+    protocol: 'anthropic',
+    authStyle: 'auth_token',
+    baseUrl: 'https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic',
+    defaultEnvOverrides: {
+      CLAUDE_CODE_SUBAGENT_MODEL: 'qwen3.7-max',
+    },
+    defaultModels: [
+      {
+        modelId: 'qwen3.8-max-preview',
+        displayName: 'Qwen 3.8 Max Preview',
+        role: 'default',
+        capabilities: {
+          reasoning: true,
+          contextWindow: 983616,
+          supportsEffort: true,
+          supportedEffortLevels: ['low', 'high', 'xhigh'],
+          thinkingMode: 'always',
+          defaultEffortLevel: 'xhigh',
+          thinkingTemperatureDefault: 0.6,
+          thinkingTemperatureMin: 0.6,
+          temperatureClampBehavior: 'upstream_clamps_below_min',
+        },
+      },
+      { modelId: 'qwen3.7-max', displayName: 'Qwen 3.7 Max' },
+      { modelId: 'qwen3.7-plus', displayName: 'Qwen 3.7 Plus' },
+      { modelId: 'qwen3.6-plus', displayName: 'Qwen 3.6 Plus' },
+      { modelId: 'qwen3.6-flash', displayName: 'Qwen 3.6 Flash', role: 'haiku' },
+      { modelId: 'deepseek-v4-pro', displayName: 'DeepSeek V4 Pro' },
+      { modelId: 'deepseek-v4-flash', displayName: 'DeepSeek V4 Flash' },
+      { modelId: 'deepseek-v3.2', displayName: 'DeepSeek V3.2' },
+      { modelId: 'kimi-k2.7-code', displayName: 'Kimi K2.7 Code' },
+      { modelId: 'kimi-k2.6', displayName: 'Kimi K2.6' },
+      { modelId: 'kimi-k2.5', displayName: 'Kimi K2.5' },
+      { modelId: 'glm-5.2', displayName: 'GLM-5.2' },
+      { modelId: 'glm-5.1', displayName: 'GLM-5.1' },
+      { modelId: 'glm-5', displayName: 'GLM-5' },
+      { modelId: 'MiniMax-M2.5', displayName: 'MiniMax-M2.5' },
+    ],
+    defaultRoleModels: {
+      default: 'qwen3.8-max-preview',
+      sonnet: 'qwen3.8-max-preview',
+      opus: 'qwen3.8-max-preview',
+      haiku: 'qwen3.6-flash',
+    },
+    fields: ['api_key'],
+    iconKey: 'bailian',
+    sdkProxyOnly: true,
+    usagePolicy: 'interactive_only',
+    meta: {
+      apiKeyUrl: 'https://platform.qianwenai.com/docs/api-reference/preparation/api-key',
+      docsUrl: 'https://platform.qianwenai.com/docs/token-plan/team/token-plan-team-overview',
+      purchaseUrl: 'https://platform.qianwenai.com/token-plan',
+      billingModel: 'token_plan',
+      notes: [
+        'Team plans are seat-based. The official terms state conversation data is not used for training.',
+        'The plan key is shown in full only when created or reset; it is not interchangeable with Coding Plan or regular DashScope keys.',
+        'For interactive coding and agent tools only; automation scripts, application backends, and batch jobs are not allowed.',
+      ],
+      notesZh: [
+        '团队版按席位计费；官方条款承诺不使用对话数据进行模型训练。',
+        '套餐 Key 仅在创建或重置时完整显示一次，且与 Coding Plan / 普通 DashScope Key 不通用。',
+        '仅限交互式编程与智能体工具，不得用于自动化脚本、应用后端或批量任务。',
+      ],
+    },
+  },
+
+  // ── ClinePass ──
+  // ClinePass subscription accessed through the Cline API (OpenAI-compatible
+  // Chat Completions). Models use the `cline-pass/<id>` slug — that IS the
+  // value sent to the API, so modelId == upstream (no alias). The Cline API
+  // is a multi-provider aggregator; its `/v1/models` returns far more than the
+  // ClinePass whitelist AND needs a key, so discovery is `catalog_only`:
+  // ship the 11-model whitelist as truth, no refresh / no search-and-add.
+  // NOT sdkProxyOnly — OpenAI-compatible reaches CodePilot + Codex runtimes
+  // via the AI SDK chat path, never the Claude Code subprocess.
+  {
+    key: 'cline-pass',
+    name: 'ClinePass',
+    description: 'ClinePass subscription — open coding models via the Cline API (CodePilot / Codex runtimes)',
+    descriptionZh: 'ClinePass 订阅 — 通过 Cline API 访问开源编程模型（用于 CodePilot / Codex 运行时）',
+    protocol: 'openai-compatible',
+    authStyle: 'api_key',
+    baseUrl: 'https://api.cline.bot/api/v1',
+    defaultEnvOverrides: {},
+    // ClinePass whitelist — https://cline.bot/models plus the Cline API model
+    // id contract at https://docs.cline.bot/api/models. Kimi K3 was added
+    // 2026-07-20 from the current product lineup; the public static model
+    // directory still lagged that rollout, so its exact cline-pass/kimi-k3 id
+    // is pinned by the provider/model-name contract and a real-key smoke.
+    // The cline-pass/ prefix is part of the model id sent to
+    // /chat/completions, so no upstreamModelId alias is needed.
+    defaultModels: [
+      { modelId: 'cline-pass/glm-5.2', displayName: 'GLM-5.2', capabilities: { toolUse: true } },
+      { modelId: 'cline-pass/kimi-k3', displayName: 'Kimi K3', capabilities: { toolUse: true } },
+      { modelId: 'cline-pass/kimi-k2.7-code', displayName: 'Kimi K2.7 Code', capabilities: { toolUse: true } },
+      { modelId: 'cline-pass/kimi-k2.6', displayName: 'Kimi K2.6', capabilities: { toolUse: true } },
+      { modelId: 'cline-pass/deepseek-v4-pro', displayName: 'DeepSeek V4 Pro', capabilities: { toolUse: true } },
+      { modelId: 'cline-pass/deepseek-v4-flash', displayName: 'DeepSeek V4 Flash', capabilities: { toolUse: true } },
+      { modelId: 'cline-pass/mimo-v2.5', displayName: 'MiMo-V2.5', capabilities: { toolUse: true } },
+      { modelId: 'cline-pass/mimo-v2.5-pro', displayName: 'MiMo-V2.5-Pro', capabilities: { toolUse: true } },
+      { modelId: 'cline-pass/minimax-m3', displayName: 'MiniMax M3', capabilities: { toolUse: true } },
+      { modelId: 'cline-pass/qwen3.7-max', displayName: 'Qwen3.7 Max', capabilities: { toolUse: true } },
+      { modelId: 'cline-pass/qwen3.7-plus', displayName: 'Qwen3.7 Plus', capabilities: { toolUse: true } },
+    ],
+    fields: ['api_key'],
+    iconKey: 'cline',
+    meta: {
+      apiKeyUrl: 'https://app.cline.bot',
+      docsUrl: 'https://docs.cline.bot/getting-started/clinepass',
+      billingModel: 'coding_plan',
+      modelDiscoveryMode: 'catalog_only',
+      notes: ['模型使用 cline-pass/<model-id> 形式；由订阅白名单定义，不做在线刷新。'],
+    },
+  },
+
+  // ── OpenCode Go (OpenAI-compatible) ──
+  // OpenCode Zen "Go" subscription, OpenAI-compatible half. Same host + key as
+  // the Anthropic half below; split into two presets because protocol lives at
+  // the provider layer (no per-model wire dispatch). `/zen/go/v1/models` is a
+  // single MIXED catalog (both wire protocols) and a superset of this plan's
+  // lineup, so discovery is `catalog_only` — auto-import would put `/messages`-
+  // only models on the `/chat/completions` path. Models use bare ids (the
+  // `opencode-go/` prefix is OpenCode-config-only, not the API model field).
+  {
+    key: 'opencode-go-openai',
+    name: 'OpenCode Go (OpenAI)',
+    description: 'OpenCode Zen Go subscription — OpenAI-compatible models (CodePilot / Codex runtimes)',
+    descriptionZh: 'OpenCode Zen Go 订阅 — OpenAI 兼容模型（用于 CodePilot / Codex 运行时）',
+    protocol: 'openai-compatible',
+    authStyle: 'api_key',
+    baseUrl: 'https://opencode.ai/zen/go/v1',
+    defaultEnvOverrides: {},
+    // OpenAI-compatible half of the official endpoint table —
+    // https://dev.opencode.ai/docs/go/ (verified 2026-07-20).
+    defaultModels: [
+      { modelId: 'glm-5.2', displayName: 'GLM-5.2', capabilities: { toolUse: true } },
+      { modelId: 'glm-5.1', displayName: 'GLM-5.1', capabilities: { toolUse: true } },
+      { modelId: 'kimi-k3', displayName: 'Kimi K3', capabilities: { toolUse: true } },
+      { modelId: 'kimi-k2.7-code', displayName: 'Kimi K2.7 Code', capabilities: { toolUse: true } },
+      { modelId: 'kimi-k2.6', displayName: 'Kimi K2.6', capabilities: { toolUse: true } },
+      { modelId: 'deepseek-v4-pro', displayName: 'DeepSeek V4 Pro', capabilities: { toolUse: true } },
+      { modelId: 'deepseek-v4-flash', displayName: 'DeepSeek V4 Flash', capabilities: { toolUse: true } },
+      { modelId: 'mimo-v2.5', displayName: 'MiMo-V2.5', capabilities: { toolUse: true } },
+      { modelId: 'mimo-v2.5-pro', displayName: 'MiMo-V2.5-Pro', capabilities: { toolUse: true } },
+    ],
+    fields: ['api_key'],
+    iconKey: 'opencode',
+    meta: {
+      apiKeyUrl: 'https://opencode.ai/auth',
+      docsUrl: 'https://opencode.ai/docs/zh-cn/go/',
+      billingModel: 'coding_plan',
+      modelDiscoveryMode: 'catalog_only',
+      notes: ['与「OpenCode Go (Anthropic)」共用同一订阅 Key；模型由套餐白名单定义。'],
+    },
+  },
+
+  // ── OpenCode Go (Anthropic Messages) ──
+  // Anthropic-Messages half of the same OpenCode Go subscription. The real
+  // endpoint is https://opencode.ai/zen/go/v1/messages, but the base is stored
+  // WITHOUT the trailing /v1 on purpose. The Claude Code SDK ALWAYS appends
+  // `/v1/messages` to ANTHROPIC_BASE_URL, so a `.../zen/go/v1` base makes the
+  // SDK POST to `.../zen/go/v1/v1/messages` → 404 HTML → surfaced as "model
+  // (minimax-m3) doesn't exist" (verified 2026-06-30). (The native
+  // ClaudeCodeCompatModel.buildMessagesUrl() actually handles a /v1-ending base
+  // fine — it appends only `/messages` in that case — so the CodePilot path was
+  // already correct; the SDK path was the broken one.) Storing `.../zen/go`
+  // makes all three transports converge on the right URL: the SDK appends
+  // `/v1/messages`, the adapter's deep-path branch also yields
+  // `.../zen/go/v1/messages`, and the Codex provider proxy reuses the adapter.
+  // (Every other anthropic preset's base ends in /api/anthropic etc. for the
+  // same SDK reason.) Bonus: this base differs from the OpenAI half
+  // (`.../zen/go/v1`), so no preset collision. authStyle: api_key → x-api-key
+  // (probe confirmed x-api-key, not Bearer; the endpoint does not require
+  // anthropic-version). NOT claudeCodeVerified: ships experimental until a
+  // real-key smoke.
+  {
+    key: 'opencode-go-anthropic',
+    name: 'OpenCode Go (Anthropic)',
+    description: 'OpenCode Zen Go subscription — Anthropic Messages models (experimental on Claude Code)',
+    descriptionZh: 'OpenCode Zen Go 订阅 — Anthropic Messages 模型（Claude Code 兼容性实验中）',
+    protocol: 'anthropic',
+    authStyle: 'api_key',
+    baseUrl: 'https://opencode.ai/zen/go',
+    defaultEnvOverrides: {},
+    // Anthropic-Messages half of the official endpoint table —
+    // https://opencode.ai/docs/zh-cn/go/ (verified 2026-06-30).
+    defaultModels: [
+      { modelId: 'minimax-m3', displayName: 'MiniMax M3', capabilities: { toolUse: true } },
+      { modelId: 'minimax-m2.7', displayName: 'MiniMax M2.7', capabilities: { toolUse: true } },
+      { modelId: 'minimax-m2.5', displayName: 'MiniMax M2.5', capabilities: { toolUse: true } },
+      { modelId: 'qwen3.7-max', displayName: 'Qwen3.7 Max', capabilities: { toolUse: true } },
+      { modelId: 'qwen3.7-plus', displayName: 'Qwen3.7 Plus', capabilities: { toolUse: true } },
+      { modelId: 'qwen3.6-plus', displayName: 'Qwen3.6 Plus', capabilities: { toolUse: true } },
+    ],
+    fields: ['api_key'],
+    iconKey: 'opencode',
+    meta: {
+      apiKeyUrl: 'https://opencode.ai/auth',
+      docsUrl: 'https://opencode.ai/docs/zh-cn/go/',
+      billingModel: 'coding_plan',
+      modelDiscoveryMode: 'catalog_only',
+      notes: [
+        '与「OpenCode Go (OpenAI)」共用同一订阅 Key；模型由套餐白名单定义。',
+        'Anthropic Messages 协议；Claude Code Runtime 兼容性未经真实凭据验证，先以实验态提供。',
+      ],
     },
   },
 
@@ -941,10 +1425,12 @@ export const VENDOR_PRESETS: VendorPreset[] = [
     defaultEnvOverrides: {
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
       CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK: '1',
+      CLAUDE_CODE_SUBAGENT_MODEL: 'deepseek-v4-flash',
     },
     // DeepSeek catalog — verified against
-    // https://api-docs.deepseek.com/quick_start/agent_integrations/claude_code
-    // and the pricing page (2026-05-06). The legacy aliases deepseek-chat
+    // https://api-docs.deepseek.com/zh-cn/quick_start/agent_integrations/claude_code,
+    // /codex, /guides/thinking_mode, and /updates (verified 2026-08-02).
+    // The legacy aliases deepseek-chat
     // and deepseek-reasoner will be deprecated 2026-07-24 and currently
     // map to non-thinking / thinking modes of deepseek-v4-flash, so they
     // are not surfaced as defaults — users still get them by manual add.
@@ -952,10 +1438,58 @@ export const VENDOR_PRESETS: VendorPreset[] = [
     // verbatim to select the 1M-context variant; both v4-pro and v4-flash
     // also have a non-suffixed default-context variant.
     defaultModels: [
-      { modelId: 'deepseek-v4-pro[1m]', upstreamModelId: 'deepseek-v4-pro[1m]', displayName: 'DeepSeek V4 Pro (1M)', role: 'opus' },
-      { modelId: 'deepseek-v4-pro', upstreamModelId: 'deepseek-v4-pro', displayName: 'DeepSeek V4 Pro', role: 'default' },
-      { modelId: 'deepseek-v4-flash', upstreamModelId: 'deepseek-v4-flash', displayName: 'DeepSeek V4 Flash', role: 'haiku' },
+      {
+        modelId: 'deepseek-v4-pro[1m]',
+        upstreamModelId: 'deepseek-v4-pro[1m]',
+        displayName: 'DeepSeek V4 Pro (1M)',
+        role: 'opus',
+        capabilities: {
+          reasoning: true,
+          toolUse: true,
+          contextWindow: 1_048_576,
+          supportsEffort: true,
+          supportedEffortLevels: ['high', 'max'],
+          defaultEffortLevel: 'high',
+        },
+      },
+      {
+        modelId: 'deepseek-v4-pro',
+        upstreamModelId: 'deepseek-v4-pro',
+        displayName: 'DeepSeek V4 Pro',
+        role: 'default',
+        capabilities: {
+          reasoning: true,
+          toolUse: true,
+          supportsEffort: true,
+          supportedEffortLevels: ['high', 'max'],
+          defaultEffortLevel: 'high',
+        },
+      },
+      {
+        modelId: 'deepseek-v4-flash',
+        upstreamModelId: 'deepseek-v4-flash',
+        displayName: 'DeepSeek V4 Flash',
+        role: 'haiku',
+        capabilities: {
+          reasoning: true,
+          toolUse: true,
+          contextWindow: 1_048_576,
+          supportsEffort: true,
+          supportedEffortLevels: ['low', 'high', 'max'],
+          defaultEffortLevel: 'high',
+        },
+      },
     ],
+    wireCapabilities: {
+      anthropicEffort: {
+        modelIds: ['deepseek-v4-pro[1m]', 'deepseek-v4-pro', 'deepseek-v4-flash'],
+      },
+      codexResponses: {
+        baseUrl: 'https://api.deepseek.com',
+        modelIds: ['deepseek-v4-flash'],
+        supportsReasoningSummary: false,
+      },
+    },
     defaultRoleModels: {
       default: 'deepseek-v4-pro[1m]',
       opus: 'deepseek-v4-pro[1m]',
@@ -1228,12 +1762,33 @@ export function isCatalogOnlyPlanProvider(presetKey: string | undefined | null):
  * `findMatchingPresetForRecord` here keeps every UI caller honest and
  * keeps both UI sites and the discovery gate on the same answer.
  */
-export function isCatalogOnlyPlanProviderRecord(record: {
-  provider_type: string;
-  base_url: string;
-}): boolean {
+export function isCatalogOnlyPlanProviderRecord(record: ProviderPresetIdentityRecord): boolean {
   const matched = findMatchingPresetForRecord(record);
   return isCatalogOnlyPlanProvider(matched?.key);
+}
+
+/**
+ * True for presets that ship `meta.modelDiscoveryMode: 'catalog_only'` — the
+ * strictest discovery posture: no `/v1/models` refresh, no search-and-add, and
+ * `classifyProvider` returns `unsupported`. The shipped `defaultModels` lineup
+ * is the only truth.
+ *
+ * This is intentionally NOT folded into `isCatalogOnlyPlanProvider`: plan
+ * providers (GLM / MiniMax) keep search-and-add ON because their `/v1/models`
+ * is a clean per-vendor list, whereas these gateways (ClinePass, OpenCode Go)
+ * expose a key-gated, mixed-protocol, or superset endpoint that must never be
+ * auto-imported. By-key variant for callers that already resolved a preset
+ * (e.g. `model-discovery.ts:classifyProvider`); use the record variant from any
+ * UI/route site that only holds a provider record.
+ */
+export function isCatalogOnlyDiscoveryProvider(presetKey: string | undefined | null): boolean {
+  if (!presetKey) return false;
+  return getPreset(presetKey)?.meta?.modelDiscoveryMode === 'catalog_only';
+}
+
+/** Record-aware version of `isCatalogOnlyDiscoveryProvider`. */
+export function isCatalogOnlyDiscoveryRecord(record: ProviderPresetIdentityRecord): boolean {
+  return isCatalogOnlyDiscoveryProvider(findMatchingPresetForRecord(record)?.key);
 }
 
 /**
@@ -1259,10 +1814,7 @@ export function isCatalogOnlyPlanProviderRecord(record: {
  *   - `ProviderManager` Add-Service success path — show search-add toast
  *   - `ModelsSection` per-card refresh — route to validate-models
  */
-export function isOpenRouterProviderRecord(record: {
-  provider_type: string;
-  base_url: string;
-}): boolean {
+export function isOpenRouterProviderRecord(record: ProviderPresetIdentityRecord): boolean {
   return findMatchingPresetForRecord(record)?.key === 'openrouter';
 }
 
@@ -1279,10 +1831,7 @@ export function getPresetsByCategory(category: 'chat' | 'media' = 'chat'): Vendo
  * Returns [] if no preset matches; the caller should treat that as
  * "manual entry only" (user must add models themselves).
  */
-export function getCatalogDefaultModelsForRecord(record: {
-  provider_type: string;
-  base_url: string;
-}): CatalogModel[] {
+export function getCatalogDefaultModelsForRecord(record: ProviderPresetIdentityRecord): CatalogModel[] {
   const matched = findMatchingPresetForRecord(record);
   return matched?.defaultModels ?? [];
 }
@@ -1314,14 +1863,11 @@ export type AccessType =
   | 'cloud_credentials'
   | 'gateway';
 
-export function getProviderAccessType(record: {
-  provider_type: string;
-  base_url: string;
-}): AccessType {
+export function getProviderAccessType(record: ProviderPresetIdentityRecord): AccessType {
   // OAuth-shaped provider_type values — these are virtual providers that
   // don't carry an api_key field (auth is in a side channel) so the
   // billingModel check below would miss them.
-  if (record.provider_type === 'openai-oauth' || record.provider_type === 'anthropic-oauth') {
+  if (record.provider_type === 'openai-oauth' || record.provider_type === 'xai-oauth' || record.provider_type === 'anthropic-oauth') {
     return 'oauth';
   }
   const preset = findMatchingPresetForRecord(record);
@@ -1380,7 +1926,7 @@ export function getProviderAccessType(record: {
  * easier to reason about and test.
  */
 export function isModelInCurrentCatalog(
-  record: { provider_type: string; base_url: string },
+  record: ProviderPresetIdentityRecord,
   modelId: string,
 ): boolean {
   const defaults = getCatalogDefaultModelsForRecord(record);
@@ -1414,7 +1960,7 @@ export function isModelInCurrentCatalog(
  * `legacy-catalog-hint.test.ts` for the case matrix.
  */
 export function shouldShowLegacyCatalogBadge(
-  record: { provider_type: string; base_url: string },
+  record: ProviderPresetIdentityRecord,
   modelId: string,
 ): boolean {
   if (isOpenRouterProviderRecord(record)) return false;
@@ -1422,6 +1968,7 @@ export function shouldShowLegacyCatalogBadge(
   if (!preset) return false;
   const isAuthoritative =
     isCatalogOnlyPlanProviderRecord(record) ||
+    isCatalogOnlyDiscoveryRecord(record) ||
     preset.meta?.fixedCatalog === true;
   if (!isAuthoritative) return false;
   return !isModelInCurrentCatalog(record, modelId);
@@ -1449,7 +1996,7 @@ export function shouldShowLegacyCatalogBadge(
  * helper 决定按钮可见性，不要各自判断。
  */
 export function canReliablyFetchModels(
-  record: { provider_type: string; base_url: string },
+  record: ProviderPresetIdentityRecord,
 ): { reliable: boolean; reasonZh: string; reasonEn: string } {
   // Plan providers stay blocked from the *write* refresh path:
   // probe-and-apply would replace plan-curated catalog rows with raw
@@ -1464,6 +2011,16 @@ export function canReliablyFetchModels(
       reliable: false,
       reasonZh: '套餐型服务，模型由套餐白名单定义；如需补 SKU 请用「添加模型」',
       reasonEn: 'Plan-based provider — model list is defined by your subscription whitelist. Use "Add model" to add SKUs.',
+    };
+  }
+  // Catalog-only discovery gateways (ClinePass, OpenCode Go): the shipped
+  // whitelist is the only truth — their model endpoint is key-gated /
+  // mixed-protocol / a superset, so neither refresh nor search-and-add is safe.
+  if (isCatalogOnlyDiscoveryRecord(record)) {
+    return {
+      reliable: false,
+      reasonZh: '套餐型服务，模型由内置白名单定义，暂不支持在线刷新',
+      reasonEn: 'Subscription provider — models are defined by a built-in whitelist; online refresh is disabled.',
     };
   }
   // OpenRouter: search-and-add is the canonical add path; validate is the
@@ -1568,8 +2125,21 @@ export function canReliablyFetchModels(
  * etc. all fall through that helper's negative branches.
  */
 export function canSearchUpstreamModels(
-  record: { provider_type: string; base_url: string },
+  record: ProviderPresetIdentityRecord,
 ): { reliable: boolean; reasonZh: string; reasonEn: string } {
+  // Catalog-only discovery gateways (ClinePass, OpenCode Go): unlike the plan
+  // providers below (whose /v1/models is a clean per-vendor list), their model
+  // endpoint is key-gated / mixed-protocol / a superset of the plan lineup, so
+  // search-and-add is disabled in Phase 1. Checked before the
+  // `isCatalogOnlyPlanProviderRecord` branch (which returns true) so these
+  // override it to false.
+  if (isCatalogOnlyDiscoveryRecord(record)) {
+    return {
+      reliable: false,
+      reasonZh: '套餐型服务，模型由内置白名单定义，暂不支持在线搜索添加',
+      reasonEn: 'Subscription provider — models come from a built-in whitelist; online search-and-add is disabled.',
+    };
+  }
   if (isOpenRouterProviderRecord(record)) {
     return { reliable: true, reasonZh: '', reasonEn: '' };
   }
@@ -1593,6 +2163,7 @@ export function canSearchUpstreamModels(
   const manualOnlyKeys = new Set([
     'volcengine',
     'bailian',
+    'qwen-token-plan-personal-cn',
     'bailian-token-plan-cn',
     'xiaomi-mimo-token-plan',
     'deepseek',
@@ -1618,57 +2189,173 @@ export function canSearchUpstreamModels(
   return canReliablyFetchModels(record);
 }
 
-/**
- * Server-safe preset matcher — equivalent to the renderer's
- * `findMatchingPreset` (in `components/settings/provider-presets.tsx`)
- * but operates on a plain {provider_type, base_url} record so it can be
- * called from API routes without React imports.
- */
-export function findMatchingPresetForRecord(record: {
-  provider_type: string;
-  base_url: string;
-}): VendorPreset | undefined {
-  if (record.base_url) {
-    const exact = VENDOR_PRESETS.find(p => p.baseUrl && p.baseUrl === record.base_url);
-    if (exact) return exact;
-  }
-  if (record.provider_type === 'bedrock') return getPreset('bedrock');
-  if (record.provider_type === 'vertex') return getPreset('vertex');
-  if (record.provider_type === 'openrouter') return getPreset('openrouter');
-  if (record.provider_type === 'gemini-image') {
-    const official = getPreset('gemini-image');
-    if (official && record.base_url && record.base_url !== official.baseUrl) {
-      return getPreset('gemini-image-thirdparty');
+function inferProtocolFromLegacyFields(providerType: string, baseUrl: string): Protocol {
+  if (providerType === 'anthropic') return 'anthropic';
+  if (providerType === 'openai-compatible') return 'openai-compatible';
+  if (providerType === 'openrouter') return 'openrouter';
+  if (providerType === 'bedrock') return 'bedrock';
+  if (providerType === 'vertex') return 'vertex';
+  if (providerType === 'gemini-image') return 'gemini-image';
+  if (providerType === 'openai-image') return 'openai-image';
+  if (providerType === 'custom') {
+    const anthropicUrls = [
+      'bigmodel.cn', 'z.ai', 'kimi.com', 'moonshot.cn', 'moonshot.ai',
+      'minimaxi.com', 'minimax.io', 'volces.com', 'volcengine.com',
+      'dashscope.aliyuncs.com', 'maas.aliyuncs.com', 'xiaomimimo.com',
+      'localhost:11434',
+    ];
+    const urlLower = baseUrl.toLowerCase();
+    if (anthropicUrls.some(u => urlLower.includes(u)) || urlLower.includes('/anthropic')) {
+      return 'anthropic';
     }
-    return official;
   }
-  if (record.provider_type === 'openai-image') {
-    const official = getPreset('openai-image');
-    if (official && record.base_url && record.base_url !== official.baseUrl) {
-      return getPreset('openai-image-thirdparty');
-    }
-    return official;
-  }
-  // Generic OpenAI-compatible third-party gateway with a user-supplied URL —
-  // fall back to the generic `openai-compatible` preset so getProviderCompat
-  // classifies it as `codepilot_only` (CodePilot + Codex runtimes), not
-  // `unknown` (which would wrongly expose it to Claude Code and gate Codex).
-  if (record.provider_type === 'openai-compatible') {
-    return getPreset('openai-compatible');
-  }
-  // Generic Anthropic-compat with a custom URL (PipeLLM / Aiberm / DeepSeek
-  // /anthropic / etc.) — fall back to the `anthropic-thirdparty` preset so
-  // they pick up its defaults (sonnet/opus/haiku as enabled baseline).
-  if (record.provider_type === 'anthropic') {
-    return getPreset('anthropic-thirdparty');
+  return 'anthropic';
+}
+
+function uniquePresetResult(
+  candidates: VendorPreset[],
+  source: 'legacy_exact' | 'legacy_fuzzy',
+): ProviderPresetIdentityResolution | undefined {
+  if (candidates.length === 1) return { status: 'resolved', preset: candidates[0], source };
+  if (candidates.length > 1) {
+    return { status: 'ambiguous', candidateKeys: candidates.map(p => p.key).sort() };
   }
   return undefined;
+}
+
+/**
+ * Single source of truth for provider product identity.
+ *
+ * Explicit identities are validated against protocol and canonical base URL.
+ * Legacy rows may resolve only when exact/fuzzy matching yields one candidate;
+ * shared endpoints are deliberately returned as `ambiguous` instead of taking
+ * catalog array order.
+ */
+export function resolveProviderPresetIdentity(
+  record: ProviderPresetIdentityRecord,
+): ProviderPresetIdentityResolution {
+  const effectiveProtocol = isValidProtocol(record.protocol)
+    ? record.protocol
+    : inferProtocolFromLegacyFields(record.provider_type, record.base_url);
+
+  if (record.preset_key) {
+    const preset = getPreset(record.preset_key);
+    if (!preset) return { status: 'invalid', candidateKeys: [record.preset_key] };
+    const protocolMatches = preset.protocol === effectiveProtocol;
+    const baseMatches = !preset.baseUrl || preset.baseUrl === record.base_url;
+    if (!protocolMatches || !baseMatches) {
+      return { status: 'invalid', candidateKeys: [record.preset_key] };
+    }
+    return { status: 'resolved', preset, source: 'preset_key' };
+  }
+
+  if (record.base_url) {
+    const exactAtBase = VENDOR_PRESETS.filter(p => Boolean(p.baseUrl) && p.baseUrl === record.base_url);
+    const exact = exactAtBase.filter(p => p.protocol === effectiveProtocol);
+    const exactResult = uniquePresetResult(exact, 'legacy_exact');
+    if (exactResult) return exactResult;
+
+    // If this exact URL is owned by a different protocol, do not hostname-
+    // fuzzy it into another preset on the same host. OpenCode Go's OpenAI and
+    // Anthropic paths are the canonical regression case.
+    if (exactAtBase.length === 0) {
+      const legacyUrl = record.base_url.toLowerCase();
+      const fuzzy = VENDOR_PRESETS.filter(p => {
+        if (!p.baseUrl || p.protocol !== effectiveProtocol) return false;
+        try {
+          return legacyUrl.includes(new URL(p.baseUrl).hostname);
+        } catch {
+          return false;
+        }
+      });
+      const fuzzyResult = uniquePresetResult(fuzzy, 'legacy_fuzzy');
+      if (fuzzyResult) return fuzzyResult;
+    }
+  }
+
+  let key: string | undefined;
+  if (record.provider_type === 'bedrock') key = 'bedrock';
+  else if (record.provider_type === 'vertex') key = 'vertex';
+  else if (record.provider_type === 'openrouter') key = 'openrouter';
+  else if (record.provider_type === 'gemini-image') key = record.base_url ? 'gemini-image-thirdparty' : 'gemini-image';
+  else if (record.provider_type === 'openai-image') key = record.base_url ? 'openai-image-thirdparty' : 'openai-image';
+  else if (record.provider_type === 'xai' || effectiveProtocol === 'xai') key = 'xai';
+  else if (effectiveProtocol === 'openai-compatible') key = 'openai-compatible';
+  else if (record.provider_type === 'anthropic' && record.base_url === 'https://api.anthropic.com') key = 'anthropic-official';
+  else if (record.provider_type === 'anthropic' && record.base_url) key = 'anthropic-thirdparty';
+
+  const preset = key ? getPreset(key) : undefined;
+  return preset
+    ? { status: 'resolved', preset, source: 'legacy_type' }
+    : { status: 'unmatched', candidateKeys: [] };
+}
+
+export function findMatchingPresetForRecord(record: ProviderPresetIdentityRecord): VendorPreset | undefined {
+  const resolution = resolveProviderPresetIdentity(record);
+  return resolution.status === 'resolved' ? resolution.preset : undefined;
+}
+
+export interface VerifiedProviderWireCapabilities {
+  /** Verified Anthropic `output_config.effort` tiers for this exact model. */
+  anthropicEffortLevels?: readonly ProviderEffortLevel[];
+  /** Verified native Responses endpoint for Codex Runtime. */
+  codexResponses?: {
+    baseUrl: string;
+    supportedEffortLevels: readonly ProviderEffortLevel[];
+    supportsReasoningSummary: boolean;
+  };
+}
+
+/**
+ * Resolve model-specific wire capabilities from the provider preset.
+ *
+ * This is intentionally record-aware and fail-closed. A matching hostname is
+ * not enough: the stored provider identity must resolve to a real preset, the
+ * selected model must be in that preset's catalog, and the wire declaration
+ * must explicitly list it. This keeps same-model aggregators from inheriting
+ * DeepSeek's first-party transport contract.
+ */
+export function getVerifiedProviderWireCapabilities(
+  record: ProviderPresetIdentityRecord,
+  modelId: string,
+): VerifiedProviderWireCapabilities {
+  const preset = findMatchingPresetForRecord(record);
+  if (!preset) return {};
+
+  const model = preset.defaultModels.find(candidate =>
+    candidate.modelId === modelId || candidate.upstreamModelId === modelId,
+  );
+  if (!model) return {};
+
+  const canonicalIds = new Set([model.modelId, model.upstreamModelId].filter(Boolean));
+  const isDeclared = (ids: readonly string[] | undefined): boolean =>
+    Boolean(ids?.some(id => canonicalIds.has(id)));
+  const supportedEffortLevels = model.capabilities?.supportsEffort
+    ? model.capabilities.supportedEffortLevels
+    : undefined;
+
+  return {
+    ...(supportedEffortLevels && isDeclared(preset.wireCapabilities?.anthropicEffort?.modelIds)
+      ? { anthropicEffortLevels: supportedEffortLevels }
+      : {}),
+    ...(supportedEffortLevels && isDeclared(preset.wireCapabilities?.codexResponses?.modelIds)
+      ? {
+          codexResponses: {
+            baseUrl: preset.wireCapabilities!.codexResponses!.baseUrl,
+            supportedEffortLevels,
+            supportsReasoningSummary:
+              preset.wireCapabilities!.codexResponses!.supportsReasoningSummary === true,
+          },
+        }
+      : {}),
+  };
 }
 
 /** All valid Protocol union values — used for raw-field validation. */
 export const VALID_PROTOCOLS = new Set<Protocol>([
   'anthropic',
   'openai-compatible',
+  'xai',
   'openrouter',
   'bedrock',
   'vertex',
@@ -1694,11 +2381,21 @@ export function getEffectiveProviderProtocol(
   providerType: string,
   protocol: string | undefined,
   baseUrl: string,
+  presetKey: string,
 ): Protocol {
+  if (presetKey) {
+    const resolved = resolveProviderPresetIdentity({
+      preset_key: presetKey,
+      provider_type: providerType,
+      protocol: protocol || '',
+      base_url: baseUrl,
+    });
+    if (resolved.status === 'resolved') return resolved.preset.protocol;
+  }
   if (protocol && VALID_PROTOCOLS.has(protocol as Protocol)) {
     return protocol as Protocol;
   }
-  return inferProtocolFromLegacy(providerType, baseUrl);
+  return inferProtocolFromLegacy(providerType, baseUrl, presetKey);
 }
 
 /**
@@ -1708,41 +2405,11 @@ export function getEffectiveProviderProtocol(
 export function inferProtocolFromLegacy(
   providerType: string,
   baseUrl: string,
+  presetKey: string,
 ): Protocol {
-  // Direct type mappings
-  if (providerType === 'anthropic') return 'anthropic';
-  if (providerType === 'openai-compatible') return 'openai-compatible';
-  if (providerType === 'openrouter') return 'openrouter';
-  if (providerType === 'bedrock') return 'bedrock';
-  if (providerType === 'vertex') return 'vertex';
-  if (providerType === 'gemini-image') return 'gemini-image';
-  if (providerType === 'openai-image') return 'openai-image';
-
-  // For 'custom' type, check if the base_url matches a known Anthropic-compatible vendor
-  if (providerType === 'custom') {
-    const anthropicUrls = [
-      'bigmodel.cn', 'z.ai',            // GLM
-      'kimi.com', 'moonshot.cn', 'moonshot.ai',  // Kimi/Moonshot
-      'minimaxi.com', 'minimax.io',     // MiniMax
-      'volces.com', 'volcengine.com',   // Volcengine
-      'dashscope.aliyuncs.com',         // Bailian Coding Plan
-      'maas.aliyuncs.com',              // Bailian Token Plan 团队版
-      'xiaomimimo.com',                 // Xiaomi MiMo
-      'localhost:11434',                // Ollama
-    ];
-    const urlLower = baseUrl.toLowerCase();
-    if (anthropicUrls.some(u => urlLower.includes(u))) {
-      return 'anthropic';
-    }
-    // Check if URL contains 'anthropic' in the path
-    if (urlLower.includes('/anthropic')) {
-      return 'anthropic';
-    }
-    // Default custom → anthropic (SDK only supports Anthropic-compatible endpoints)
-    return 'anthropic';
-  }
-
-  return 'anthropic';
+  const preset = presetKey ? getPreset(presetKey) : undefined;
+  if (preset && (!preset.baseUrl || preset.baseUrl === baseUrl)) return preset.protocol;
+  return inferProtocolFromLegacyFields(providerType, baseUrl);
 }
 
 /**
@@ -1770,55 +2437,18 @@ export function inferAuthStyleFromLegacy(
  * presets with the same protocol to avoid misclassifying cross-protocol
  * providers that share the same host (e.g. dashscope OpenAI-compatible vs Bailian Anthropic).
  */
-export function findPresetForLegacy(baseUrl: string, providerType: string, protocol?: Protocol): VendorPreset | undefined {
-  // Exact base_url match (most specific). When a protocol is supplied, the
-  // match must agree with it — otherwise an openai-compatible chat provider
-  // configured with https://api.openai.com/v1 would land on the openai-image
-  // preset and inherit the GPT Image catalog for chat model selection.
-  // Fuzzy match (below) already applies this guard; the exact branch must
-  // too, now that multiple presets share the same canonical URL.
-  if (baseUrl) {
-    const match = VENDOR_PRESETS.find(p => {
-      if (p.baseUrl !== baseUrl) return false;
-      if (protocol && p.protocol !== protocol) return false;
-      return true;
-    });
-    if (match) return match;
-
-    // Fuzzy match: legacy entries may have old URLs (e.g. minimaxi.com/anthropic
-    // before /v1 suffix was added). Match by domain substring against presets.
-    const urlLower = baseUrl.toLowerCase();
-    const fuzzy = VENDOR_PRESETS.find(p => {
-      if (!p.baseUrl) return false;
-      if (protocol && p.protocol !== protocol) return false;
-      try {
-        const presetHost = new URL(p.baseUrl).hostname;
-        return urlLower.includes(presetHost);
-      } catch { return false; }
-    });
-    if (fuzzy) return fuzzy;
-  }
-
-  // Type-based fallback
-  if (providerType === 'bedrock') return VENDOR_PRESETS.find(p => p.key === 'bedrock');
-  if (providerType === 'vertex') return VENDOR_PRESETS.find(p => p.key === 'vertex');
-  if (providerType === 'openrouter') return VENDOR_PRESETS.find(p => p.key === 'openrouter');
-  // Media provider fallbacks: prefer the third-party preset when baseUrl was
-  // provided but didn't match the official host (the exact-match branch above
-  // already returned the official preset when baseUrl === official).
-  if (providerType === 'gemini-image') {
-    if (baseUrl) return VENDOR_PRESETS.find(p => p.key === 'gemini-image-thirdparty');
-    return VENDOR_PRESETS.find(p => p.key === 'gemini-image');
-  }
-  if (providerType === 'openai-image') {
-    if (baseUrl) return VENDOR_PRESETS.find(p => p.key === 'openai-image-thirdparty');
-    return VENDOR_PRESETS.find(p => p.key === 'openai-image');
-  }
-  if (providerType === 'anthropic' && baseUrl === 'https://api.anthropic.com') {
-    return VENDOR_PRESETS.find(p => p.key === 'anthropic-official');
-  }
-
-  return undefined;
+export function findPresetForLegacy(
+  baseUrl: string,
+  providerType: string,
+  protocol: Protocol | undefined,
+  presetKey: string,
+): VendorPreset | undefined {
+  return findMatchingPresetForRecord({
+    preset_key: presetKey,
+    provider_type: providerType,
+    protocol: protocol || '',
+    base_url: baseUrl,
+  });
 }
 
 /**
@@ -1887,6 +2517,9 @@ export function getDefaultModelsForProvider(
   }
   if (protocol === 'anthropic' || protocol === 'openrouter') {
     return ANTHROPIC_DEFAULT_MODELS;
+  }
+  if (protocol === 'xai') {
+    return getPreset('xai')?.defaultModels ?? [];
   }
   // Media protocols: a third-party provider pointing at a custom proxy URL
   // won't match an exact or fuzzy host, so fall back to the third-party

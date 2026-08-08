@@ -40,6 +40,7 @@ import {
   translateCodexApproval,
   CODEX_KNOWN_NOTIFICATION_METHODS,
 } from '@/lib/codex/event-mapper';
+import { diagnoseCodexNetworkError } from '@/lib/codex/error-diagnostics';
 
 const ctx = { sessionId: 's1' };
 
@@ -290,6 +291,22 @@ describe('translateCodexNotification — turn lifecycle (nested status per schem
     assert.match(event.message, /Codex turn failed/);
   });
 
+  it('turn/completed diagnoses a 502 that targets CodePilot loopback proxy', () => {
+    const event = translateCodexNotification(
+      'turn/completed',
+      turnCompleted('failed', {
+        message: 'unexpected status 502 Bad Gateway: Unknown error, url: http://127.0.0.1:47823/api/codex/proxy/v1/responses (other)',
+      }),
+      ctx,
+    );
+    if (event?.type !== 'run_failed') throw new Error('unreachable');
+    assert.equal(event.code, 'CODEX_LOOPBACK_PROXY_INTERCEPTED');
+    assert.match(event.message, /^CODEX_LOOPBACK_PROXY_INTERCEPTED:/);
+    assert.match(event.message, /127\.0\.0\.1\/localhost/);
+    assert.match(event.message, /Original Codex error:/);
+    assert.match(event.message, /url: http:\/\/127\.0\.0\.1:47823/);
+  });
+
   it('turn/completed with status=inProgress → run_completed (conservative, with the real status as reason)', () => {
     // Codex doesn't typically emit inProgress here, but the schema
     // allows it. Surface the real status so downstream can distinguish.
@@ -324,6 +341,25 @@ describe('translateCodexNotification — turn lifecycle (nested status per schem
     assert.match(event.message, /retry budget exhausted/);
     assert.match(event.message, /httpConnectionFailed HTTP 504/);
     assert.equal(event.code, 'codex:httpConnectionFailed');
+  });
+
+  it('error notification diagnoses loopback 502 when the URL is in additionalDetails', () => {
+    const event = translateCodexNotification(
+      'error',
+      {
+        error: {
+          message: 'Unknown error',
+          codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 502 } },
+          additionalDetails: 'unexpected status 502 Bad Gateway, url: http://127.0.0.1:47823/api/codex/proxy/v1/responses',
+        },
+        willRetry: false,
+      },
+      ctx,
+    );
+    if (event?.type !== 'run_failed') throw new Error('unreachable');
+    assert.equal(event.code, 'CODEX_LOOPBACK_PROXY_INTERCEPTED');
+    assert.match(event.message, /^CODEX_LOOPBACK_PROXY_INTERCEPTED:/);
+    assert.match(event.message, /url: http:\/\/127\.0\.0\.1:47823/);
   });
 
   it('error notification with willRetry=true → unknown_item (NOT run_failed) so the stream stays open', () => {
@@ -419,6 +455,32 @@ describe('translateCodexNotification — turn lifecycle (nested status per schem
   });
 });
 
+describe('Codex loopback proxy error diagnosis', () => {
+  it('recognizes localhost and IPv6 CodePilot proxy URLs', () => {
+    assert.match(
+      diagnoseCodexNetworkError(
+        'unexpected status 502 Bad Gateway, url: http://localhost:47823/api/codex/proxy/v1/responses',
+      ).message,
+      /^CODEX_LOOPBACK_PROXY_INTERCEPTED:/,
+    );
+    assert.match(
+      diagnoseCodexNetworkError(
+        'unexpected status 502 Bad Gateway, url: http://[::1]:47823/api/codex/proxy/v1/responses',
+      ).message,
+      /^CODEX_LOOPBACK_PROXY_INTERCEPTED:/,
+    );
+  });
+
+  it('does not relabel an upstream Provider 502, a managed proxy envelope, or an unrelated loopback endpoint', () => {
+    const upstream = 'unexpected status 502 Bad Gateway, url: https://api.example.test/v1/responses';
+    const unrelated = 'unexpected status 502 Bad Gateway, url: http://127.0.0.1:47825/v1/responses';
+    const managedEnvelope = 'unexpected status 502 Bad Gateway: {"error":{"code":"upstream_server_error","message":"Provider unavailable"}}, url: http://127.0.0.1:47823/api/codex/proxy/v1/responses';
+    assert.deepEqual(diagnoseCodexNetworkError(upstream), { message: upstream });
+    assert.deepEqual(diagnoseCodexNetworkError(unrelated), { message: unrelated });
+    assert.deepEqual(diagnoseCodexNetworkError(managedEnvelope), { message: managedEnvelope });
+  });
+});
+
 describe('translateCodexNotification — chat-only item types return null (P2.1 fix)', () => {
   // Phase 5 review round 2 fix (2026-05-13) — agentMessage / userMessage
   // / plan / reasoning lifecycle previously fell through to unknown_item,
@@ -434,7 +496,6 @@ describe('translateCodexNotification — chat-only item types return null (P2.1 
     'enteredReviewMode',
     'exitedReviewMode',
     'contextCompaction',
-    'collabAgentToolCall',
     // Phase 5b smoke round 7 (2026-05-16): imageView / imageGeneration
     // are NOT chat-only — they have no delta channel and their final
     // item is the only surface where the result reaches the user. See
@@ -459,6 +520,159 @@ describe('translateCodexNotification — chat-only item types return null (P2.1 
       assert.equal(event, null);
     });
   }
+});
+
+describe('translateCodexNotification — collabAgentToolCall visibility', () => {
+  it('keeps an anonymous wait as ordinary collaboration activity, not a child capsule', () => {
+    const event = translateCodexNotification(
+      'item/started',
+      {
+        item: {
+          type: 'collabAgentToolCall',
+          id: 'wait-call-1',
+          tool: 'wait',
+          status: 'inProgress',
+          receiverThreadIds: [],
+          agentsStates: {},
+        },
+        threadId: 't',
+        turnId: 'u',
+        startedAtMs: 0,
+      },
+      ctx,
+    );
+    assert.ok(event);
+    if (event.type !== 'tool_started') throw new Error(`expected tool_started, got ${event.type}`);
+    assert.equal(event.name, 'codex_collaboration_wait');
+    assert.equal(event.toolId, 'wait-call-1');
+    assert.deepEqual(event.input, {
+      type: 'collabAgentToolCall',
+      id: 'wait-call-1',
+      tool: 'wait',
+      status: 'inProgress',
+      receiverThreadIds: [],
+      agentsStates: {},
+    });
+  });
+
+  it('does not turn fifteen identity-less wait actions into fifteen sub-agent capsules', () => {
+    const names = Array.from({ length: 15 }, (_, index) => {
+      const event = translateCodexNotification(
+        'item/started',
+        {
+          item: {
+            type: 'collabAgentToolCall',
+            id: `wait-call-${index}`,
+            tool: 'wait',
+            status: 'inProgress',
+            receiverThreadIds: [],
+            agentsStates: {},
+          },
+        },
+        ctx,
+      );
+      if (event?.type !== 'tool_started') throw new Error('expected tool_started');
+      return event.name;
+    });
+    assert.equal(names.filter(name => name === 'codex_subagent').length, 0);
+    assert.deepEqual(new Set(names), new Set(['codex_collaboration_wait']));
+  });
+
+  it('maps a collaboration item to a child capsule only with one proven child identity', () => {
+    const event = translateCodexNotification(
+      'item/started',
+      {
+        item: {
+          type: 'collabAgentToolCall',
+          id: 'wait-call-2',
+          tool: 'wait',
+          status: 'inProgress',
+          receiverThreadIds: ['child-thread-1'],
+          agentsStates: {
+            'child-thread-1': { status: 'running', message: 'Reviewing patch' },
+          },
+          model: 'gpt-5.6-sol',
+          prompt: 'Review this patch',
+        },
+      },
+      ctx,
+    );
+    assert.ok(event);
+    if (event.type !== 'tool_started') throw new Error(`expected tool_started, got ${event.type}`);
+    assert.equal(event.name, 'codex_subagent');
+    assert.equal(event.toolId, 'wait-call-2');
+  });
+
+  it('keeps multi-child wait activity out of the single-child capsule path', () => {
+    const event = translateCodexNotification(
+      'item/started',
+      {
+        item: {
+          type: 'collabAgentToolCall',
+          id: 'wait-call-many',
+          tool: 'wait',
+          status: 'inProgress',
+          receiverThreadIds: ['child-1', 'child-2'],
+          agentsStates: {
+            'child-1': { status: 'running' },
+            'child-2': { status: 'completed' },
+          },
+        },
+      },
+      ctx,
+    );
+    assert.ok(event);
+    if (event.type !== 'tool_started') throw new Error(`expected tool_started, got ${event.type}`);
+    assert.equal(event.name, 'codex_collaboration_wait');
+  });
+
+  it('preserves the full identity-bound completion payload without treating action status as child failure', () => {
+    const event = translateCodexNotification(
+      'item/completed',
+      {
+        item: {
+          type: 'collabAgentToolCall',
+          id: 'wait-call-2',
+          tool: 'wait',
+          status: 'failed',
+          receiverThreadIds: ['child-thread-1'],
+          agentsStates: {
+            'child-thread-1': { status: 'running', message: 'Still reviewing' },
+          },
+          model: 'gpt-5.6-sol',
+        },
+        threadId: 't',
+        turnId: 'u',
+        completedAtMs: 0,
+      },
+      ctx,
+    );
+    assert.ok(event);
+    if (event.type !== 'tool_completed') throw new Error(`expected tool_completed, got ${event.type}`);
+    assert.equal(event.toolId, 'wait-call-2');
+    assert.equal((event.output as { model?: string }).model, 'gpt-5.6-sol');
+    assert.equal(event.error, undefined);
+  });
+
+  it('surfaces an anonymous collaboration action failure as a regular tool error', () => {
+    const event = translateCodexNotification(
+      'item/completed',
+      {
+        item: {
+          type: 'collabAgentToolCall',
+          id: 'wait-call-failed',
+          tool: 'wait',
+          status: 'failed',
+          receiverThreadIds: [],
+          agentsStates: {},
+        },
+      },
+      ctx,
+    );
+    assert.ok(event);
+    if (event.type !== 'tool_completed') throw new Error(`expected tool_completed, got ${event.type}`);
+    assert.equal(event.error, 'Codex collaboration wait failed');
+  });
 });
 
 describe('translateCodexNotification — imageGeneration / imageView lifecycle (Phase 5b smoke round 7)', () => {
@@ -830,10 +1044,25 @@ describe('translateCodexApproval — server-to-client request → canonical perm
     const event = translateCodexApproval({
       ...baseArgs,
       method: 'item/permissions/requestApproval',
-      params: { reason: 'elevate sandbox' },
+      params: {
+        reason: 'elevate sandbox',
+        cwd: '/workspace',
+        environmentId: 'local',
+        permissions: { network: { enabled: true } },
+      },
     });
     if (event.type !== 'permission_request') throw new Error('unreachable');
     assert.equal(event.toolName, 'Permissions');
+    assert.deepEqual(event.toolInput, {
+      permissions: { network: { enabled: true } },
+      cwd: '/workspace',
+      environmentId: 'local',
+    });
+    assert.deepEqual(event.permissionHints, [{
+      type: 'codexPermissionGrant',
+      behavior: 'allow',
+      destination: 'session',
+    }]);
   });
 
   it('unknown approval kind → permission_unavailable (conservative default)', () => {

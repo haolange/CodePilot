@@ -10,7 +10,7 @@ CodePilot — 多模型 AI Agent 桌面客户端，基于 Electron + Next.js。
 
 - **作者** — 产品方向与决策、最终验收。
 - **Claude Code** — 一般任务是**生成代码**（实现、修改、修复）。审查 Codex 改动时按下方「语义验收与反假数据」逐条核对，不只看 diff 形状。
-- **Codex** — 负责**计划与测试**（执行计划、用例设计、回归验证）。
+- **Codex** — 默认负责**计划与测试**（执行计划、用例设计、回归验证）；用户在当前任务明确要求 Codex 实现时，可按 `AGENTS.md` 的临时授权规则承担该范围内的代码改动。
 
 **Claude Code 优先排查方向（Codex Runtime stop / abort 高发区）：** 接手 Codex Runtime 的中断 / 卡死类问题时，优先确认这四点（前两点常是同一根因——见 `src/lib/stream-session-manager.ts` 注释，composer 的 `isStreaming` gate ≡ `snapshot.phase === 'active'`）：
 
@@ -89,18 +89,24 @@ CodePilot — 多模型 AI Agent 桌面客户端，基于 Electron + Next.js。
 - `npm run test:smoke` — 冒烟测试（需要 dev server）
 - `npm run test:e2e` — 完整 E2E（需要 dev server）
 
-**pre-commit hook 实际执行：**
-- `node scripts/lint-hooks.mjs`
-- `npx lint-staged`
-- `npx tsc --noEmit`
-- `CODEX_DISABLED=1 npx tsx --test src/__tests__/unit/*.test.ts`
+**pre-commit hook 实际执行（按改动分层，`scripts/pre-commit-tier.mjs` 判定，fail-closed）：**
+- 恒跑：`node scripts/lint-hooks.mjs` + `npx lint-staged`（含 docs-drift）
+- **docs-only**（全部暂存文件都是 `docs/**` / `*.md` / `*.txt` / `LICENSE` 等）：到此为止，**跳过 `tsc` + 单测**
+- **代码 / 测试 / 依赖 / 构建脚本 / 配置 / 未知扩展名**：追加 `npx tsc --noEmit` + `CODEX_DISABLED=1 npx tsx --test --import ./src/__tests__/db-isolation.setup.ts src/__tests__/unit/*.test.ts`
+- fail-closed：分类器出错 / 空暂存集 / 非 `docs` 判定一律走全量门禁（防「前置失败被静默放行」回归）
 
-提交前至少确保 `npm run test` 通过；`test:smoke` / `test:e2e` 按风险触发，不是每次提交的默认门禁。
+高风险 docs（release / security / runtime / provider / permission / DB schema）即便走 docs 快路，也应手动跑 `npm run test`（必要时 build / smoke）。`test:smoke` / `test:e2e` 按风险触发，不是每次提交的默认门禁。
 
 **验证分层：**
 - Tier 0：纯视觉 / 间距 / className 调整。迭代时做代码审查 + 浏览器视觉检查 + console 检查即可；不要把 commit 当作 spacing 调整的迭代循环，攒成一批后再跑提交门禁。
 - Tier 1：UI 行为 / 数据接线 / i18n 文案 / 组件状态变化。需要 targeted test 或 smoke，并在提交前跑 `npm run test`。
 - Tier 2：Runtime / Provider / DB / 权限 / Stream / MCP / Electron / 发版链路。必须读对应 guardrail，跑 targeted + full tests，必要时追加真实凭据 smoke 或 E2E，并把结果写入相关执行计划的 Smoke Ledger。
+
+## 汇报与完成状态
+
+**完成状态词典（禁止混用）：** `Code complete`（代码改完）/ `Tests pass`（测试过）/ `Smoke passed`（真实路径跑通）/ `Review passed`（复审无 blocker）/ `Release ready`（可发版）/ `Shipped`（已 push/tag/release）。不要把 `Code complete` 说成"已修好"。
+
+**简化汇报协议（默认 ≤5 行）：** 结论 / 用户影响 / 验证 / 剩余风险 / 下一步。默认不贴 commit 串、`file:line`、测试全文；只有 Tier 2 改动、review blocker、用户主动要细节时才展开。完整词典与协议见 [docs/rules/reporting.md](./docs/rules/reporting.md)。
 
 ## 改动自查
 
@@ -133,59 +139,11 @@ CodePilot — 多模型 AI Agent 桌面客户端，基于 Electron + Next.js。
 
 ## 发版
 
-**发版流程：** 更新 `RELEASE_NOTES.md` → 更新 package.json version → `npm install` 同步 lock → 提交推送 → `git tag v{版本号} && git push origin v{版本号}` → CI 自动构建发布并使用 `RELEASE_NOTES.md` 作为 Release 正文。不要手动创建 GitHub Release（CI 会自动创建并上传构建产物）。
+**发版流程：** 更新 `RELEASE_NOTES.md` → 更新 package.json version → `npm install` 同步 lock → 提交推送 → `git tag v{版本号} && git push origin v{版本号}` → CI 自动构建发布并用 `RELEASE_NOTES.md` 作为 Release 正文。**完整流程、Release Notes 模板与写作规则见 [docs/rules/release.md](./docs/rules/release.md)。**
 
-**发版纪律：** 禁止自动发版。`git push` + `git tag` 必须等用户明确指示后才执行。commit 可以正常进行。
+**发版纪律（硬规则）：** 禁止自动发版——`git push` + `git tag` 必须等用户明确指示后才执行；commit 可正常进行。不要手动创建 GitHub Release（CI 自动创建）。不要删除 / 重建已发布的 release tag（会把 Release 打回 Draft）。
 
-**构建：** macOS 产出 DMG（arm64 + x64），Windows 产出 NSIS 安装包。`scripts/after-pack.js` 重编译 better-sqlite3 为 Electron ABI。构建前清理 `rm -rf release/ .next/`。
-
-**Release Notes 格式（必须严格遵循）：**
-
-标题：`CodePilot v{版本号}`
-
-正文结构：
-
-```markdown
-## CodePilot v{版本号}
-
-> 一句话版本摘要，说明这个版本的核心主题或推荐升级理由。
-
-### 新增功能
-- 功能描述（面向用户的语言，不要写 commit hash）
-
-### 修复问题
-- 修复了 xxx 的问题
-
-### 优化改进
-- 优化了 xxx
-
-## 下载地址
-
-### macOS
-- [Apple Silicon (M1/M2/M3/M4)](https://github.com/op7418/CodePilot/releases/download/v{版本号}/CodePilot-{版本号}-arm64.dmg)
-- [Intel](https://github.com/op7418/CodePilot/releases/download/v{版本号}/CodePilot-{版本号}-x64.dmg)
-
-### Windows
-- [Windows 安装包](https://github.com/op7418/CodePilot/releases/download/v{版本号}/CodePilot.Setup.{版本号}.exe)
-
-## 安装说明
-
-**macOS**: 下载 DMG → 拖入 Applications → 首次启动如遇安全提示，在系统设置 > 隐私与安全中点击"仍要打开"
-**Windows**: 下载 exe 安装包 → 双击安装
-
-## 系统要求
-
-- macOS 12.0+ / Windows 10+ / Linux (glibc 2.31+)
-- 需要配置 API 服务商（Anthropic / OpenRouter 等）
-- 推荐安装 Claude Code CLI 以获得完整功能
-```
-
-**Release Notes 写作规则：**
-- 更新内容必须用用户能理解的语言，不要出现 commit hash、函数名、文件路径
-- 每个条目说清楚"用户能感知到什么变化"
-- 下载链接必须是完整的 GitHub release download URL，用户点击即可下载
-- 如果某个分类没有内容（如没有修复），跳过该分类不要留空标题
-- `git log --oneline` 的输出只用于自己梳理，不要原样复制到 Release Notes
+**构建：** macOS 产出 DMG（arm64 + x64），Windows 产出 NSIS 安装包（x64），Linux 在原生 Ubuntu 22.04 runner 产出 AppImage / deb / rpm（arm64 + x64）；任一目标失败都会阻断正式 Release。Windows 构建机器钉在 `windows-2022`（tech-debt #44）。`scripts/after-pack.js` 重编译 better-sqlite3 为 Electron ABI。构建前使用受保护的清理脚本清理 `release/ .next/ dist-electron/`。
 
 ## 执行计划
 
@@ -197,9 +155,17 @@ CodePilot — 多模型 AI Agent 桌面客户端，基于 Electron + Next.js。
 
 **修复闭环：** 接手 P1/P2 review finding、用户反馈、CDP 失败或测试失败时，按 `Signal → Triage → Fix → Verify → Guardrail` 处理；修复说明必须包含根因、改动、验证和防回归。不要只在聊天里关闭问题；需要沉淀的同类问题写入执行计划、tech-debt tracker 或 guardrail。
 
+**完成即回写进度（与 Codex 对齐协作）：** 执行计划里的任一 Phase / 子项做完后，必须立即把进度回写到对应执行计划文档，不能只在聊天里说"做完了"——审查者只能据文档判断真实进度。回写三处且必须互相一致：
+1. **执行清单**：对应 `[ ]` → `[x]`（部分完成的项标注"部分：已做 X，待 Y"）。
+2. **「状态总览」表**：更新该 Phase 状态（`📋 待开始` / `🚧 进行中` / `✅ 已完成`），并同步顶部 frontmatter 的总状态行。
+3. **决策日志**：追加一条，含 commit hash + 验证结论（测试数 / smoke 结果）+ 推翻或转 tech-debt 的结论。
+分工：默认由 Claude Code 负责实施 + 回写进度，Codex 负责审查与维护文档结构；若用户按 `AGENTS.md` 明确授权 Codex 实现，则 Codex 同样负责其改动对应的进度回写，后续审查仍需使用独立上下文。状态表、清单勾选、决策日志三者出现不一致即视为状态失真，必须先对齐再继续。Phase 全部子项完成后把计划从 `active/` 移到 `completed/`。
+
 ## 文档
 
 - [ARCHITECTURE.md](./ARCHITECTURE.md) — 项目架构、目录结构、数据流、新功能触及点
+- [docs/rules/](./docs/rules/README.md) — 流程规则（汇报协议 / 完成状态词典 / 发版细则）
+- [docs/guardrails/](./docs/guardrails/README.md) — 模块级开发契约（改对应模块代码前必读）
 - [docs/design.md](./docs/design.md) — UI 设计规范（卡片 / 分割线 / 徽章 / preview 流程等模式；新做 Settings / 同类页面前先读）
 - `docs/exec-plans/` — 执行计划（进度状态 + 决策日志 + 技术债务）
 - `docs/handover/` — 技术交接文档（架构、数据流、设计决策）

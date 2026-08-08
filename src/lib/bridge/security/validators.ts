@@ -6,6 +6,7 @@
  */
 
 import * as path from 'path';
+import { detectPathDialect, resolvePathIdentity } from '../../path-identity';
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -32,7 +33,7 @@ const DANGEROUS_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
 
 /**
  * Validate a working directory path.
- * Must be an absolute path without traversal or shell metacharacters.
+ * Must be an existing absolute directory without traversal or control characters.
  * Returns sanitized path or null if invalid.
  */
 export function validateWorkingDirectory(rawPath: string): string | null {
@@ -40,11 +41,19 @@ export function validateWorkingDirectory(rawPath: string): string | null {
 
   const trimmed = rawPath.trim();
 
-  // Must be absolute
+  // Must be absolute in the current host dialect. `path.isAbsolute()` alone
+  // cannot describe Windows input when tests/review run on another platform,
+  // so detect the input dialect explicitly and then require host compatibility.
+  const dialect = detectPathDialect(trimmed, process.platform);
   if (!path.isAbsolute(trimmed)) return null;
+  if (process.platform === 'win32' && dialect === 'posix') return null;
+  if (process.platform !== 'win32' && (dialect === 'windows_drive' || dialect === 'unc')) return null;
 
-  // Reject null bytes
-  if (trimmed.includes('\0')) return null;
+  // Reject control characters. Shell metacharacters are valid filename
+  // characters on Windows and are safe here because this value is passed as
+  // spawn.cwd / filesystem input, never interpolated into a command string.
+   
+  if (/[\x00-\x1f]/.test(trimmed)) return null;
 
   // Reject path traversal segments
   const segments = trimmed.split(/[/\\]/);
@@ -53,11 +62,12 @@ export function validateWorkingDirectory(rawPath: string): string | null {
   // Reject if too long
   if (trimmed.length > MAX_PATH_LENGTH) return null;
 
-  // Reject shell metacharacters that have no place in a directory path
-  if (/[$`;|&><(){}\x00-\x1f]/.test(trimmed)) return null;
-
-  // Normalize the path (resolves redundant slashes, etc.)
-  return path.normalize(trimmed);
+  try {
+    const identity = resolvePathIdentity(trimmed);
+    return identity.kind === 'directory' ? identity.absolutePath : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -108,7 +118,7 @@ export function sanitizeInput(
   if (!text) return { text: '', truncated: false };
 
   // Strip control characters except \n (0x0A) and \t (0x09)
-  // eslint-disable-next-line no-control-regex
+   
   let sanitized = text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
 
   const truncated = sanitized.length > maxLength;

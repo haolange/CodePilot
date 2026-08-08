@@ -1,7 +1,11 @@
 import { generateImage, NoImageGeneratedError } from 'ai';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { createOpenAI } from '@ai-sdk/openai';
-import { getDb, getSession, getSetting } from '@/lib/db';
+import { getAllProviders, getDb, getSession, getSetting } from '@/lib/db';
+import {
+  findActiveAssetIdsByStablePaths,
+  registerMediaGenerationAsset,
+} from '@/lib/assets/service';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
@@ -218,10 +222,13 @@ function pickImageProvider(
   family: ImageFamily | undefined,
   providerId: string | undefined,
 ): { row: ProviderRow; family: ImageFamily } {
-  const db = getDb();
-  const rows = db.prepare(
-    "SELECT id, provider_type, api_key, base_url, extra_env FROM api_providers WHERE provider_type IN ('gemini-image', 'openai-image') AND api_key != ''"
-  ).all() as ProviderRow[];
+  // Provider secrets may be envelope-encrypted at rest. Always use the DB
+  // accessor so selection sees the authenticated, in-memory plaintext and
+  // never depends on the legacy api_key column.
+  const rows = getAllProviders().filter(
+    provider => (provider.provider_type === 'gemini-image' || provider.provider_type === 'openai-image')
+      && !!provider.api_key,
+  ) as ProviderRow[];
 
   if (rows.length === 0) {
     throw new Error('No image provider configured. Please add a Gemini Image or OpenAI Image provider in Settings.');
@@ -289,6 +296,7 @@ export async function generateSingleImage(params: GenerateSingleImageParams): Pr
   // Collect reference images (base64 strings). Both referenceImagePaths and
   // referenceImages may be provided together.
   const refImageData: string[] = [];
+  const resolvedReferencePaths: string[] = [];
   if (params.referenceImagePaths && params.referenceImagePaths.length > 0) {
     for (const fp of params.referenceImagePaths) {
       // Resolve relative paths against session working directory
@@ -296,6 +304,7 @@ export async function generateSingleImage(params: GenerateSingleImageParams): Pr
       if (fs.existsSync(resolved)) {
         const buf = fs.readFileSync(resolved);
         refImageData.push(buf.toString('base64'));
+        resolvedReferencePaths.push(resolved);
       }
     }
   }
@@ -430,16 +439,24 @@ export async function generateSingleImage(params: GenerateSingleImageParams): Pr
     metadata.referenceImages = savedRefImages;
   }
 
-  getDb().prepare(
-    `INSERT INTO media_generations (id, type, status, provider, model, prompt, aspect_ratio, image_size, local_path, thumbnail_path, session_id, message_id, tags, metadata, error, created_at, completed_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    id, 'image', 'completed', family, requestedModel, params.prompt,
-    aspectRatio, imageSize, localPath, '',
-    params.sessionId || null, null,
-    '[]', JSON.stringify(metadata),
-    null, now, now
-  );
+  const db = getDb();
+  db.transaction(() => {
+    db.prepare(
+      `INSERT INTO media_generations (id, type, status, provider, model, prompt, aspect_ratio, image_size, local_path, thumbnail_path, session_id, message_id, tags, metadata, error, created_at, completed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      id, 'image', 'completed', family, requestedModel, params.prompt,
+      aspectRatio, imageSize, localPath, '',
+      params.sessionId || null, null,
+      '[]', JSON.stringify(metadata),
+      null, now, now
+    );
+    registerMediaGenerationAsset({
+      mediaGenerationId: id,
+      producerId: 'image-generator',
+      parentAssetIds: findActiveAssetIdsByStablePaths(resolvedReferencePaths),
+    });
+  })();
 
   return {
     mediaGenerationId: id,

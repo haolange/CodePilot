@@ -2,11 +2,22 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   VENDOR_PRESETS,
-  inferProtocolFromLegacy,
+  inferProtocolFromLegacy as inferProtocolFromLegacyResolved,
   inferAuthStyleFromLegacy,
   getDefaultModelsForProvider,
-  findPresetForLegacy,
+  findPresetForLegacy as findPresetForLegacyResolved,
 } from '../../lib/provider-catalog';
+import { resolveEffortMenuLevels } from '../../lib/effort-levels';
+import en from '../../i18n/en';
+import zh from '../../i18n/zh';
+
+const inferProtocolFromLegacy = (providerType: string, baseUrl: string) =>
+  inferProtocolFromLegacyResolved(providerType, baseUrl, '');
+const findPresetForLegacy = (
+  baseUrl: string,
+  providerType: string,
+  protocol?: import('../../lib/provider-catalog').Protocol,
+) => findPresetForLegacyResolved(baseUrl, providerType, protocol, '');
 
 // ── Provider Catalog Tests ──────────────────────────────────────
 
@@ -44,6 +55,180 @@ describe('Provider Catalog', () => {
       assert.ok(kimi, 'Kimi preset not found');
       assert.equal(kimi.protocol, 'anthropic');
       assert.equal(kimi.authStyle, 'api_key');
+    });
+
+    // ── Phase 1 (2026-07-17): GLM-5.2 / Kimi for Coding ─────────────
+    //
+    // These pin the two USER-VISIBLE claims the catalog makes for the two
+    // Coding Plans: which model name the user reads, and which effort tiers
+    // the menu may offer. Both were fake before this phase — GLM listed a
+    // superseded model pair with no effort capability at all, and Kimi's row
+    // said `Kimi K2.5`, a version the vendor rolls forward without telling us.
+
+    describe('GLM Coding Plan (CN + Global)', () => {
+      const glmPresets = VENDOR_PRESETS.filter(p => p.key === 'glm-cn' || p.key === 'glm-global');
+
+      it('both regions exist and share one catalog', () => {
+        assert.equal(glmPresets.length, 2, 'Expected glm-cn + glm-global');
+        assert.deepEqual(glmPresets[0].defaultModels, glmPresets[1].defaultModels);
+      });
+
+      it('catalog is the GLM-5.2 generation — no superseded 5-Turbo / 5.1 rows', () => {
+        for (const p of glmPresets) {
+          const names = p.defaultModels.map(m => m.displayName);
+          assert.ok(names.includes('GLM-5.2'), `${p.key} should list GLM-5.2, got ${names.join(', ')}`);
+          for (const stale of ['GLM-5-Turbo', 'GLM-5.1']) {
+            assert.ok(!names.includes(stale), `${p.key} still lists superseded ${stale}`);
+          }
+        }
+      });
+
+      it('GLM-5.2 is listed once — sonnet+opus both map to it, so two rows would be one model twice', () => {
+        for (const p of glmPresets) {
+          const glm52Rows = p.defaultModels.filter(m => m.displayName === 'GLM-5.2');
+          assert.equal(glm52Rows.length, 1, `${p.key} lists GLM-5.2 ${glm52Rows.length}×`);
+        }
+      });
+
+      it('role env mapping points both sonnet and opus at glm-5.2', () => {
+        for (const p of glmPresets) {
+          assert.equal(p.defaultEnvOverrides.ANTHROPIC_DEFAULT_SONNET_MODEL, 'glm-5.2', p.key);
+          assert.equal(p.defaultEnvOverrides.ANTHROPIC_DEFAULT_OPUS_MODEL, 'glm-5.2', p.key);
+          // haiku is unchanged this round — nothing in the research baseline
+          // says the small slot moved off 4.5-Air.
+          assert.equal(p.defaultEnvOverrides.ANTHROPIC_DEFAULT_HAIKU_MODEL, 'glm-4.5-air', p.key);
+        }
+      });
+
+      it('effort capability declares exactly the two real tiers (high, max)', () => {
+        for (const p of glmPresets) {
+          const glm52 = p.defaultModels.find(m => m.displayName === 'GLM-5.2');
+          assert.ok(glm52, `${p.key} missing GLM-5.2 row`);
+          assert.equal(glm52.capabilities?.supportsEffort, true, p.key);
+          assert.deepEqual(glm52.capabilities?.supportedEffortLevels, ['high', 'max'], p.key);
+        }
+      });
+
+      it('never offers the low/medium/xhigh tiers GLM silently folds away', () => {
+        // GLM maps low/medium/high → high and xhigh/max/ultracode → max, so a
+        // `low` row would charge the user for `high` while the button said Low.
+        for (const p of glmPresets) {
+          for (const m of p.defaultModels) {
+            const levels = m.capabilities?.supportedEffortLevels ?? [];
+            for (const fake of ['low', 'medium', 'xhigh']) {
+              assert.ok(!levels.includes(fake as 'low'), `${p.key}/${m.modelId} offers folded tier ${fake}`);
+            }
+          }
+        }
+      });
+
+      it('the two-tier menu carries a mapping note stating BOTH groups in both locales', () => {
+        const glm52 = glmPresets[0].defaultModels.find(m => m.displayName === 'GLM-5.2');
+        const key = glm52?.capabilities?.effortNoteKey;
+        assert.ok(key, 'GLM-5.2 must explain the six-to-two collapse in the menu');
+        const enNote = en[key as keyof typeof en] as string;
+        const zhNote = zh[key as keyof typeof zh] as string;
+        assert.ok(enNote, `missing en string for ${key}`);
+        assert.ok(zhNote, `missing zh string for ${key}`);
+        // Both source tiers must be named, or the note under-promises the
+        // fold: `ultracode` was missing from both locales in the first cut
+        // while the code comment claimed six-to-two.
+        for (const note of [enNote, zhNote]) {
+          for (const tier of ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode']) {
+            assert.ok(
+              note.includes(tier),
+              `mapping note omits the ${tier} tier — reads as a partial mapping: "${note}"`,
+            );
+          }
+        }
+      });
+
+      it('menu resolves to Auto + the two real tiers', () => {
+        const glm52 = glmPresets[0].defaultModels.find(m => m.displayName === 'GLM-5.2');
+        assert.deepEqual(
+          resolveEffortMenuLevels(glm52?.capabilities?.supportedEffortLevels),
+          ['auto', 'high', 'max'],
+        );
+      });
+
+      it('GLM-4.5-Air declares no effort capability → selector hides, not guesses', () => {
+        const air = glmPresets[0].defaultModels.find(m => m.displayName === 'GLM-4.5-Air');
+        assert.ok(air, 'GLM-4.5-Air row missing');
+        assert.equal(air.capabilities?.supportsEffort, undefined);
+        assert.equal(resolveEffortMenuLevels(air.capabilities?.supportedEffortLevels), null);
+      });
+    });
+
+    describe('Kimi for Coding', () => {
+      const kimi = VENDOR_PRESETS.find(p => p.key === 'kimi');
+
+      it('user-visible name is the channel, never the underlying version', () => {
+        assert.ok(kimi);
+        assert.equal(kimi.defaultModels.length, 1);
+        assert.equal(kimi.defaultModels[0].displayName, 'Kimi for Coding');
+      });
+
+      it('no K2.5 / K3 version string anywhere in the user-visible Kimi preset', () => {
+        assert.ok(kimi);
+        const visible = [kimi.name, kimi.description, kimi.descriptionZh, ...kimi.defaultModels.map(m => m.displayName)];
+        for (const text of visible) {
+          assert.ok(!/K2\.5|K3/i.test(text), `Kimi preset leaks an underlying version: "${text}"`);
+        }
+      });
+
+      it('does NOT add an explicit k3 row (vendor rolls the channel forward)', () => {
+        assert.ok(kimi);
+        assert.ok(!kimi.defaultModels.some(m => /k3/i.test(m.modelId) || /k3/i.test(m.upstreamModelId ?? '')));
+      });
+
+      it('requests go to the stable channel id, not the bare `sonnet` alias', () => {
+        assert.ok(kimi);
+        const row = kimi.defaultModels[0];
+        // The alias stays as the UI/DB id (existing rows + sessions point at
+        // it); upstreamModelId is what actually ships.
+        assert.equal(row.modelId, 'sonnet');
+        assert.equal(row.upstreamModelId, 'kimi-for-coding');
+      });
+
+      it('declares the documented low/high/max tiers without Claude-only pseudo-tiers', () => {
+        assert.ok(kimi);
+        const caps = kimi.defaultModels[0].capabilities;
+        assert.equal(caps?.supportsEffort, true);
+        assert.deepEqual(caps?.supportedEffortLevels, ['low', 'high', 'max']);
+      });
+
+      it('menu is Auto + Low/High/Max, and `auto` is never a declared vendor tier', () => {
+        assert.ok(kimi);
+        const caps = kimi.defaultModels[0].capabilities;
+        // Auto is CodePilot's "send nothing" option; if it ever leaked into
+        // the capability list it would be sent on the wire as effort=auto.
+        assert.ok(!(caps?.supportedEffortLevels as string[]).includes('auto'));
+        assert.deepEqual(resolveEffortMenuLevels(caps?.supportedEffortLevels), ['auto', 'low', 'high', 'max']);
+      });
+
+      it('the Auto distinction is explained in both locales', () => {
+        assert.ok(kimi);
+        const key = kimi.defaultModels[0].capabilities?.effortNoteKey;
+        assert.ok(key, 'Kimi must state that Auto is not a Kimi tier');
+        assert.ok(en[key as keyof typeof en], `missing en string for ${key}`);
+        assert.ok(zh[key as keyof typeof zh], `missing zh string for ${key}`);
+      });
+    });
+
+    describe('Moonshot — out of scope for the Kimi rename (Phase 1)', () => {
+      it('keeps its own name and K2.5 model row untouched', () => {
+        // Moonshot is a separate pay-as-you-go provider that sells the K2.5
+        // SKU by name. The `Kimi for Coding` channel abstraction is a Kimi
+        // Coding Plan product contract and does NOT apply here; renaming it
+        // would claim a channel Moonshot doesn't offer.
+        const moonshot = VENDOR_PRESETS.find(p => p.key === 'moonshot');
+        assert.ok(moonshot);
+        assert.equal(moonshot.name, 'Moonshot');
+        assert.equal(moonshot.baseUrl, 'https://api.moonshot.cn/anthropic');
+        assert.deepEqual(moonshot.defaultModels, [
+          { modelId: 'sonnet', displayName: 'Kimi K2.5', role: 'default' },
+        ]);
+      });
     });
 
     it('MiniMax presets use anthropic protocol', () => {
@@ -282,7 +467,7 @@ describe('Provider Catalog', () => {
 
 // ── Provider Resolver Tests ─────────────────────────────────────
 
-import { resolveProvider, toClaudeCodeEnv, toAiSdkConfig } from '../../lib/provider-resolver';
+import { resolveProvider, toClaudeCodeEnv, toAiSdkConfig, resolveEffectiveAnthropicBaseUrl } from '../../lib/provider-resolver';
 import type { ResolvedProvider } from '../../lib/provider-resolver';
 
 describe('Provider Resolver', () => {
@@ -308,6 +493,7 @@ describe('Provider Resolver', () => {
         provider: {
           id: 'test',
           name: 'Test',
+          preset_key: 'anthropic-official',
           provider_type: 'anthropic',
           protocol: 'anthropic',
           base_url: 'https://api.anthropic.com',
@@ -348,6 +534,7 @@ describe('Provider Resolver', () => {
         provider: {
           id: 'test',
           name: 'Kimi',
+          preset_key: 'kimi',
           provider_type: 'anthropic',
           protocol: 'anthropic',
           base_url: 'https://api.kimi.com/coding/',
@@ -386,6 +573,7 @@ describe('Provider Resolver', () => {
         provider: {
           id: 'test',
           name: 'Test',
+          preset_key: 'anthropic-official',
           provider_type: 'anthropic',
           protocol: 'anthropic',
           base_url: '',
@@ -432,6 +620,7 @@ describe('Provider Resolver', () => {
         provider: {
           id: 'test',
           name: 'Test',
+          preset_key: 'anthropic-official',
           provider_type: 'anthropic',
           protocol: 'anthropic',
           base_url: '',
@@ -474,6 +663,7 @@ describe('Provider Resolver', () => {
         provider: {
           id: 'test',
           name: 'Legacy Gateway',
+          preset_key: '',
           provider_type: 'anthropic',
           protocol: 'anthropic',
           base_url: 'https://gateway.example.com/anthropic',
@@ -549,7 +739,7 @@ describe('Provider Resolver', () => {
     it('anthropic protocol → anthropic SDK', () => {
       const resolved: ResolvedProvider = {
         provider: {
-          id: 'test', name: 'Test', provider_type: 'anthropic', protocol: 'anthropic',
+          id: 'test', name: 'Test', preset_key: 'anthropic-official', provider_type: 'anthropic', protocol: 'anthropic',
           base_url: 'https://api.anthropic.com', api_key: 'key', is_active: 1, sort_order: 0,
           extra_env: '{}', headers_json: '{}', env_overrides_json: '', role_models_json: '{}',
           notes: '', created_at: '', updated_at: '', options_json: '{}',
@@ -587,7 +777,7 @@ describe('Provider Resolver', () => {
       // upstream slug.
       const resolved: ResolvedProvider = {
         provider: {
-          id: 'test', name: 'OR', provider_type: 'openrouter', protocol: 'openrouter',
+          id: 'test', name: 'OR', preset_key: 'openrouter', provider_type: 'openrouter', protocol: 'openrouter',
           base_url: 'https://openrouter.ai/api', api_key: 'or-key', is_active: 1, sort_order: 0,
           extra_env: '{}', headers_json: '{}', env_overrides_json: '', role_models_json: '{}',
           notes: '', created_at: '', updated_at: '', options_json: '{}',
@@ -637,7 +827,7 @@ describe('Provider Resolver', () => {
       // sdkProxyOnly providers like Zhipu / Kimi).
       const resolved: ResolvedProvider = {
         provider: {
-          id: 'test', name: 'OR', provider_type: 'openrouter', protocol: 'openrouter',
+          id: 'test', name: 'OR', preset_key: 'openrouter', provider_type: 'openrouter', protocol: 'openrouter',
           base_url: 'https://openrouter.ai/api', api_key: 'or-key', is_active: 1, sort_order: 0,
           extra_env: '{}', headers_json: '{}', env_overrides_json: '', role_models_json: '{}',
           notes: '', created_at: '', updated_at: '', options_json: '{}',
@@ -670,7 +860,7 @@ describe('Provider Resolver', () => {
       // refactor doesn't accidentally widen the branch.
       const resolved: ResolvedProvider = {
         provider: {
-          id: 'test', name: 'OR', provider_type: 'openrouter', protocol: 'openrouter',
+          id: 'test', name: 'OR', preset_key: 'openrouter', provider_type: 'openrouter', protocol: 'openrouter',
           base_url: 'https://openrouter.ai/api/v1', api_key: 'or-key', is_active: 1, sort_order: 0,
           extra_env: '{}', headers_json: '{}', env_overrides_json: '', role_models_json: '{}',
           notes: '', created_at: '', updated_at: '', options_json: '{}',
@@ -700,7 +890,7 @@ describe('Provider Resolver', () => {
       // pre-round-7 behaviour for un-configured records.
       const resolved: ResolvedProvider = {
         provider: {
-          id: 'test', name: 'OR', provider_type: 'openrouter', protocol: 'openrouter',
+          id: 'test', name: 'OR', preset_key: 'openrouter', provider_type: 'openrouter', protocol: 'openrouter',
           base_url: '', api_key: 'or-key', is_active: 1, sort_order: 0,
           extra_env: '{}', headers_json: '{}', env_overrides_json: '', role_models_json: '{}',
           notes: '', created_at: '', updated_at: '', options_json: '{}',
@@ -726,7 +916,7 @@ describe('Provider Resolver', () => {
     it('bedrock protocol → injects env overrides', () => {
       const resolved: ResolvedProvider = {
         provider: {
-          id: 'test', name: 'Bedrock', provider_type: 'bedrock', protocol: 'bedrock',
+          id: 'test', name: 'Bedrock', preset_key: 'bedrock', provider_type: 'bedrock', protocol: 'bedrock',
           base_url: '', api_key: '', is_active: 1, sort_order: 0,
           extra_env: '{}', headers_json: '{}', env_overrides_json: '', role_models_json: '{}',
           notes: '', created_at: '', updated_at: '', options_json: '{}',
@@ -758,7 +948,7 @@ describe('Provider Resolver', () => {
     it('openai-compatible protocol → openai SDK', () => {
       const resolved: ResolvedProvider = {
         provider: {
-          id: 'test', name: 'Custom', provider_type: 'custom', protocol: 'openai-compatible',
+          id: 'test', name: 'Custom', preset_key: '', provider_type: 'custom', protocol: 'openai-compatible',
           base_url: 'https://my-server.com/v1', api_key: 'key', is_active: 1, sort_order: 0,
           extra_env: '{}', headers_json: '{}', env_overrides_json: '', role_models_json: '{}',
           notes: '', created_at: '', updated_at: '', options_json: '{}',
@@ -784,7 +974,7 @@ describe('Provider Resolver', () => {
     it('model override takes precedence', () => {
       const resolved: ResolvedProvider = {
         provider: {
-          id: 'test', name: 'Test', provider_type: 'anthropic', protocol: 'anthropic',
+          id: 'test', name: 'Test', preset_key: 'anthropic-official', provider_type: 'anthropic', protocol: 'anthropic',
           base_url: '', api_key: 'key', is_active: 1, sort_order: 0,
           extra_env: '{}', headers_json: '{}', env_overrides_json: '', role_models_json: '{}',
           notes: '', created_at: '', updated_at: '', options_json: '{}',
@@ -809,7 +999,7 @@ describe('Provider Resolver', () => {
     it('gemini-image protocol → google SDK', () => {
       const resolved: ResolvedProvider = {
         provider: {
-          id: 'test', name: 'Gemini', provider_type: 'gemini-image', protocol: 'gemini-image',
+          id: 'test', name: 'Gemini', preset_key: 'gemini-image', provider_type: 'gemini-image', protocol: 'gemini-image',
           base_url: 'https://generativelanguage.googleapis.com/v1beta', api_key: 'gkey',
           is_active: 1, sort_order: 0,
           extra_env: '{}', headers_json: '{}', env_overrides_json: '', role_models_json: '{}',
@@ -956,7 +1146,7 @@ describe('Upstream Model ID Mapping', () => {
   it('toAiSdkConfig maps internal model ID to upstream via availableModels', () => {
     const resolved: ResolvedProvider = {
       provider: {
-        id: 'test', name: 'GLM', provider_type: 'custom', protocol: 'anthropic',
+        id: 'test', name: 'GLM', preset_key: 'glm-cn', provider_type: 'custom', protocol: 'anthropic',
         base_url: 'https://open.bigmodel.cn/api/anthropic', api_key: 'key',
         is_active: 1, sort_order: 0, extra_env: '{}', headers_json: '{}',
         env_overrides_json: '', role_models_json: '{}', notes: '', created_at: '', updated_at: '', options_json: '{}',
@@ -993,7 +1183,7 @@ describe('Upstream Model ID Mapping', () => {
   it('toClaudeCodeEnv injects role model env vars for upstream mapping', () => {
     const resolved: ResolvedProvider = {
       provider: {
-        id: 'test', name: 'GLM', provider_type: 'custom', protocol: 'anthropic',
+        id: 'test', name: 'GLM', preset_key: 'glm-cn', provider_type: 'custom', protocol: 'anthropic',
         base_url: 'https://open.bigmodel.cn/api/anthropic', api_key: 'key',
         is_active: 1, sort_order: 0, extra_env: '{}', headers_json: '{}',
         env_overrides_json: '', role_models_json: '{"default":"glm-5-turbo","sonnet":"glm-5-turbo","opus":"glm-5.1"}',
@@ -1133,7 +1323,7 @@ describe('Entry Point Resolution Contract', () => {
     // both toAiSdkConfig and toClaudeCodeEnv must use the upstream ID
     const resolved: ResolvedProvider = {
       provider: {
-        id: 'test', name: 'GLM', provider_type: 'custom', protocol: 'anthropic',
+        id: 'test', name: 'GLM', preset_key: 'glm-cn', provider_type: 'custom', protocol: 'anthropic',
         base_url: 'https://open.bigmodel.cn/api/anthropic', api_key: 'key',
         is_active: 1, sort_order: 0, extra_env: '{}', headers_json: '{}',
         env_overrides_json: '', role_models_json: '{"default":"glm-5-turbo"}',
@@ -1639,7 +1829,9 @@ describe('Hidden role models do not leak into Claude Code env', () => {
 
 describe('getProviderCompat tier mapping', () => {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { getProviderCompat } = require('../../lib/runtime-compat');
+  const { getProviderCompat: getProviderCompatResolved } = require('../../lib/runtime-compat') as typeof import('../../lib/runtime-compat');
+  const getProviderCompat = (record: { provider_type: string; base_url: string }) =>
+    getProviderCompatResolved({ preset_key: '', protocol: record.provider_type, ...record });
 
   it('Anthropic official → claude_code_ready', () => {
     assert.equal(
@@ -2032,6 +2224,7 @@ describe('routeAuxiliaryModel (pure routing)', () => {
       provider: {
         id: opts.id || 'main-prov',
         name: 'Test Main',
+        preset_key: 'anthropic-official',
         provider_type: 'anthropic',
         protocol: 'anthropic',
         base_url: 'https://api.anthropic.com',
@@ -2516,8 +2709,9 @@ describe('resolveAuxiliaryModel (live wrapper)', () => {
 
     const makeProvider = (json: string) => ({
       id: 'p',
-      name: 'Test',
-      provider_type: 'anthropic',
+          name: 'Test',
+          preset_key: 'anthropic-official',
+          provider_type: 'anthropic',
       protocol: 'anthropic',
       base_url: 'https://example.com',
       api_key: 'k',
@@ -2626,6 +2820,134 @@ describe('resolveAuxiliaryModel (live wrapper)', () => {
     } finally {
       deleteProvider(mainSdkOnly.id);
       deleteProvider(fallbackEmpty.id);
+    }
+  });
+});
+
+// ── Effective Anthropic base URL → context-window trust gate (#632) ─────
+// resolveEffectiveAnthropicBaseUrl computes the base URL the Claude Code SDK
+// subprocess will ACTUALLY use, with the same precedence as toClaudeCodeEnv.
+// claude-client gates trust of the SDK-reported contextWindow on it: a
+// third-party proxy here reports the SDK's generic ~200K default, which must
+// NOT be shown as a real capacity (the GLM "200K" the user reported).
+import { isFirstPartyAnthropicEndpoint } from '../../lib/ai-provider';
+
+describe('resolveEffectiveAnthropicBaseUrl — context-window trust gate (#632)', () => {
+  const GLM_URL = 'https://open.bigmodel.cn/api/anthropic';
+  const makeDbProvider = (base_url: string): NonNullable<ResolvedProvider['provider']> => ({
+    id: 'p1', name: 'Test', preset_key: '', provider_type: 'custom', protocol: 'anthropic',
+    base_url, api_key: 'key', is_active: 1, sort_order: 0, extra_env: '{}',
+    headers_json: '{}', env_overrides_json: '', role_models_json: '{}', notes: '',
+    created_at: '', updated_at: '', options_json: '{}',
+  });
+  const baseResolved = (overrides: Partial<ResolvedProvider>): ResolvedProvider => ({
+    provider: undefined, protocol: 'anthropic', authStyle: 'api_key',
+    model: 'sonnet', upstreamModel: 'sonnet', modelDisplayName: undefined,
+    headers: {}, envOverrides: {}, roleModels: {}, hasCredentials: true,
+    availableModels: [], settingSources: ['user'], ...overrides,
+  });
+
+  // ── DB provider path: base_url IS the effective URL ──
+  it('DB third-party provider (GLM) → effective URL third-party → NOT first-party', () => {
+    const eff = resolveEffectiveAnthropicBaseUrl(baseResolved({ provider: makeDbProvider(GLM_URL) }));
+    assert.equal(eff, GLM_URL);
+    assert.equal(isFirstPartyAnthropicEndpoint(eff), false, 'GLM proxy must not be trusted for the SDK window');
+  });
+
+  it('DB official-Anthropic provider → first-party (trusted)', () => {
+    const eff = resolveEffectiveAnthropicBaseUrl(baseResolved({ provider: makeDbProvider('https://api.anthropic.com') }));
+    assert.equal(isFirstPartyAnthropicEndpoint(eff), true);
+  });
+
+  it('DB provider with empty base_url + credentials → undefined → first-party (SDK default api.anthropic.com)', () => {
+    const eff = resolveEffectiveAnthropicBaseUrl(baseResolved({ provider: makeDbProvider(''), hasCredentials: true }));
+    assert.equal(eff, undefined);
+    assert.equal(isFirstPartyAnthropicEndpoint(eff), true);
+  });
+
+  // ── DB provider WITHOUT credentials — Codex P2 (2026-06-20). toClaudeCodeEnv
+  // runs neither branch, so the SDK inherits ambient process.env.ANTHROPIC_BASE_URL
+  // (NOT provider.base_url, NOT settings). The helper must mirror that or it would
+  // trust a first-party-looking provider row while the SDK actually hits a
+  // third-party env proxy. ──
+  it('DB provider WITHOUT credentials → follows ambient process.env, NOT provider.base_url (P2)', () => {
+    const origEnv = process.env.ANTHROPIC_BASE_URL;
+    const origSetting = getSetting('anthropic_base_url');
+    setSetting('anthropic_base_url', '');
+    process.env.ANTHROPIC_BASE_URL = GLM_URL; // ambient third-party proxy
+    try {
+      // provider.base_url looks first-party, but no credentials → SDK ignores it.
+      const eff = resolveEffectiveAnthropicBaseUrl(
+        baseResolved({ provider: makeDbProvider('https://api.anthropic.com'), hasCredentials: false }),
+      );
+      assert.equal(eff, GLM_URL, 'no-cred provider must defer to ambient env, not its own base_url');
+      assert.equal(isFirstPartyAnthropicEndpoint(eff), false, 'a third-party ambient env must untrust even behind a first-party-looking no-cred provider row');
+    } finally {
+      if (origEnv !== undefined) process.env.ANTHROPIC_BASE_URL = origEnv; else delete process.env.ANTHROPIC_BASE_URL;
+      setSetting('anthropic_base_url', origSetting || '');
+    }
+  });
+
+  it('DB provider WITHOUT credentials + clean env → undefined → first-party (no false untrust)', () => {
+    const origEnv = process.env.ANTHROPIC_BASE_URL;
+    delete process.env.ANTHROPIC_BASE_URL;
+    try {
+      const eff = resolveEffectiveAnthropicBaseUrl(
+        baseResolved({ provider: makeDbProvider(GLM_URL), hasCredentials: false }),
+      );
+      assert.equal(eff, undefined, 'no-cred provider with clean ambient env → SDK default (provider.base_url is not injected)');
+      assert.equal(isFirstPartyAnthropicEndpoint(eff), true);
+    } finally {
+      if (origEnv !== undefined) process.env.ANTHROPIC_BASE_URL = origEnv; else delete process.env.ANTHROPIC_BASE_URL;
+    }
+  });
+
+  // ── env / legacy / cc-switch path (resolved.provider === undefined) — THE #632 P1 HOLE.
+  // Must consult process.env.ANTHROPIC_BASE_URL AND settings.anthropic_base_url,
+  // because isFirstPartyAnthropicEndpoint(undefined) === true would otherwise
+  // re-trust a third-party proxy reached via env/legacy. ──
+  it('env mode + process.env.ANTHROPIC_BASE_URL third-party → NOT first-party (P1 regression)', () => {
+    const origEnv = process.env.ANTHROPIC_BASE_URL;
+    const origSetting = getSetting('anthropic_base_url');
+    setSetting('anthropic_base_url', '');
+    process.env.ANTHROPIC_BASE_URL = GLM_URL;
+    try {
+      const eff = resolveEffectiveAnthropicBaseUrl(baseResolved({ provider: undefined }));
+      assert.equal(eff, GLM_URL);
+      assert.equal(isFirstPartyAnthropicEndpoint(eff), false, 'env-mode third-party proxy must NOT trust the SDK window — this is the #632 P1 hole');
+    } finally {
+      if (origEnv !== undefined) process.env.ANTHROPIC_BASE_URL = origEnv; else delete process.env.ANTHROPIC_BASE_URL;
+      setSetting('anthropic_base_url', origSetting || '');
+    }
+  });
+
+  it('env mode + settings.anthropic_base_url third-party → NOT first-party', () => {
+    const origEnv = process.env.ANTHROPIC_BASE_URL;
+    const origSetting = getSetting('anthropic_base_url');
+    delete process.env.ANTHROPIC_BASE_URL;
+    setSetting('anthropic_base_url', GLM_URL);
+    try {
+      const eff = resolveEffectiveAnthropicBaseUrl(baseResolved({ provider: undefined }));
+      assert.equal(eff, GLM_URL);
+      assert.equal(isFirstPartyAnthropicEndpoint(eff), false);
+    } finally {
+      if (origEnv !== undefined) process.env.ANTHROPIC_BASE_URL = origEnv; else delete process.env.ANTHROPIC_BASE_URL;
+      setSetting('anthropic_base_url', origSetting || '');
+    }
+  });
+
+  it('env mode clean (no env, no settings) → undefined → first-party (official default)', () => {
+    const origEnv = process.env.ANTHROPIC_BASE_URL;
+    const origSetting = getSetting('anthropic_base_url');
+    delete process.env.ANTHROPIC_BASE_URL;
+    setSetting('anthropic_base_url', '');
+    try {
+      const eff = resolveEffectiveAnthropicBaseUrl(baseResolved({ provider: undefined }));
+      assert.equal(eff, undefined);
+      assert.equal(isFirstPartyAnthropicEndpoint(eff), true);
+    } finally {
+      if (origEnv !== undefined) process.env.ANTHROPIC_BASE_URL = origEnv; else delete process.env.ANTHROPIC_BASE_URL;
+      setSetting('anthropic_base_url', origSetting || '');
     }
   });
 });

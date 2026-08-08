@@ -8,6 +8,13 @@
 
 | 文件 | 主题 |
 |------|------|
+| windows-runtime-recovery-hardening.md | **Windows Runtime P0/P1 加固与跨机复查**：Path Identity、三 Runtime Doctor、Codex sandbox 真实状态、复制固定官方命令并打开 PowerShell、safeStorage + AES-GCM Provider secret 迁移、另一台 Windows 的 smoke 清单 |
+| windows-runtime-path-compatibility-review.md | **Windows Runtime / 路径兼容性修复交接与跨机复查手册**：中文/空格/特殊字符 CWD、PowerShell 编码命令、无 bash/rg 回退、Claude `.exe/.cmd`、Codex Desktop vs standalone、WindowsApps/沙盒边界、参考项目专项适配与另一台 Windows 电脑的验收矩阵 |
+| harness-home.md | **Harness Home 技术交接**：framework-neutral canonical repository、普通文件可读与 Assistant 自动服务显式 binding、Skill/MCP/CLI/builtin/renderer/model adapter 统一 Capability Package/Broker、L0/L1 与 Runtime bridge 边界、SecretRef、Asset/HTML 安全、Codex durable/preview-only 去重与当前未关闭门禁 |
+| default-assistant-heartbeat-system-notification.md | **默认助理 → 心跳 → 系统通知纵向闭环**：only-if-empty bootstrap/CAS、`instructions.md` effective owner、desired/reconcile/run 真源、Main-owned durable native delivery 与点击恢复 |
+| same-runtime-multi-model-subagents.md | 同 Runtime 动态子模型：Native 白名单/child session、Claude SDK read-only worker、Codex collab 可见性、权限/取消、Agent 聊天卡片与侧栏 transcript |
+| qwen-token-plan-grok-access.md | 千问 Coding/Token Plan 稳定 identity、interactive-only 调用策略、xAI API Key/OAuth 双渠道、PKCE/device/refresh 生命周期与 Runtime 数据流 |
+| foundation-refresh-claude-review-2026-07-20.md | **基础体验更新 Claude 独立审查任务书**：汇总模型/推理强度、跨 Runtime 权限、自动命名、Claude DNS/延迟、全局字体与 K3 套餐改动；列明当前证据、未完成 smoke 和必须重点质疑的高风险边界 |
 | agent-tooling-todo-bridge.md | SDK → SSE → DB 事件流、TodoWrite 字段映射、去重策略 |
 | bridge-system.md | 多 IM 远程桥接系统架构（目录结构、数据流、设计决策） |
 | assistant-workspace.md | 助理工作区：人格/记忆文件、对话式引导、自动触发、确定性落盘 |
@@ -15,7 +22,7 @@
 | cli-tools.md | CLI 工具管理：静态 catalog、系统检测、一键安装、AI 描述、聊天上下文注入、输入框选择器 |
 | ui-governance.md | 设计模式治理：四层架构、ESLint 规则、图标/颜色统一、组件拆分记录、新增文件清单（**图标部分在 Phase 7 收口后由 icon-system.md 接管**） |
 | icon-system.md | **Phase 7 图标体系**（Phase 0 reference）：Semantic alias 字典（model/runtime/skill/mcp/cli/terminal/memory/...）、HugeIcons free 候选映射、Brain/Lightning/Terminal 三大冲突解决决议、7 优先迁移区域 inventory snapshot、Phase 2 wave plan |
-| macos-visual-profile.md | **Phase 7b macOS Native Visual Profile**：Raycast v2 + Apple Liquid Glass/HIG 调研结论、Electron vibrancy 窗口级边界、12 个 shell/floating/content surface 审计矩阵、light/dark baseline 截图清单、Phase 1/2 平台 token 与 material POC 建议 |
+| macos-visual-profile.md | **Phase 7b macOS Native Visual Profile**：Raycast v2 + Apple Liquid Glass/HIG 调研结论、Electron vibrancy 窗口级边界、app mode → `nativeTheme.themeSource` 同步契约、12 个 shell/floating/content surface 审计矩阵、light/dark baseline 与平台 token 约束 |
 | git-terminal-layout.md | Git 集成 + 终端 + 统一布局重构：四层布局、Git 后端/前端、终端抽屉、ResizeHandle 统一、已知债务 |
 | onboarding-setup-center.md | 首次引导 Setup Center：三卡片引导流程、Claude Code 环境检测与冲突处理、Provider 三条凭据来源、目录校验回退链、Toast 系统、Windows 适配 |
 | generative-ui.md | 生成式 UI Widget 系统：代码围栏触发、receiver iframe 渲染、CSS 变量桥接、流式预览、高度缓存、安全模型、UX 优化清单 |
@@ -33,10 +40,11 @@
 | models-provider-experience.md | Models / Providers 体验收敛：服务商连接和模型管理职责拆分、模型拉取规则、添加模型统一入口、状态与术语约束 |
 | agentic-architecture-map.md | CodePilot Agentic 架构映射：Provider/Models、Plugins、Runtime/Agent、Health/Logs、Memory/Tasks 的分层边界与改动判断流程 |
 | provider-governance.md | 服务商治理系统：Zod Schema 防护、authStyle 修正 6 preset、宿主接管、连通性验证、引导 UX、错误恢复、模型 CRUD |
-| sentry-error-reporting.md | Sentry 匿名错误上报：三层覆盖（browser/server/electron）、opt-out 机制、隐私保护、上报策略 |
+| sentry-error-reporting.md | Sentry 匿名错误与崩溃率统计：U0 main-only Release Health、official-stable 三层初始化、default-deny 脱敏、provider/in-band terminal anti-double-capture、private source-map 发布闭环与未关闭真实 smoke |
 | decouple-native-runtime.md | Native Agent Runtime：双 Runtime 架构、AI SDK agent-loop、OpenAI Codex 集成、文件快照 rewind、MCP 全链路、验证边界与剩余风险 |
 | provider-proxy-bridge.md | Provider Proxy Bridge Contract：Codex provider proxy / 任何新 Agent 框架接入的 8 个 hook（parseInbound / translateInput / translateTools / translateProviderOptions / translateStream / translateResponse / translateError / resumeThreadParams）、AI SDK v6 `tool({inputSchema: jsonSchema(...)})` schema 合约、Codex schema 来源清单、Smoke 矩阵收口标准；接新 Agent 框架前必读 |
 | markdown-artifact-overhaul.md | Markdown 渲染 × Artifact 预览体系：PreviewSource 联合、DiffSummary 卡片、Sandpack 单文件 React、CodeMirror 编辑+自动保存、长图导出 IPC、文件 I/O API 合同、loadedPath/freshPreview 防漂移 |
+| markdown-live-preview-file-tree.md | Markdown 单页 Live Preview、跨 owner 文件 mutation transaction、Explorer 右键/F2/Trash、material-icon-theme 静态文件类型图标 |
 | phase-4-markdown-artifact.md | Phase 4 Markdown 数据层 × HTML 表现层 × 工程引用：trust tier 三档授权、html-preview 同源路由 + 4 轮 CSP 演进、codepilot:file-changed 单通道 + quiet refresh、原地 Markdown 风格 Select、code-fence Preview / dev-output chips；Save-HTML 入口 deferred 的代码锚点与重启条件 |
 | chat-composer-redesign.md | Chat composer 重构（April 2026）：三层视觉规则、Run 状态聚合面板、ai-elements 整合、隐形 select、弹窗底座统一、弥散阴影 token、左侧栏密度收紧 |
 | new-chat-greeting.md | 新对话欢迎语：「时段问候 + 场景问句」组合（场景优先级 assistant > project > general、项目名插值）、SSR-safe 的 client-only 组合逻辑、page.tsx / ChatView 调用点、助理检测的已知局限 |

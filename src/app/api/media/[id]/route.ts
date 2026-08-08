@@ -1,6 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getDb } from '@/lib/db';
-import fs from 'fs';
+import {
+  AssetInUseError,
+  deleteAssetPermanently,
+  deleteLegacyMediaGenerationPermanently,
+  getAssetRecord,
+} from '@/lib/assets/service';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -37,33 +42,50 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
     const { id } = await params;
     const db = getDb();
 
-    // Get the record first to find the file path
     const row = db.prepare('SELECT * FROM media_generations WHERE id = ?').get(id) as {
       id: string;
-      local_path: string;
-      thumbnail_path: string;
+      status: string;
     } | undefined;
 
-    if (!row) {
+    const asset = getAssetRecord(id);
+    if (!row && !asset) {
       return NextResponse.json(
-        { error: 'Media generation not found' },
+        { error: 'Asset not found', code: 'asset_not_found' },
         { status: 404 }
       );
     }
-
-    // Delete the file from disk
-    if (row.local_path && fs.existsSync(row.local_path)) {
-      fs.unlinkSync(row.local_path);
+    if (!asset && row) {
+      const deleted = deleteLegacyMediaGenerationPermanently(id);
+      return NextResponse.json({
+        success: true,
+        permanent: true,
+        recoverable: false,
+        fileDeleted: deleted.deletedPaths.length > 0,
+        retainedSharedPaths: deleted.retainedSharedPaths,
+        retainedExternalPaths: deleted.retainedExternalPaths,
+        sourceMediaGenerationDeleted: true,
+      });
     }
-    if (row.thumbnail_path && fs.existsSync(row.thumbnail_path)) {
-      fs.unlinkSync(row.thumbnail_path);
-    }
-
-    // Delete the record
-    db.prepare('DELETE FROM media_generations WHERE id = ?').run(id);
-
-    return NextResponse.json({ success: true });
+    const deleted = deleteAssetPermanently(asset!.id);
+    return NextResponse.json({
+      success: true,
+      permanent: true,
+      recoverable: false,
+      fileDeleted: deleted.deletedPaths.length > 0,
+      retainedSharedPaths: deleted.retainedSharedPaths,
+      sourceMediaGenerationDeleted: deleted.sourceMediaGenerationDeleted,
+    });
   } catch (error) {
+    if (error instanceof AssetInUseError) {
+      return NextResponse.json(
+        {
+          error: error.message,
+          code: 'asset_in_use',
+          consumers: error.consumers,
+        },
+        { status: 409 },
+      );
+    }
     console.error('[media/[id]] DELETE Error:', error);
     return NextResponse.json(
       { error: error instanceof Error ? error.message : 'Failed to delete media generation' },

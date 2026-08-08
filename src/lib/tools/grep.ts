@@ -4,9 +4,11 @@
 
 import { tool } from 'ai';
 import { z } from 'zod';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import path from 'path';
+import fs from 'node:fs';
 import type { ToolContext } from './index';
+import { grepWithNode } from './search-fallback';
 
 export function createGrepTool(ctx: ToolContext) {
   return tool({
@@ -22,10 +24,20 @@ export function createGrepTool(ctx: ToolContext) {
       context: z.number().int().min(0).optional().describe('Lines of context around each match'),
       max_results: z.number().int().min(1).optional().describe('Maximum number of results (default 50)'),
     }),
-    execute: async ({ pattern, path: searchPath, glob: globPattern, case_insensitive, context: ctxLines, max_results }) => {
-      const cwd = searchPath
+    execute: async ({ pattern, path: searchPath, glob: globPattern, case_insensitive, context: ctxLines, max_results }, toolOptions) => {
+      const requestedPath = searchPath
         ? (path.isAbsolute(searchPath) ? searchPath : path.resolve(ctx.workingDirectory, searchPath))
         : ctx.workingDirectory;
+      let cwd = requestedPath;
+      let target = '.';
+      try {
+        if (fs.statSync(requestedPath).isFile()) {
+          cwd = path.dirname(requestedPath);
+          target = path.basename(requestedPath);
+        }
+      } catch {
+        // Let ripgrep / the Node fallback report an empty result below.
+      }
 
       const limit = max_results ?? 50;
 
@@ -40,18 +52,24 @@ export function createGrepTool(ctx: ToolContext) {
       if (globPattern) args.push(`--glob=${globPattern}`);
 
       args.push(`-m${limit * 2}`); // allow some overhead for context lines
-      args.push('--', pattern, '.');
+      args.push('--', pattern, target);
 
       try {
-        const result = execSync(`rg ${args.join(' ')}`, {
+        const result = execFileSync('rg', args, {
           cwd,
           encoding: 'utf-8',
           timeout: 15_000,
           maxBuffer: 1024 * 1024,
+          stdio: ['ignore', 'pipe', 'pipe'],
         });
 
         // Trim to max_results entries
-        const lines = result.trim().split('\n');
+        const lines = result.trim().split('\n').map((line) => {
+          const match = line.match(/^(.+?)([:-]\d+[:-])/);
+          if (!match) return line;
+          const portablePath = match[1].replace(/^\.([/\\])/, '').replace(/\\/g, '/');
+          return `${portablePath}${match[2]}${line.slice(match[0].length)}`;
+        });
         const trimmed = lines.slice(0, limit * 3); // rough trim (context lines inflate count)
 
         if (trimmed.length === 0) {
@@ -64,23 +82,27 @@ export function createGrepTool(ctx: ToolContext) {
         if (err && typeof err === 'object' && 'status' in err && (err as { status: number }).status === 1) {
           return `No matches found for pattern "${pattern}" in ${cwd}`;
         }
-        // rg not installed — fall back to grep
+        const processError = err as NodeJS.ErrnoException;
+        if (processError.code !== 'ENOENT') {
+          return `Error searching for pattern "${pattern}" in ${requestedPath}`;
+        }
+
         try {
-          const grepArgs = ['-rn', '--include=' + (globPattern || '*')];
-          if (case_insensitive) grepArgs.push('-i');
-          grepArgs.push(pattern, '.');
-
-          const result = execSync(`grep ${grepArgs.join(' ')}`, {
-            cwd,
-            encoding: 'utf-8',
-            timeout: 15_000,
-            maxBuffer: 1024 * 1024,
+          const lines = await grepWithNode({
+            pattern,
+            root: cwd,
+            target: path.resolve(cwd, target),
+            glob: globPattern,
+            caseInsensitive: case_insensitive,
+            contextLines: ctxLines,
+            limit,
+            signal: toolOptions.abortSignal,
           });
-
-          const lines = result.trim().split('\n').slice(0, limit);
-          return lines.join('\n') || `No matches found for pattern "${pattern}"`;
-        } catch {
-          return `No matches found for pattern "${pattern}" in ${cwd}`;
+          return lines.join('\n') || `No matches found for pattern "${pattern}" in ${requestedPath}`;
+        } catch (fallbackError) {
+          if (fallbackError instanceof Error && fallbackError.name === 'AbortError') throw fallbackError;
+          const reason = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+          return `Error searching for pattern "${pattern}" in ${requestedPath}: ${reason}`;
         }
       }
     },

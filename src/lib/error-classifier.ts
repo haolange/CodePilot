@@ -5,17 +5,57 @@
  * classifier that produces actionable, user-facing error messages.
  */
 
+import {
+  buildNormalizedFingerprint,
+  shouldUseDefaultStackGrouping,
+  statusClass,
+} from './telemetry/contract';
+import { markProviderFailureHandled } from './telemetry/provider-marker';
+import {
+  createSafeTelemetryError,
+  normalizeTelemetryFailure,
+} from './telemetry/root-cause';
+
 // ── Sentry integration (lazy, no-op when unavailable) ───────────
 
-const SENTRY_REPORTABLE: Set<string> = new Set([
-  // PROCESS_CRASH removed — too noisy (136+ events/day), mostly user config issues
-  'UNKNOWN', 'CLI_NOT_FOUND', 'CLI_INSTALL_CONFLICT',
-  'MISSING_GIT_BASH', 'PROVIDER_NOT_APPLIED', 'SESSION_STATE_ERROR',
-  // Native Runtime errors
-  'NATIVE_STREAM_ERROR', 'OPENAI_AUTH_FAILED', 'MCP_CONNECTION_ERROR',
-]);
+/**
+ * Pure predicate: should this (category, error) be reported to Sentry?
+ *
+ * Side-effect-free and exported so tests can lock the semantics WITHOUT
+ * importing `@sentry/node` (that import would pull the @opentelemetry chain
+ * into the dev/test compile graph — see reportToSentry's guard and the
+ * sentry-dev-guard contract).
+ *
+ *  1. category must be in the reportable allow-list.
+ *  2. user-initiated abort/cancel is dropped — EXCEPT TIMEOUT_*, which the
+ *     native runtime raises as an AbortError (a fired timeout budget aborts
+ *     the combined signal; see agent-loop.ts:728). A timeout is a real
+ *     failure, so the abort/cancel message filter must not swallow it.
+ */
+export function shouldReportToSentry(
+  category: string,
+  error: unknown,
+  context: Pick<SentryReportContext, 'statusCode' | 'retryExhausted' | 'providerTest'> = {},
+): boolean {
+  return normalizeTelemetryFailure(category, error, context).shouldReport;
+}
 
-function reportToSentry(category: string, error: unknown, extra?: Record<string, unknown>) {
+interface SentryReportContext {
+  runtimeId?: string;
+  providerProtocol?: string;
+  providerClass?: string;
+  statusCode?: number;
+  retryExhausted?: boolean;
+  callScene?: string;
+  timeoutStage?: string;
+  providerTest?: boolean;
+}
+
+function reportToSentry(category: string, error: unknown, context: SentryReportContext = {}) {
+  // Every classified provider/native error is now owned by this boundary,
+  // including zero-event outcomes. Prevent the Node SDK from auto-capturing
+  // the original rich object after the caller rethrows it.
+  markProviderFailureHandled(error);
   // Dev-server memory guardrail (2026-05-09): even though instrumentation.ts
   // skips Sentry.init in dev, this lazy import path would still pull
   // `@sentry/node` + the `@opentelemetry/*` chain into Turbopack's compile
@@ -25,25 +65,51 @@ function reportToSentry(category: string, error: unknown, extra?: Record<string,
   // instrumentation.ts contract here. Locked in by
   // `src/__tests__/unit/sentry-dev-guard.test.ts`.
   if (process.env.NODE_ENV !== 'development') {
-    if (!SENTRY_REPORTABLE.has(category)) return;
-    // Skip aborted operations — these are user-initiated cancellations
-    const msg = error instanceof Error ? error.message : String(error);
-    if (/abort|cancel/i.test(msg)) return;
+    if (process.env.NODE_ENV !== 'production') return;
+    if (process.env.NEXT_PUBLIC_CODEPILOT_CHANNEL !== 'stable') return;
+    const normalized = normalizeTelemetryFailure(category, error, {
+      retryExhausted: context.retryExhausted,
+      providerTest: context.providerTest,
+      statusCode: context.statusCode,
+    });
+    if (!normalized.shouldReport) return;
 
     // Fire-and-forget async import — never blocks the classifier
     import('@sentry/node').then((Sentry) => {
+      if (!Sentry.isInitialized()) return;
       Sentry.withScope((scope) => {
-        scope.setTag('error.category', category);
-        scope.setTag('error.provider', (extra?.providerName as string) || 'unknown');
-        scope.setTag('error.runtime', (extra?.runtime as string) || 'unknown');
-        if (extra?.baseUrl) scope.setTag('provider.baseUrl', extra.baseUrl as string);
-        if (extra?.modelId) scope.setTag('model.id', extra.modelId as string);
-        if (extra) scope.setExtras(extra);
-        scope.setFingerprint([category, msg.slice(0, 100)]);
-        if (error instanceof Error) {
-          Sentry.captureException(error);
+        scope.setTag('error.category', normalized.category);
+        scope.setTag('error.outcome', normalized.outcome);
+        scope.setTag('error.runtime', context.runtimeId || 'unknown');
+        scope.setTag('runtime.id', context.runtimeId || 'unknown');
+        scope.setTag('provider.protocol', context.providerProtocol || 'unknown');
+        scope.setTag('provider.class', context.providerClass || 'unknown');
+        scope.setTag('status.class', statusClass(normalized.statusCode));
+        scope.setExtras({
+          callScene: context.callScene,
+          retryExhausted: normalized.retryExhausted,
+          timeoutStage: context.timeoutStage,
+        });
+        const useDefaultStackGrouping = shouldUseDefaultStackGrouping(normalized.outcome, error);
+        if (normalized.outcome === 'unknown') scope.setTag('needs_classification', 'yes');
+        if (!useDefaultStackGrouping) {
+          scope.setTag('grouping.strategy', 'normalized');
+          scope.setFingerprint(buildNormalizedFingerprint({
+            category: normalized.category,
+            layer: 'next_server',
+            runtimeId: context.runtimeId,
+            providerProtocol: context.providerProtocol,
+            providerClass: context.providerClass,
+            statusCode: normalized.statusCode,
+          }));
+        }
+        if (useDefaultStackGrouping && error instanceof Error) {
+          const safeMessage = normalized.outcome === 'product_fault'
+            ? 'telemetry.product_fault'
+            : 'telemetry.unknown_failure';
+          Sentry.captureException(createSafeTelemetryError(error, safeMessage));
         } else {
-          Sentry.captureMessage(String(error), 'error');
+          Sentry.captureMessage('telemetry.normalized_failure', 'error');
         }
       });
     }).catch(() => { /* Sentry not available */ });
@@ -57,9 +123,23 @@ function reportToSentry(category: string, error: unknown, extra?: Record<string,
 export function reportNativeError(
   category: ClaudeErrorCategory,
   error: unknown,
-  context?: { providerName?: string; modelId?: string; sessionId?: string; baseUrl?: string },
+  context?: {
+    providerProtocol?: string;
+    providerClass?: string;
+    retryExhausted?: boolean;
+    /** Accepted for existing callers but deliberately never sent. */
+    modelId?: string;
+    sessionId?: string;
+    providerName?: string;
+    baseUrl?: string;
+  },
 ) {
-  reportToSentry(category, error, { ...context, runtime: 'native' });
+  reportToSentry(category, error, {
+    runtimeId: 'codepilot_runtime',
+    providerProtocol: context?.providerProtocol,
+    providerClass: context?.providerClass,
+    retryExhausted: context?.retryExhausted,
+  });
 }
 
 // ── Error categories ────────────────────────────────────────────
@@ -88,6 +168,12 @@ export type ClaudeErrorCategory =
   | 'OPENAI_AUTH_FAILED'     // OpenAI OAuth token expired/invalid
   | 'MCP_CONNECTION_ERROR'   // MCP server connect/sync failure
   | 'EMPTY_RESPONSE'         // Model returned nothing (proxy rejection, unsupported model)
+  // Native Runtime timeout reason codes (Phase 4 ① — src/lib/native-timeout.ts).
+  // Assigned directly from the fired timeout budget, never regex-inferred.
+  | 'TIMEOUT_CONNECT'        // No provider response headers within connectMs
+  | 'TIMEOUT_FIRST_TOKEN'    // Response arrived but no model output within firstTokenMs
+  | 'TIMEOUT_TOOL_EXECUTION' // One tool call exceeded toolExecutionMs
+  | 'TIMEOUT_TOTAL_RUN'      // Whole run exceeded totalRunMs
   | 'UNKNOWN';
 
 /** A concrete action the user can take to recover from an error */
@@ -143,6 +229,10 @@ export interface ErrorContext {
     docsUrl?: string;
     pricingUrl?: string;
   };
+  /** Diagnostic connection tests are user-invoked probes, never product faults. */
+  providerTest?: boolean;
+  /** True only after the caller's retry/fallback budget has been exhausted. */
+  retryExhausted?: boolean;
 }
 
 // ── Pattern definitions ─────────────────────────────────────────
@@ -165,7 +255,12 @@ const ERROR_PATTERNS: ErrorPattern[] = [
   // ── CLI not found ──
   {
     category: 'CLI_NOT_FOUND',
-    patterns: ['ENOENT', 'spawn', 'not found', 'No such file'],
+    patterns: [
+      /spawn(?:ing)? [^\n]+ enoent/i,
+      /claude code (?:cli|executable|native binary)[^\n]*not found/i,
+      /executable[^\n]*not found/i,
+      'No such file',
+    ],
     codes: ['ENOENT'],
     userMessage: () => 'Claude Code CLI not found.',
     actionHint: () => 'Please install Claude Code CLI and ensure it is available in your PATH. Run: npm install -g @anthropic-ai/claude-code',
@@ -276,8 +371,8 @@ const ERROR_PATTERNS: ErrorPattern[] = [
   // ── Network unreachable ──
   {
     category: 'NETWORK_UNREACHABLE',
-    patterns: ['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'fetch failed', 'network error', 'DNS', 'ENOTFOUND'],
-    codes: ['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND'],
+    patterns: ['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'fetch failed', 'network error', 'DNS', 'ENOTFOUND', 'EAI_AGAIN'],
+    codes: ['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN'],
     userMessage: (ctx) => `Cannot connect to API endpoint${ctx.baseUrl ? ` (${ctx.baseUrl})` : ''}.`,
     actionHint: () => 'Check your network connection and the Base URL in provider settings.',
     retryable: true,
@@ -306,6 +401,12 @@ const ERROR_PATTERNS: ErrorPattern[] = [
       'failed to resume',
       'resume_failed',
       'conversation not found',
+      // #629 (POC-B 2026-06-26) — third-party Anthropic proxies (GLM / MiMo /
+      // DeepSeek / Aliyun) return "No conversation found with session ID: <sid>"
+      // for a stale resume. 'conversation not found' has the wrong word order and
+      // the session-id regex below needs "not found" AFTER the id (here it's
+      // before), so neither matches. See docs/research/issue-629-resume-error-shape-poc/.
+      'no conversation found',
       /session\s+id\s+.*\s*(invalid|expired|not found|missing)/,
     ],
     userMessage: () => 'Failed to resume previous conversation.',
@@ -430,6 +531,27 @@ export function classifyError(ctx: ErrorContext): ClassifiedError {
   };
 }
 
+/**
+ * #629 — decide whether an is_error RESULT's `errors[]` indicates a stale/bad
+ * resume (session-state) that SHOULD clear sdk_session_id, vs a transient error
+ * (rate-limit / auth / budget) that must NOT (clearing would force a fresh
+ * session and drop SDK-side context). Pure: feeds `errors.join('\n')` through
+ * classifyError; true only for RESUME_FAILED / SESSION_STATE_ERROR. Empty / null
+ * → false (no text signal; caller may fall back to a non-text heuristic).
+ *
+ * Verified shape (POC-B 2026-06-26, docs/research/issue-629-resume-error-shape-poc):
+ * GLM / MiMo / DeepSeek / Aliyun Anthropic proxies all return
+ * errors[0] = "No conversation found with session ID: <sid>".
+ */
+export function isSessionStateResultError(
+  errors: readonly string[] | null | undefined,
+  ctx?: Pick<ErrorContext, 'providerName' | 'baseUrl'>,
+): boolean {
+  if (!errors || errors.length === 0) return false;
+  const { category } = classifyError({ error: errors.join('\n'), ...ctx });
+  return category === 'RESUME_FAILED' || category === 'SESSION_STATE_ERROR';
+}
+
 function buildRecoveryActions(category: ClaudeErrorCategory, ctx: ErrorContext): RecoveryAction[] {
   const actions: RecoveryAction[] = [];
   const meta = ctx.providerMeta;
@@ -479,9 +601,9 @@ function buildResult(
 
   // Report severe errors to Sentry (non-blocking, ignores expected errors like RATE_LIMITED)
   reportToSentry(category, ctx.error, {
-    providerName: ctx.providerName,
-    baseUrl: ctx.baseUrl,
-    rawMessage,
+    runtimeId: 'claude_code',
+    providerTest: ctx.providerTest,
+    retryExhausted: ctx.retryExhausted,
   });
 
   return {

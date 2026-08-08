@@ -1,6 +1,7 @@
 'use client';
 
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { ThinkingOrb } from 'thinking-orbs';
 import { useTranslation } from '@/hooks/useTranslation';
 import {
   Message as AIMessage,
@@ -9,6 +10,7 @@ import {
 } from '@/components/ai-elements/message';
 import { ToolActionsGroup } from '@/components/ai-elements/tool-actions-group';
 import { MediaPreview } from './MediaPreview';
+import { SearchSources } from './SearchSources';
 import { Button } from '@/components/ui/button';
 import { Shimmer } from '@/components/ai-elements/shimmer';
 import { ImageGenConfirmation } from './ImageGenConfirmation';
@@ -16,7 +18,13 @@ import { BatchPlanInlinePreview } from './batch-image-gen/BatchPlanInlinePreview
 import { WidgetRenderer } from './WidgetRenderer';
 import { parseAllShowWidgets, computePartialWidgetKey, MalformedWidgetNotice } from './MessageItem';
 import { PENDING_KEY, buildReferenceImages } from '@/lib/image-ref-store';
-import type { PlannerOutput, MediaBlock } from '@/types';
+import type { PlannerOutput, MediaBlock, ExternalSource } from '@/types';
+import { SubagentCard } from './SubagentCard';
+import {
+  buildSubagentRunView,
+  collapseLogicalSubagentRuns,
+  isSubagentToolCall,
+} from '@/lib/subagent-view';
 
 interface ImageGenRequest {
   prompt: string;
@@ -100,6 +108,7 @@ interface ToolResultInfo {
   content: string;
   is_error?: boolean;
   media?: MediaBlock[];
+  sources?: ExternalSource[];
 }
 
 interface StreamingMessageProps {
@@ -199,7 +208,18 @@ function ThinkingPhaseLabel() {
       ? t('streaming.thinkingDeep')
       : t('streaming.preparing');
 
-  return <Shimmer>{text}</Shimmer>;
+  return (
+    <div className="inline-flex items-center gap-2 text-muted-foreground">
+      <ThinkingOrb
+        state="working"
+        size={20}
+        role="presentation"
+        aria-hidden="true"
+        className="shrink-0 opacity-70"
+      />
+      <Shimmer>{text}</Shimmer>
+    </div>
+  );
 }
 
 function ElapsedTimer({ startedAt }: { startedAt: number }) {
@@ -218,12 +238,13 @@ function ElapsedTimer({ startedAt }: { startedAt: number }) {
     startedAtIsReady ? Math.floor((Date.now() - startedAt) / 1000) : 0,
   );
 
-  // Reset elapsed when the stream start time changes (e.g. new turn or session switch)
-  useEffect(() => {
-    if (!startedAtIsReady) return;
-    setElapsed(Math.floor((Date.now() - startedAt) / 1000));
-  }, [startedAt, startedAtIsReady]);
-
+  // The parent keys this component by `startedAt` (see render site), so a new
+  // turn / session switch remounts it and the lazy initializer above repaints
+  // the correct first value synchronously — no stale tick. This effect then
+  // only ticks every second; setState runs in the interval callback (async),
+  // never in the effect body, so there's no set-state-in-effect cascade.
+  // (#35 on-touch — previously a same-render reset effect that the React
+  // Compiler flagged; key-based remount is the clean equivalent.)
   useEffect(() => {
     if (!startedAtIsReady) return;
     const interval = setInterval(() => {
@@ -267,7 +288,7 @@ function StreamingStatusBar({ statusText, onForceStop, startedAt }: { statusText
         )}
       </div>
       <span className="text-muted-foreground/50">|</span>
-      <ElapsedTimer startedAt={startedAt} />
+      <ElapsedTimer key={startedAt} startedAt={startedAt} />
       {isCritical && onForceStop && (
         <Button
           variant="outline"
@@ -296,8 +317,43 @@ export function StreamingMessage({
 }: StreamingMessageProps) {
   const { t } = useTranslation();
   const bufferedContent = useBufferedContent(content, isStreaming);
-  const runningTools = toolUses.filter(
-    (tool) => !toolResults.some((r) => r.tool_use_id === tool.id)
+  // A2 (audit 2026-06): index toolResults by id once, then reuse for both the
+  // running-tools filter and the per-tool lookup in the render below. Both
+  // previously did an O(n) scan inside an O(n) loop → O(n²) every render.
+  const toolResultsById = useMemo(
+    () => new Map(toolResults.map((r) => [r.tool_use_id, r] as const)),
+    [toolResults]
+  );
+  const runningTools = useMemo(
+    () => toolUses.filter((tool) => !toolResultsById.has(tool.id)),
+    [toolUses, toolResultsById]
+  );
+  const subagentTools = useMemo(
+    () => toolUses.filter((tool) => {
+      const result = toolResultsById.get(tool.id);
+      return isSubagentToolCall(tool.name, tool.input, result?.content);
+    }),
+    [toolUses, toolResultsById],
+  );
+  const subagentRuns = useMemo(
+    () => collapseLogicalSubagentRuns(subagentTools.map((tool) => {
+      const result = toolResultsById.get(tool.id);
+      return buildSubagentRunView({
+        id: tool.id,
+        name: tool.name,
+        toolInput: tool.input,
+        result: result?.content,
+        isError: result?.is_error,
+      });
+    })),
+    [subagentTools, toolResultsById],
+  );
+  const regularTools = useMemo(
+    () => toolUses.filter((tool) => {
+      const result = toolResultsById.get(tool.id);
+      return !isSubagentToolCall(tool.name, tool.input, result?.content);
+    }),
+    [toolUses, toolResultsById],
   );
 
   // Extract a human-readable summary of the running command
@@ -322,10 +378,10 @@ export function StreamingMessage({
     <AIMessage from="assistant">
       <MessageContent>
         {/* Tool calls + thinking — single collapsible group */}
-        {(toolUses.length > 0 || thinkingContent) && (
+        {(regularTools.length > 0 || thinkingContent) && (
           <ToolActionsGroup
-            tools={toolUses.map((tool) => {
-              const result = toolResults.find((r) => r.tool_use_id === tool.id);
+            tools={regularTools.map((tool) => {
+              const result = toolResultsById.get(tool.id);
               return {
                 id: tool.id,
                 name: tool.name,
@@ -346,6 +402,8 @@ export function StreamingMessage({
           const allMedia = toolResults.flatMap(r => r.media || []);
           return allMedia.length > 0 ? <MediaPreview media={allMedia} /> : null;
         })()}
+
+        <SearchSources sources={toolResults.flatMap(result => result.sources || [])} />
 
         {/* Streaming text content rendered via Streamdown */}
         {content && (() => {
@@ -582,6 +640,20 @@ export function StreamingMessage({
           })() : undefined)
           || (content && content.length > 0 ? t('streaming.generating') : undefined)
         } onForceStop={onForceStop} startedAt={startedAt} />}
+
+        {/* Compact Sub Agent capsules follow the parent's live output and wrap
+            into the available row width. */}
+        {subagentRuns.length > 0 && (
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            {subagentRuns.map(run => (
+              <SubagentCard
+                key={run.id}
+                run={run}
+                sessionId={sessionId}
+              />
+            ))}
+          </div>
+        )}
       </MessageContent>
     </AIMessage>
   );

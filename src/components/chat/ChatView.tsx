@@ -3,6 +3,7 @@
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
 import type { Message, MessagesResponse, FileAttachment, SessionStreamSnapshot, MentionRef, TaskRunSummary } from '@/types';
+import type { SessionPermissionProfile } from '@/lib/permission/profile';
 import { MessageList } from './MessageList';
 import { NewChatWelcome } from './NewChatWelcome';
 import { TerminalReasonChip } from './TerminalReasonChip';
@@ -32,6 +33,7 @@ import { usePanel } from '@/hooks/usePanel';
 import { useTranslation } from '@/hooks/useTranslation';
 import type { TranslationKey } from '@/i18n';
 import { PermissionPrompt } from './PermissionPrompt';
+import { PermissionReviewNotices } from './PermissionReviewNotices';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -50,6 +52,7 @@ import { useAssistantTrigger } from '@/hooks/useAssistantTrigger';
 import { useStreamSubscription } from '@/hooks/useStreamSubscription';
 import { useProviderModels } from '@/hooks/useProviderModels';
 import { findModelOption } from '@/lib/model-option-match';
+import { toWireEffort, resolveModelSwitchEffortEffect } from '@/lib/effort-levels';
 // Import from `chat-runtime-shared`, NOT `chat-runtime`. The latter
 // transitively imports the runtime registry → claude-client → Node-only
 // deps (async_hooks, Sentry, OpenTelemetry). Pulling that into a client
@@ -65,19 +68,12 @@ import {
   getSnapshot,
   getRewindPoints,
   respondToPermission,
+  getMessageQueue,
+  updateMessageQueue,
+  enqueueMessage,
+  subscribeMessageQueue,
+  type QueuedMessage,
 } from '@/lib/stream-session-manager';
-
-interface QueuedMessage {
-  content: string;
-  files?: FileAttachment[];
-  systemPromptAppend?: string;
-  displayOverride?: string;
-  mentions?: MentionRef[];
-  /** Phase 2 Context Accounting — preserve badge-derived Skill labels
-   *  across the queue so dequeued sends carry them through to producer.
-   *  Codex review v4 P1 fix (2026-05-20). */
-  selectedSkills?: readonly string[];
-}
 
 interface ChatViewProps {
   sessionId: string;
@@ -92,7 +88,7 @@ interface ChatViewProps {
    * cascade. Empty / undefined = "follow global" (today's behavior).
    */
   runtimePin?: string;
-  initialPermissionProfile?: 'default' | 'full_access';
+  initialPermissionProfile?: SessionPermissionProfile;
   initialMode?: 'code' | 'plan';
   initialHasSummary?: boolean;
 }
@@ -121,7 +117,7 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
   // Used by `<MessageList />` to render `<TaskRunMarker />` without
   // per-marker fetches.
   const [taskRuns, setTaskRuns] = useState<Record<string, TaskRunSummary>>({});
-  const [permissionProfile, setPermissionProfile] = useState<'default' | 'full_access'>(initialPermissionProfile || 'default');
+  const [permissionProfile, setPermissionProfile] = useState<SessionPermissionProfile>(initialPermissionProfile || 'default');
   const [pendingContextTokens, setPendingContextTokens] = useState(0);
   // Phase 6 Phase 3 — per-source split (attachment / mention / directory).
   // Flows through RunCockpit → useContextUsage → breakdown so the popover's
@@ -180,6 +176,43 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
       })
       .catch(() => { /* keep current state as-is */ });
   }, [sessionId]);
+
+  // A fresh renderer cannot re-attach to the old browser-side SSE reader, but
+  // the server collector may still be finishing the turn. Durable assistant
+  // checkpoints let us poll only that narrow recovery window and replace the
+  // same row in place until it reaches a terminal status.
+  const hasStreamingCheckpoint = messages.some(
+    (message) => message.role === 'assistant' && message.stream_status === 'streaming',
+  );
+  useEffect(() => {
+    if (!hasStreamingCheckpoint) return;
+
+    let cancelled = false;
+    const refreshCheckpoints = async () => {
+      try {
+        const res = await fetch(`/api/chat/sessions/${sessionId}/messages?limit=50`);
+        if (!res.ok || cancelled) return;
+        const data = await res.json() as MessagesResponse;
+        if (!data.messages || cancelled) return;
+        const refreshed = new Map(data.messages.map((message) => [message.id, message]));
+        setMessages((current) =>
+          current.map((message) => refreshed.get(message.id) ?? message),
+        );
+        if (data.taskRuns) {
+          setTaskRuns((current) => ({ ...current, ...data.taskRuns }));
+        }
+      } catch {
+        // Keep the last durable checkpoint visible and retry on the next tick.
+      }
+    };
+
+    void refreshCheckpoints();
+    const timer = window.setInterval(refreshCheckpoints, 750);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [hasStreamingCheckpoint, sessionId]);
 
   const cappedSetMessages: typeof setMessages = useCallback((action) => {
     setMessages((prev) => {
@@ -244,7 +277,30 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
     resolvedProviderId,
     resolvedModel,
     providerWasFilteredOut,
+    providerGroups,
   } = useProviderModels(currentProviderId, currentModel, sessionRuntimeParam);
+
+  // #632 item 1 — does the active session provider report a TRUSTWORTHY context
+  // window? `false` only for a third-party Anthropic-compat proxy (e.g. GLM),
+  // whose persisted token_usage.context_window is the SDK's bogus ~200K default.
+  // Forwarded to RunCockpit → useContextUsage so existing third-party sessions
+  // stop rendering a fake capacity %. currentProviderId '' is the historic
+  // env-mode value → the 'env' group.
+  //
+  // FAIL-CLOSED until provider models load (Codex P3, 2026-06-20): while
+  // providerFetchState !== 'loaded' we pass `false`, so an existing third-party
+  // session never FLASHES its persisted bogus window as a % before we know the
+  // provider isn't first-party. Cost: a first-party session briefly shows
+  // used-only before the % appears — honest progressive disclosure, never a
+  // wrong number. Once loaded, a found group is always annotated; a not-found
+  // (stale/removed) provider defaults to trusted for back-compat.
+  const activeProviderGroup = providerGroups.find(
+    g => g.provider_id === (currentProviderId || 'env'),
+  );
+  const activeProviderReportsTrustedWindow =
+    providerFetchState === 'loaded'
+      ? (activeProviderGroup?.reportedContextWindowTrusted ?? true)
+      : false;
 
   // Phase 2 Step 3b — was: silently set state + PATCH the session row
   // when the runtime filter excluded the saved provider. That made an
@@ -369,6 +425,10 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
     [checkpointReasons],
   );
   const handleCheckpointAction = useCallback((actionId: string) => {
+    // Generic confirm→bypass bridge (MessageInput listens for this event and
+    // re-runs submit with bypass=true). As of #632 no built-in reason emits
+    // 'confirm-context-cost' — context-cost is now a non-blocking heads-up;
+    // this is retained dormant for any future real-danger confirm reason.
     if (actionId === 'confirm-context-cost') {
       window.dispatchEvent(new Event('run-checkpoint-confirm-send'));
     }
@@ -430,7 +490,55 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
   const statusText = streamSnapshot?.statusText;
   const pendingPermission = streamSnapshot?.pendingPermission ?? null;
   const permissionResolved = streamSnapshot?.permissionResolved ?? null;
+  const reviewNotices = streamSnapshot?.reviewNotices ?? [];
   const rewindPoints = getRewindPoints(sessionId);
+
+  // When the user navigates away and back without reloading the renderer, the
+  // local SSE snapshot is still alive while the history API now also contains
+  // its durable checkpoint. Remember those row ids so the historical mirror is
+  // hidden only while the local stream renders the same turn. Once terminal,
+  // prefer the canonical DB row and suppress the equivalent temp assistant
+  // bubble appended by the client completion event.
+  const mirroredCheckpointIdsRef = useRef<Set<string>>(
+    new Set(
+      initialMessages
+        .filter((message) => message.role === 'assistant' && message.stream_status === 'streaming')
+        .map((message) => message.id),
+    ),
+  );
+  useEffect(() => {
+    mirroredCheckpointIdsRef.current = new Set(
+      initialMessages
+        .filter((message) => message.role === 'assistant' && message.stream_status === 'streaming')
+        .map((message) => message.id),
+    );
+  }, [sessionId, initialMessages]);
+
+  const recoveredCheckpointContents = new Set(
+    messages
+      .filter((message) =>
+        message.role === 'assistant'
+        && mirroredCheckpointIdsRef.current.has(message.id)
+        && message.stream_status !== 'streaming'
+      )
+      .map((message) => message.content),
+  );
+  const displayedMessages = messages.filter((message) => {
+    if (
+      isStreaming
+      && mirroredCheckpointIdsRef.current.has(message.id)
+    ) {
+      return false;
+    }
+    if (
+      message.role === 'assistant'
+      && message.id.startsWith('temp-assistant-')
+      && recoveredCheckpointContents.has(message.content)
+    ) {
+      return false;
+    }
+    return true;
+  });
 
   // ── Skill nudge banner ──
   // Listens for 'skill-nudge' window events dispatched by stream-session-manager
@@ -464,7 +572,22 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
   }, [isStreaming]);
 
   // ── Message queue — allows sending while AI is responding ──
-  const [messageQueue, setMessageQueue] = useState<QueuedMessage[]>([]);
+  // Phase 2 ④ — the queue lives in stream-session-manager keyed by sessionId,
+  // so it survives ChatView unmount/remount (session switch away and back)
+  // instead of being dropped with the old component-local useState. This local
+  // state just mirrors the store for rendering; `setMessageQueue` forwards to
+  // the store, and the subscription below re-reads + stays in sync (including
+  // on session change, where we read the target session's own bucket).
+  const [messageQueue, setMessageQueueState] = useState<QueuedMessage[]>(() => getMessageQueue(sessionId));
+  const setMessageQueue = useCallback(
+    (updater: QueuedMessage[] | ((prev: QueuedMessage[]) => QueuedMessage[])) =>
+      updateMessageQueue(sessionId, updater),
+    [sessionId],
+  );
+  useEffect(() => {
+    setMessageQueueState(getMessageQueue(sessionId));
+    return subscribeMessageQueue(sessionId, () => setMessageQueueState(getMessageQueue(sessionId)));
+  }, [sessionId]);
   const dequeuingRef = useRef(false);
 
   // Tracks the id of the optimistic `temp-*` user bubble that the most
@@ -504,10 +627,45 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
   const handleProviderModelChange = useCallback((
     newProviderId: string,
     model: string,
-    opts?: { isAuto?: boolean },
+    opts?: { isAuto?: boolean; supportedEffortLevels?: string[] },
   ) => {
     setCurrentProviderId(newProviderId);
     setCurrentModel(model);
+
+    // Model plan Phase 2 / s07 (2026-07-18; reviewer fix run i31) — effort
+    // effect. On ANY effective model change — manual pick OR silent auto-correct
+    // — if the tier the user had selected isn't offered by the new model, fall
+    // back to Auto and tell them once: keeping a now-unsupported tier would
+    // either be rejected by the provider or silently dropped by toWireEffort on
+    // send, making the composer button lie about what actually reaches the wire.
+    // The reset does NOT depend on isAuto (an auto-correct that leaves an illegal
+    // transient tier is exactly the inconsistency this guards); isAuto only gates
+    // the session-pin persist below. Prefer the levels MessageInput resolved from
+    // the SAME feed the picker renders (opts.supportedEffortLevels); fall back to
+    // our own useProviderModels lookup if a caller omitted them.
+    const newGroup = providerGroups.find(g => g.provider_id === (newProviderId || 'env'));
+    const fallbackOption = findModelOption(newGroup?.models ?? [], model) as
+      | { supportedEffortLevels?: string[] }
+      | undefined;
+    const newSupportedLevels =
+      opts?.supportedEffortLevels ?? fallbackOption?.supportedEffortLevels;
+    const effortEffect = resolveModelSwitchEffortEffect(
+      selectedEffort,
+      newSupportedLevels,
+    );
+    if (effortEffect.resetEffort) {
+      setSelectedEffort(undefined);
+    }
+    if (effortEffect.showResetToast) {
+      import('@/hooks/useToast').then(({ showToast }) => {
+        showToast({
+          type: 'info',
+          message: t('messageInput.effort.resetOnModelSwitch' as TranslationKey),
+          duration: 4000,
+        });
+      });
+    }
+
     // Phase 6 P0 (2026-05-15) — only persist to the session row on a
     // MANUAL user pick. An auto-correct fallback (when the saved
     // model isn't in the active runtime's compatible set) must NOT
@@ -516,12 +674,13 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
     // the user's last intended pin, which is exactly the kind of
     // hidden state mutation the picker is supposed to avoid.
     if (opts?.isAuto) return;
+
     fetch(`/api/chat/sessions/${sessionId}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model, provider_id: newProviderId }),
     }).catch(() => {});
-  }, [sessionId]);
+  }, [sessionId, providerGroups, selectedEffort, t]);
 
   // Phase 2 Step 4c — RuntimeSelector callback. Optimistic local update
   // (so the picker filter and other consumers see the new pin
@@ -920,7 +1079,14 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
     }
   }, [sessionId, messages, hasMore]);
 
-  const stopStreaming = useCallback(() => { stopStream(sessionId); }, [sessionId]);
+  // 用户主动停止 = 全停：同时清空排队消息。否则 isStreaming 一翻 false，
+  // dequeue effect 会立刻把队列里的消息发出去开新 run —— 用户感知为
+  // "停止无效 + 重复发送 + 仍在 streaming"（tech-debt #52 真实浏览器 smoke 的
+  // 全部三个症状均由此产生）。
+  const stopStreaming = useCallback(() => {
+    setMessageQueue([]);
+    stopStream(sessionId);
+  }, [sessionId]);
 
   const handlePermissionResponse = useCallback(
     async (decision: 'allow' | 'allow_session' | 'deny', updatedInput?: Record<string, unknown>, denyMessage?: string) => {
@@ -932,7 +1098,12 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
 
   /** Start an API stream for the given content. Does NOT add a user message to the list. */
   const doStartStream = useCallback(
-    (content: string, files?: FileAttachment[], systemPromptAppend?: string, displayOverride?: string, mentions?: MentionRef[], selectedSkills?: readonly string[]) => {
+    // Returns true iff a stream was actually started; false when a guard
+    // suppressed it. The dequeue effect relies on this: a suppressed start
+    // never flips isStreaming, so its isStreaming-gated latch reset can't
+    // fire — it must reset `dequeuingRef` itself on a false return, or the
+    // queue deadlocks (audit ④).
+    (content: string, files?: FileAttachment[], systemPromptAppend?: string, displayOverride?: string, mentions?: MentionRef[], selectedSkills?: readonly string[]): boolean => {
       // Guard 1: idle = picker feed hasn't loaded yet. We don't know
       // what the runtime gate would have done with the saved pair, so
       // we can't safely fire — letting it through with raw values
@@ -940,20 +1111,20 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
       // gets re-resolved against env defaults. Block until loaded.
       if (providerFetchState === 'idle') {
         console.warn('[ChatView] startStream suppressed: provider feed still loading');
-        return;
+        return false;
       }
       // Guard 2: refuse when the active runtime has no compatible
       // provider at all (catch-all for empty filtered set).
       if (noCompatibleProvider) {
         console.warn('[ChatView] startStream suppressed: no provider compatible with active runtime');
-        return;
+        return false;
       }
       // Guard 3: only after fetch settles, refuse when resolved pair is
       // empty. failed branch (API down) still has the synthetic env
       // group from the catch path, so resolved pair stays populated.
       if (providerFetchState === 'loaded' && (!resolvedProviderId || !resolvedModel)) {
         console.warn('[ChatView] startStream suppressed: resolved provider/model is empty');
-        return;
+        return false;
       }
       // Guard 4 (Phase 2 Step 3b review): when the session's saved
       // provider isn't reachable under the current execution engine,
@@ -968,7 +1139,7 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
       // visibly reflects the same gate.
       if (sessionProviderRuntimeIncompatible) {
         console.warn('[ChatView] startStream suppressed: session provider runtime-incompatible — user must pick another in the composer');
-        return;
+        return false;
       }
       const notices = pendingImageNoticesRef.current.length > 0
         ? [...pendingImageNoticesRef.current]
@@ -994,9 +1165,9 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
         workingDirectory,
         systemPromptAppend,
         pendingImageNotices: notices,
-        // 'auto' sentinel means "no explicit effort" — filter it here so
-        // the CLI applies its per-model default (Opus 4.7 → xhigh, etc.)
-        effort: selectedEffort && selectedEffort !== 'auto' ? selectedEffort : undefined,
+        // 'auto' sentinel means "no explicit effort" — omitted so the CLI
+        // applies its per-model default (Opus 4.7 → xhigh, etc.)
+        effort: toWireEffort(selectedEffort),
         thinking: buildThinkingConfig(),
         context1m,
         displayOverride,
@@ -1014,6 +1185,7 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
           console.log('[ChatView] SDK init meta received:', meta);
         },
       });
+      return true;
     },
     [sessionId, mode, currentModel, currentProviderId, selectedEffort, context1m, buildThinkingConfig, handleModeChange, noCompatibleProvider, providerFetchState, resolvedProviderId, resolvedModel, sessionProviderRuntimeIncompatible]
   );
@@ -1076,9 +1248,11 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
         clearPendingRetry();
       }
 
-      // Queue message if currently streaming — hold above input, send after completion
+      // Queue message if currently streaming — hold above input, send after
+      // completion. Phase 2 ④ — enqueue into the manager-owned bucket so the
+      // queued message survives a session switch away and back.
       if (isStreaming) {
-        setMessageQueue((prev) => [...prev, { content, files, systemPromptAppend, displayOverride, mentions, selectedSkills }]);
+        enqueueMessage(sessionId, { content, files, systemPromptAppend, displayOverride, mentions, selectedSkills });
         return;
       }
 
@@ -1148,7 +1322,14 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
       };
       pendingOptimisticUserIdRef.current = userMessage.id;
       cappedSetMessages((prev) => [...prev, userMessage]);
-      doStartStream(next.content, next.files, next.systemPromptAppend, next.displayOverride, next.mentions, next.selectedSkills);
+      const started = doStartStream(next.content, next.files, next.systemPromptAppend, next.displayOverride, next.mentions, next.selectedSkills);
+      if (!started) {
+        // A guard suppressed the stream (e.g. resolved provider/model went
+        // empty). isStreaming will never flip true, so the reset below can't
+        // fire — release the latch here so a later state change re-runs the
+        // effect instead of the queue deadlocking with dequeuingRef stuck true.
+        dequeuingRef.current = false;
+      }
     }
     if (isStreaming) {
       dequeuingRef.current = false;
@@ -1258,7 +1439,7 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
   // session-less landing). Covers "clicked + on a project" and
   // "clicked + in the assistant workspace" — both create an empty
   // session and land here.
-  const isNewChat = messages.length === 0 && !isStreaming;
+  const isNewChat = displayedMessages.length === 0 && !isStreaming;
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -1327,6 +1508,7 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
                     sessionId={sessionId}
                     permissionProfile={permissionProfile}
                     onPermissionChange={setPermissionProfile}
+                    runtime={sessionRuntimeParam}
                   />
                 </>
               }
@@ -1343,6 +1525,7 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
                   pendingContextTokens={pendingContextTokens}
                   pendingContextSubTotals={pendingContextSubTotals}
                   sessionRuntimePin={runtimePin}
+                  reportedContextWindowTrusted={activeProviderReportsTrustedWindow}
                 />
               }
             />
@@ -1351,7 +1534,7 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
       ) : (
         <>
         <MessageList
-        messages={messages}
+        messages={displayedMessages}
         streamingContent={streamingContent}
         isStreaming={isStreaming}
         toolUses={toolUses}
@@ -1383,6 +1566,9 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
           onAction={handleTerminalAction}
         />
       )}
+      {/* Decisions made FOR the user (auto_review classifier denials) — these
+          have no prompt to close, so they get their own surface above it. */}
+      <PermissionReviewNotices notices={reviewNotices} />
       {/* Permission prompt */}
       <PermissionPrompt
         pendingPermission={pendingPermission}
@@ -1600,6 +1786,7 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
               sessionId={sessionId}
               permissionProfile={permissionProfile}
               onPermissionChange={setPermissionProfile}
+              runtime={sessionRuntimeParam}
             />
           </>
         }
@@ -1616,6 +1803,7 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
             pendingContextTokens={pendingContextTokens}
             pendingContextSubTotals={pendingContextSubTotals}
             sessionRuntimePin={runtimePin}
+            reportedContextWindowTrusted={activeProviderReportsTrustedWindow}
           />
         }
       />

@@ -59,6 +59,23 @@ import type {
   ResponsesOutputItem,
 } from './types';
 import { classifyUpstreamError } from './errors';
+import type { CodexNamespaceToolRoute } from './namespace-tools';
+import type { ExternalSource } from '@/types';
+import {
+  appendUniqueExternalSource,
+  normalizeExternalUrlSource,
+} from '@/lib/xai-hosted-search';
+
+export type ProviderToolLifecycleEvent =
+  | { type: 'started'; toolId: string; name: string; input?: unknown }
+  | {
+      type: 'completed';
+      toolId: string;
+      name: string;
+      output?: unknown;
+      error?: string;
+      sources?: readonly ExternalSource[];
+    };
 
 interface TranslateStreamOptions {
   responseId: string;
@@ -75,6 +92,11 @@ interface TranslateStreamOptions {
    *  execute a tool it doesn't know" failure mode that motivated the
    *  bridge in the first place. */
   builtinToolNames?: ReadonlySet<string>;
+  /** Provider-hosted tools suppressed from Codex but mirrored to CodePilot UI. */
+  providerExecutedToolNames?: ReadonlySet<string>;
+  onProviderToolEvent?: (event: ProviderToolLifecycleEvent) => void;
+  /** Flat provider function name → original Codex namespace/member pair. */
+  namespaceToolRoutes?: ReadonlyMap<string, CodexNamespaceToolRoute>;
 }
 
 /**
@@ -87,6 +109,8 @@ export async function* translateStream(
 ): AsyncGenerator<ResponsesEvent, void, void> {
   const { responseId, body, source } = opts;
   const builtinToolNames = opts.builtinToolNames ?? new Set<string>();
+  const providerExecutedToolNames = opts.providerExecutedToolNames ?? new Set<string>();
+  const namespaceToolRoutes = opts.namespaceToolRoutes ?? new Map();
 
   let nextOutputIndex = 0;
   const textIndices = new Map<string, number>();
@@ -97,6 +121,9 @@ export async function* translateStream(
    *  bridge so we drop them on the way out (input-start / call /
    *  result events for these names should never reach Codex). */
   const suppressedToolCallIds = new Set<string>();
+  const providerToolCallIds = new Set<string>();
+  const providerToolResults = new Map<string, { name: string; output?: unknown; error?: string }>();
+  let providerSources: ExternalSource[] = [];
   let terminalEmitted = false;
 
   try {
@@ -246,8 +273,20 @@ export async function* translateStream(
             suppressedToolCallIds.has(part.toolCallId)
           ) {
             suppressedToolCallIds.add(part.toolCallId);
+            if (providerExecutedToolNames.has(part.toolName)) {
+              providerToolCallIds.add(part.toolCallId);
+              toolNames.set(part.toolCallId, part.toolName);
+              opts.onProviderToolEvent?.({
+                type: 'started',
+                toolId: part.toolCallId,
+                name: part.toolName,
+                input: part.input,
+              });
+            }
             toolIndices.delete(part.toolCallId);
-            toolNames.delete(part.toolCallId);
+            if (!providerExecutedToolNames.has(part.toolName)) {
+              toolNames.delete(part.toolCallId);
+            }
             break;
           }
           // Final function_call envelope lands as `output_item.done`.
@@ -259,11 +298,13 @@ export async function* translateStream(
             toolIndices.set(part.toolCallId, idx);
           }
           const argsJson = stringifyInput(part.input);
+          const namespaceRoute = namespaceToolRoutes.get(part.toolName);
           const item: ResponsesOutputItem = {
             id: part.toolCallId,
             type: 'function_call',
             call_id: part.toolCallId,
-            name: part.toolName,
+            name: namespaceRoute?.name ?? part.toolName,
+            ...(namespaceRoute ? { namespace: namespaceRoute.namespace } : {}),
             arguments: argsJson,
           };
           yield {
@@ -286,7 +327,44 @@ export async function* translateStream(
           //   2. an upstream provider's own implicit tool execute
           //      (rare; ai-sdk drops it from fullStream by default
           //      because Codex tools have no execute()).
-          // Both cases drop silently.
+          // Provider-hosted tools are still mirrored to CodePilot's canonical
+          // tool lifecycle side-channel so the chat never shows a permanently
+          // pending search. They remain suppressed from Codex Responses output.
+          const toolName = part.toolName || toolNames.get(part.toolCallId);
+          if (
+            toolName &&
+            providerExecutedToolNames.has(toolName) &&
+            providerToolCallIds.has(part.toolCallId)
+          ) {
+            const result = part.type === 'tool-error'
+              ? { name: toolName, error: part.error instanceof Error ? part.error.message : String(part.error) }
+              : { name: toolName, output: part.output };
+            providerToolResults.set(part.toolCallId, result);
+            opts.onProviderToolEvent?.({
+              type: 'completed',
+              toolId: part.toolCallId,
+              ...result,
+              ...(providerSources.length > 0 ? { sources: providerSources } : {}),
+            });
+          }
+          break;
+        }
+
+        case 'source': {
+          const source = normalizeExternalUrlSource(part);
+          if (!source) break;
+          providerSources = appendUniqueExternalSource(providerSources, source);
+          // Sources can arrive after the provider-executed result. Re-publish
+          // the completed lifecycle fact with the same id; downstream storage
+          // is last-wins and enriches the existing tool result.
+          for (const [toolId, result] of providerToolResults) {
+            opts.onProviderToolEvent?.({
+              type: 'completed',
+              toolId,
+              ...result,
+              sources: providerSources,
+            });
+          }
           break;
         }
 
@@ -356,7 +434,7 @@ export async function* translateStream(
           return;
         }
 
-        // The remaining ai-sdk parts (reasoning-*, source, file,
+        // The remaining ai-sdk parts (reasoning-*, file,
         // tool-result, tool-error, start-step, finish-step, raw,
         // tool-output-denied) don't map onto the Codex-visible
         // surface today — we drop them silently. Reasoning content

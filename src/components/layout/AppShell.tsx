@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from "react";
 import dynamic from "next/dynamic";
 import { usePathname, useRouter } from "next/navigation";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -11,6 +11,7 @@ import { CardFrame, CardSurface, ResizeGutter } from "./card-primitives";
 import { UpdateBanner } from "./UpdateBanner";
 import { UnifiedTopBar } from "./UnifiedTopBar";
 import { WorkspaceSidebarProvider, useWorkspaceSidebar, useWorkspaceSidebarOptional } from "@/hooks/useWorkspaceSidebar";
+import { FileMutationProvider, useFileMutation } from "@/hooks/useFileMutation";
 import { PanelContext, usePanel, type PreviewViewMode, type PreviewSource } from "@/hooks/usePanel";
 import { UpdateContext } from "@/hooks/useUpdate";
 import { useUpdateChecker } from "@/hooks/useUpdateChecker";
@@ -26,6 +27,11 @@ import { useNotificationClickRoute } from '@/hooks/useNotificationClickRoute';
 import { useGlobalSearchShortcut } from '@/hooks/useGlobalSearchShortcut';
 import { GlobalSearchDialog } from './GlobalSearchDialog';
 import { ANNOUNCEMENT_KEY } from './feature-announcement-key';
+import {
+  pathIsWithin,
+  remapMutationPath,
+  type FileMutationTransaction,
+} from "@/lib/file-mutation";
 
 // AppShell static-import contract (Phase A memory cut, 2026-05-08): the six
 // components below are conditionally rendered (gated by route, modal state,
@@ -107,10 +113,47 @@ const RENDERED_EXTENSIONS = new Set([".md", ".mdx", ".html", ".htm", ".jsx", ".t
 function defaultViewMode(filePath: string): PreviewViewMode {
   const dot = filePath.lastIndexOf(".");
   const ext = dot >= 0 ? filePath.slice(dot).toLowerCase() : "";
+  // Markdown now has one canonical surface: CodeMirror Live Preview.
+  // Keep "rendered" for the other previewable formats, whose source and
+  // rendered views are still meaningfully separate.
+  if (ext === ".md" || ext === ".mdx") return "edit";
   return RENDERED_EXTENSIONS.has(ext) ? "rendered" : "source";
 }
 
 const LG_BREAKPOINT = 1024;
+
+function AppFileMutationParticipant({
+  previewSource,
+  onCommit,
+}: {
+  previewSource: PreviewSource | null;
+  onCommit: (transaction: FileMutationTransaction) => void;
+}) {
+  const { registerParticipant } = useFileMutation();
+  const previewSourceRef = useRef(previewSource);
+
+  useLayoutEffect(() => {
+    previewSourceRef.current = previewSource;
+  }, [previewSource]);
+
+  useEffect(
+    () =>
+      registerParticipant({
+        id: "app-preview-source",
+        priority: 20,
+        matches: (transaction) =>
+          previewSourceRef.current?.kind === "file" &&
+          pathIsWithin(
+            previewSourceRef.current.filePath,
+            transaction.targetPath,
+          ),
+        commit: (transaction) => onCommit(transaction),
+      }),
+    [onCommit, registerParticipant],
+  );
+
+  return null;
+}
 
 /**
  * Inner row that holds the chat main area + the two right-rail
@@ -147,10 +190,12 @@ const LG_BREAKPOINT = 1024;
  */
 
 function ChatContentRow({
+  isChatRoute,
   isChatDetailRoute,
   isSplitActive,
   children,
 }: {
+  isChatRoute: boolean;
   isChatDetailRoute: boolean;
   isSplitActive: boolean;
   children: React.ReactNode;
@@ -182,7 +227,7 @@ function ChatContentRow({
       </CardFrame>
       {/* Workspace sidebar: ResizeGutter as sibling of the frame so
           its visible line lands in the gap between main and workspace. */}
-      {isChatDetailRoute && ws.state.open && (
+      {isChatRoute && ws.state.open && (
         <>
           <ResizeGutter
             onResize={handleWorkspaceResize}
@@ -371,7 +416,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
   // Listen for global stream events from stream-session-manager
   useEffect(() => {
-    const handler = () => {
+    const handler = (e: Event) => {
       const activeIds = getActiveSessionIds();
       setActiveStreamingSessions(activeIds.length > 0 ? new Set(activeIds) : EMPTY_SET);
 
@@ -383,6 +428,20 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         }
       }
       setPendingApprovalSessionIds(approvals.size > 0 ? approvals : EMPTY_SET);
+
+      // A5 Step 2 follow-up #2 — also clear the single-value global badge when
+      // THIS event's session no longer needs approval (resolved / timed out).
+      // Runs at the app-shell level for every stream event, so it covers the
+      // "user navigated away, THEN the request timed out" case: the session's
+      // useStreamSubscription is unmounted then and can't clear it, but the
+      // pendingApprovalSessionIds Set above (which DOES re-derive) leaves the
+      // single global stuck until stream end. Functional + guarded
+      // (prev === sid && not in approvals) so it never clears a still-pending
+      // peer or the /chat inline new-session value.
+      const sid = (e as CustomEvent<{ sessionId?: string }>).detail?.sessionId;
+      if (sid) {
+        setPendingApprovalSessionId((prev) => (prev === sid && !approvals.has(sid) ? '' : prev));
+      }
     };
     window.addEventListener('stream-session-event', handler);
     return () => window.removeEventListener('stream-session-event', handler);
@@ -534,8 +593,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const [previewViewMode, setPreviewViewMode] = useState<PreviewViewMode>("source");
   // Track the last filePath we routed through setPreviewSource so we can
   // distinguish "file change" (reset view mode) from "metadata update"
-  // (Phase 4 UX — same-file presentationTemplate / anchor / trust
-  // promotions must NOT bounce the user out of Edit mode).
+  // (same-file anchor / trust promotions must NOT bounce the user out
+  // of Edit mode).
   const lastPreviewFilePathRef = useRef<string | null>(null);
 
   const previewFile: string | null =
@@ -595,6 +654,32 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       }
     },
     [setPreviewSource, workingDirectory],
+  );
+
+  const commitPreviewFileMutation = useCallback(
+    (transaction: FileMutationTransaction) => {
+      setPreviewSourceRaw((current) => {
+        if (
+          current?.kind !== "file" ||
+          !pathIsWithin(current.filePath, transaction.targetPath)
+        ) {
+          return current;
+        }
+        if (transaction.kind === "delete") {
+          lastPreviewFilePathRef.current = null;
+          return null;
+        }
+        if (!transaction.newPath) return current;
+        const filePath = remapMutationPath(
+          current.filePath,
+          transaction.targetPath,
+          transaction.newPath,
+        );
+        lastPreviewFilePathRef.current = filePath;
+        return { ...current, filePath };
+      });
+    },
+    [],
   );
 
   // Reset doc preview when navigating between pages/sessions
@@ -687,6 +772,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     <UpdateContext.Provider value={updateContextValue}>
       <SentryInit />
       <PanelContext.Provider value={panelContextValue}>
+        <FileMutationProvider>
+        <AppFileMutationParticipant
+          previewSource={previewSource}
+          onCommit={commitPreviewFileMutation}
+        />
         <WorkspaceSidebarProvider workingDirectory={workingDirectory} sessionId={sessionId}>
         <SplitContext.Provider value={splitContextValue}>
         <BatchImageGenContext.Provider value={batchImageGenValue}>
@@ -755,7 +845,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                   }}
                 />
               )}
-              <ChatContentRow isChatDetailRoute={isChatDetailRoute} isSplitActive={isSplitActive}>
+              <ChatContentRow isChatRoute={isChatRoute} isChatDetailRoute={isChatDetailRoute} isSplitActive={isSplitActive}>
                 {children}
               </ChatContentRow>
             </div>
@@ -788,6 +878,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         </BatchImageGenContext.Provider>
         </SplitContext.Provider>
         </WorkspaceSidebarProvider>
+        </FileMutationProvider>
       </PanelContext.Provider>
     </UpdateContext.Provider>
   );

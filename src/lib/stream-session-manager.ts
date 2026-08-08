@@ -13,15 +13,19 @@
 import { consumeSSEStream } from '@/hooks/useSSEStream';
 import { transferPendingToMessage } from '@/lib/image-ref-store';
 import { dispatchFileChanged } from '@/lib/file-changed-event';
+import { refreshSessionTitle } from '@/lib/session-title-events';
 import {
   extractWritePath,
   isWriteTool,
   resolveToolPath,
 } from '@/lib/file-write-tools';
+import { reconcilePhase } from '@/lib/stream-phase-reconcile';
+import { MISSING_TOOL_RESULT_CONTENT } from '@/lib/tool-history-integrity';
 import type {
   ToolUseInfo,
   ToolResultInfo,
   SessionStreamSnapshot,
+  StreamPhase,
   StreamEvent,
   StreamEventListener,
   TokenUsage,
@@ -60,6 +64,10 @@ interface ActiveStream {
   toolOutputAccumulated: string;
   toolTimeoutInfo: { toolName: string; elapsedSeconds: number } | null;
   isIdleTimeout: boolean;
+  /** #635 — true once the first model-output SSE (text / thinking / tool_use)
+   *  arrived. Gates the two-tier idle budget; status/init, tool_result/
+   *  tool_output and the terminal result do NOT count as "first token". */
+  sawUpstreamModelOutput: boolean;
   sendMessageFn: ((content: string, files?: FileAttachment[]) => void) | null;
   rewindPoints: Array<{ userMessageId: string }>;
 }
@@ -110,8 +118,18 @@ export interface StartStreamParams {
 
 const GLOBAL_KEY = '__streamSessionManager__' as const;
 const LISTENERS_KEY = '__streamSessionListeners__' as const;
-const STREAM_IDLE_TIMEOUT_MS = 330_000;
+// #635 — two-tier idle budget. Before the first model-output SSE the upstream
+// may legitimately be queueing on a slow third-party proxy (the SDK is silent
+// during that wait — its keep_alive is filtered before the app iterator), so we
+// give a longer fuse; once the model has started emitting we tighten it (a stream
+// that opened then went silent is more likely truly stuck). NOT an unconditional
+// keepalive — a dead upstream still aborts after the PRE budget. See
+// docs/research/issue-635-stream-idle-liveness-design.md.
+const STREAM_IDLE_PRE_FIRST_TOKEN_MS = 600_000; // 10min — waiting for first model output
+const STREAM_IDLE_POST_FIRST_TOKEN_MS = 330_000; // 5.5min — mid-stream silence (unchanged)
 const GC_DELAY_MS = 5 * 60 * 1000; // 5 minutes
+/** Bound on retained auto-review notices per turn — keeps the recent tail. */
+const MAX_REVIEW_NOTICES = 20;
 // stopStream: how long to wait for a graceful interrupt before force-aborting.
 // The force-abort is scheduled UNCONDITIONALLY (not behind the interrupt
 // request's .finally) so a hung /api/chat/interrupt can't strand the stream in
@@ -214,6 +232,18 @@ export function buildFinalMessageContent(args: {
         content: normalizeContentToString(tr.content),
         ...(tr.is_error ? { is_error: true } : {}),
         ...(tr.media && tr.media.length > 0 ? { media: tr.media } : {}),
+        ...(tr.sources && tr.sources.length > 0 ? { sources: tr.sources } : {}),
+      });
+    } else {
+      // A stopped/partially delivered turn may end after tool_use but before
+      // any tool_result SSE arrives. Persist an honest app-owned terminal
+      // result so the next turn is valid AI SDK history. This says only what
+      // CodePilot observed; it does not claim whether the tool ran.
+      blocks.push({
+        type: 'tool_result',
+        tool_use_id: tu.id,
+        content: MISSING_TOOL_RESULT_CONTENT,
+        is_error: true,
       });
     }
   }
@@ -230,6 +260,7 @@ export function buildFinalMessageContent(args: {
       content: normalizeContentToString(tr.content),
       ...(tr.is_error ? { is_error: true } : {}),
       ...(tr.media && tr.media.length > 0 ? { media: tr.media } : {}),
+      ...(tr.sources && tr.sources.length > 0 ? { sources: tr.sources } : {}),
     });
   }
   return JSON.stringify(blocks);
@@ -259,6 +290,9 @@ function buildSnapshot(stream: ActiveStream): SessionStreamSnapshot {
     statusText: stream.snapshot.statusText,
     pendingPermission: stream.snapshot.pendingPermission,
     permissionResolved: stream.snapshot.permissionResolved,
+    // Carried through: emit() replaces the snapshot wholesale, so anything
+    // not rebuilt here is dropped on the next event.
+    reviewNotices: stream.snapshot.reviewNotices,
     tokenUsage: stream.snapshot.tokenUsage,
     startedAt: stream.snapshot.startedAt,
     completedAt: stream.snapshot.completedAt,
@@ -288,13 +322,19 @@ function emit(stream: ActiveStream, type: StreamEvent['type']) {
 
 function scheduleGC(stream: ActiveStream) {
   if (stream.gcTimer) clearTimeout(stream.gcTimer);
-  stream.gcTimer = setTimeout(() => {
+  const timer = setTimeout(() => {
     const map = getStreamsMap();
     const current = map.get(stream.sessionId);
     if (current === stream && current.snapshot.phase !== 'active') {
       map.delete(stream.sessionId);
     }
   }, GC_DELAY_MS);
+  stream.gcTimer = timer;
+  // This module is also exercised in Node-based unit/SSR processes. A
+  // five-minute client-side retention timer must not keep those processes
+  // alive after all work is complete; browsers use numeric timers and are
+  // unaffected by this Node-only unref.
+  if (typeof timer === 'object' && 'unref' in timer) timer.unref();
 }
 
 function cleanupTimers(stream: ActiveStream) {
@@ -349,6 +389,7 @@ export function startStream(params: StartStreamParams): void {
       statusText: undefined,
       pendingPermission: null,
       permissionResolved: null,
+      reviewNotices: [],
       tokenUsage: null,
       startedAt: Date.now(),
       completedAt: null,
@@ -368,6 +409,7 @@ export function startStream(params: StartStreamParams): void {
     toolOutputAccumulated: '',
     toolTimeoutInfo: null,
     isIdleTimeout: false,
+    sawUpstreamModelOutput: false,
     sendMessageFn: params.sendMessageFn ?? null,
     rewindPoints: [],
   };
@@ -384,7 +426,12 @@ async function runStream(stream: ActiveStream, params: StartStreamParams): Promi
 
   // Idle timeout checker
   stream.idleCheckTimer = setInterval(() => {
-    if (Date.now() - stream.lastEventTime >= STREAM_IDLE_TIMEOUT_MS) {
+    // #635 — longer fuse before the first model-output event (a slow proxy may
+    // legitimately be queueing), shorter once the stream has started producing.
+    const idleBudget = stream.sawUpstreamModelOutput
+      ? STREAM_IDLE_POST_FIRST_TOKEN_MS
+      : STREAM_IDLE_PRE_FIRST_TOKEN_MS;
+    if (Date.now() - stream.lastEventTime >= idleBudget) {
       cleanupTimers(stream);
       stream.isIdleTimeout = true;
       stream.abortController.abort();
@@ -398,7 +445,15 @@ async function runStream(stream: ActiveStream, params: StartStreamParams): Promi
     effectiveContent = `${notices}\n\n---\n\n${params.content}`;
   }
 
-  // Adaptive text emit throttle — avoids excessive React re-renders during fast streaming.
+  // Adaptive snapshot emit throttle — avoids excessive React re-renders during
+  // fast streaming. Phase 2 ② — reused (kept the `Text` names for a minimal
+  // diff) by the three high-frequency non-text handlers too: onThinking,
+  // onToolOutput and onToolProgress. All four just schedule a coalesced
+  // `emit(stream, 'snapshot-updated')`, and buildSnapshot always reads the
+  // latest mutated accumulators/statusText, so coalescing drops intermediate
+  // frames WITHOUT changing the final snapshot. Terminal transitions
+  // (completion/error/stop) and onToolUse call flushTextThrottle() first, so
+  // no pending frame is ever lost before a tool block or the final content.
   // Defined before try/catch so flushTextThrottle is accessible in the error path.
   const TEXT_THROTTLE_MS = 100;
   let textEmitTimer: ReturnType<typeof setTimeout> | null = null;
@@ -489,18 +544,30 @@ async function runStream(stream: ActiveStream, params: StartStreamParams): Promi
       throw e;
     }
 
+    // Accepted — the route has already persisted the user message and, if this
+    // was the session's first real message, committed the fallback title.
+    // Pull it back so the top bar / sidebar update now rather than on the
+    // sidebar's 5s poll. autoTrigger turns are skipped: they never write a
+    // title, so a GET would be pure noise. Fire-and-forget — this is cosmetic
+    // and must not touch the snapshot lifecycle below.
+    if (!params.autoTrigger) {
+      void refreshSessionTitle(params.sessionId);
+    }
+
     const reader = response.body?.getReader();
     if (!reader) throw new Error('No response stream');
 
     const result = await consumeSSEStream(reader, {
       onText: (acc) => {
         markActive();
+        stream.sawUpstreamModelOutput = true; // #635 — first model-output tier
         stream.accumulatedText = acc;
         stream.thinkingPhaseEnded = true;
         throttledTextEmit();
       },
       onThinking: (delta) => {
         markActive();
+        stream.sawUpstreamModelOutput = true; // #635 — first model-output tier
         // If non-thinking content has arrived since last thinking delta,
         // this is a new thinking phase (e.g. after a tool_use round-trip).
         // Reset the live accumulator so the UI shows only the current phase.
@@ -513,10 +580,11 @@ async function runStream(stream: ActiveStream, params: StartStreamParams): Promi
           stream.thinkingPhaseEnded = false;
         }
         stream.accumulatedThinking += delta;
-        emit(stream, 'snapshot-updated');
+        throttledTextEmit(); // Phase 2 ② — coalesce fast thinking deltas
       },
       onToolUse: (tool) => {
         markActive();
+        stream.sawUpstreamModelOutput = true; // #635 — first model-output tier (tool-call-only first response)
         flushTextThrottle(); // Ensure text is up-to-date before tool events
         stream.thinkingPhaseEnded = true;
         stream.toolOutputAccumulated = '';
@@ -572,12 +640,12 @@ async function runStream(stream: ActiveStream, params: StartStreamParams): Promi
         } else {
           stream.toolOutputAccumulated = next;
         }
-        emit(stream, 'snapshot-updated');
+        throttledTextEmit(); // Phase 2 ② — coalesce fast live tool-output frames
       },
       onToolProgress: (toolName, elapsed) => {
         markActive();
         stream.snapshot = { ...stream.snapshot, statusText: `Running ${toolName}... (${elapsed}s)` };
-        emit(stream, 'snapshot-updated');
+        throttledTextEmit(); // Phase 2 ② — coalesce fast progress ticks
       },
       onSkillNudge: (data) => {
         // Broadcast as window event — ChatView listens and renders a
@@ -661,6 +729,42 @@ async function runStream(stream: ActiveStream, params: StartStreamParams): Promi
           permissionResolved: null,
         };
         emit(stream, 'permission-request');
+      },
+      onPermissionResolved: (permissionRequestId, status) => {
+        // A5 Step 2 — registry auto-denied a pending request on timeout.
+        // Flip ONLY the prompt that's actually showing; a late event for an
+        // already-answered or replaced request is ignored.
+        markActive();
+        if (stream.snapshot.pendingPermission?.permissionRequestId !== permissionRequestId) return;
+        stream.snapshot = { ...stream.snapshot, permissionResolved: status };
+        emit(stream, 'snapshot-updated');
+        // Hold the "auto-denied — timed out" line a touch longer than a manual
+        // resolve (the user wasn't watching), then clear it if nothing else
+        // replaced the prompt in the meantime.
+        const answeredId = permissionRequestId;
+        streamTimeout(stream, () => {
+          if (stream.snapshot.pendingPermission?.permissionRequestId === answeredId) {
+            stream.snapshot = {
+              ...stream.snapshot,
+              pendingPermission: null,
+              permissionResolved: null,
+            };
+            emit(stream, 'snapshot-updated');
+          }
+        }, 6000);
+      },
+      onPermissionReview: (notice) => {
+        // A decision made for the user, with no prompt to close. Appended to
+        // its own list rather than folded into permissionResolved: that field
+        // answers "what happened to the question you were asked", and this
+        // never was one. Keep the tail bounded — a long auto_review turn can
+        // produce many, and the useful ones are the recent ones.
+        markActive();
+        stream.snapshot = {
+          ...stream.snapshot,
+          reviewNotices: [...stream.snapshot.reviewNotices, notice].slice(-MAX_REVIEW_NOTICES),
+        };
+        emit(stream, 'snapshot-updated');
       },
       onToolTimeout: (toolName, elapsedSeconds) => {
         markActive();
@@ -776,7 +880,11 @@ async function runStream(stream: ActiveStream, params: StartStreamParams): Promi
     if (error instanceof DOMException && error.name === 'AbortError') {
       if (stream.isIdleTimeout) {
         // Idle timeout
-        const idleSecs = Math.round(STREAM_IDLE_TIMEOUT_MS / 1000);
+        const idleSecs = Math.round(
+          (stream.sawUpstreamModelOutput
+            ? STREAM_IDLE_POST_FIRST_TOKEN_MS
+            : STREAM_IDLE_PRE_FIRST_TOKEN_MS) / 1000,
+        );
         const textPart = stream.accumulatedText.trim()
           ? stream.accumulatedText.trim() + `\n\n**Error:** Stream idle timeout — no response for ${idleSecs}s. The connection may have dropped.`
           : `**Error:** Stream idle timeout — no response for ${idleSecs}s. The connection may have dropped.`;
@@ -915,10 +1023,18 @@ interface StoppableStream {
 
 interface StopStreamDeps {
   /** Best-effort graceful interrupt. MUST be bounded by the caller (so a hung
-   *  endpoint can't leak) and swallow its own errors. */
-  requestInterrupt: () => void;
+   *  endpoint can't leak) and swallow its own errors (resolve, never reject).
+   *  Returns the backend's authoritative runtime_status from the interrupt
+   *  response, or null when unknown / failed / timed out. */
+  requestInterrupt: () => Promise<string | null>;
   /** Schedule the force-abort safety net (tracked on the stream's timers). */
   scheduleForceAbort: (fn: () => void, ms: number) => void;
+  /** Converge the client phase to a TERMINAL phase (I4). Called only when the
+   *  interrupt response reports the backend is already terminal while the
+   *  client is still 'active' — flips the composer's isStreaming gate off
+   *  without waiting for the reader to reject. Must NOT append content (the
+   *  reader's own terminal transition still runs). */
+  convergePhase: (terminalPhase: StreamPhase) => void;
 }
 
 /**
@@ -930,6 +1046,14 @@ interface StopStreamDeps {
  * so `.finally` never ran, the abort was never scheduled, `phase` stayed
  * 'active' forever, and the composer's `isStreaming` gate (= phase==='active')
  * locked the user out of sending after an interrupt.
+ *
+ * Interrupt/phase reconcile (I4/I2): the interrupt response now carries the backend's
+ * authoritative runtime_status. If the backend is ALREADY terminal (idle /
+ * interrupted / error), converge the client phase to a terminal phase in a
+ * microtask — bounding phase off 'active' even if the reader never rejects. A
+ * 'running'/unknown status maps to no correction (reconcilePhase → null or
+ * 'active'), so the force-abort net remains the sole bound in the live-stop
+ * case. No periodic poll (DP2) — this is one read off the stop response.
  */
 export function stopStreamWith(
   stream: StoppableStream | undefined,
@@ -944,9 +1068,27 @@ export function stopStreamWith(
       stream.abortController.abort();
     }
   }, forceAbortMs);
-  // 2) Best-effort graceful interrupt — stops the backend faster than the
-  //    force-abort when it works; purely an optimization now.
-  deps.requestInterrupt();
+  // 2) Best-effort graceful interrupt — invoked immediately (its side effect
+  //    fires synchronously, right after the net is armed). Its resolved
+  //    runtime_status drives phase convergence in a microtask.
+  Promise.resolve(deps.requestInterrupt())
+    .then((runtimeStatus) => {
+      // The reader may have already settled (force-abort or a real terminal
+      // event) between the interrupt and its response — only converge a still-
+      // active client.
+      if (stream.snapshot.phase !== 'active') return;
+      const next = reconcilePhase(runtimeStatus, stream.snapshot.phase);
+      // Act on TERMINAL corrections only. A 'running' status maps back to
+      // 'active' (→ skipped): we never re-lock behind a reader-less phase, and
+      // the force-abort net still bounds it.
+      if (next && next !== 'active') {
+        deps.convergePhase(next);
+      }
+    })
+    .catch(() => {
+      // Interrupt failed/timed out — the force-abort net (armed above) is the
+      // fallback that bounds the phase.
+    });
 }
 
 export function stopStream(sessionId: string): void {
@@ -954,20 +1096,40 @@ export function stopStream(sessionId: string): void {
   stopStreamWith(
     stream,
     {
-      requestInterrupt: () => {
-        fetch('/api/chat/interrupt', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sessionId }),
-          // Bounded so a hung endpoint can't leak a pending request; the
-          // scheduled force-abort is the real fallback.
-          signal: AbortSignal.timeout(STREAM_FORCE_ABORT_MS),
-        }).catch(() => {
+      requestInterrupt: async (): Promise<string | null> => {
+        try {
+          const res = await fetch('/api/chat/interrupt', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionId }),
+            // Bounded so a hung endpoint can't leak a pending request; the
+            // scheduled force-abort is the real fallback.
+            signal: AbortSignal.timeout(STREAM_FORCE_ABORT_MS),
+          });
+          if (!res.ok) return null;
+          const data = await res.json().catch(() => null);
+          // Interrupt/phase reconcile — the interrupt route returns the backend's
+          // authoritative runtime_status (or null). Drives phase convergence.
+          return data && typeof data.runtime_status === 'string' ? data.runtime_status : null;
+        } catch {
           // Interrupt failed/timed out — force-abort already scheduled.
-        });
+          return null;
+        }
       },
       scheduleForceAbort: (fn, ms) => {
         if (stream) streamTimeout(stream, fn, ms);
+      },
+      convergePhase: (terminalPhase) => {
+        // I4: bound the client phase off 'active' once the backend is confirmed
+        // terminal, so the composer's isStreaming gate (≡ phase==='active',
+        // GitHub #578) releases without waiting for the reader to reject. We
+        // only flip the phase and emit — we do NOT append finalMessageContent or
+        // schedule GC here: the reader's own terminal transition (line ~905, on
+        // the force-abort's abort or a real stream close) still runs and appends
+        // the partial output canonically. This bounds phase, not content.
+        if (!stream || stream.snapshot.phase !== 'active') return;
+        stream.snapshot = { ...stream.snapshot, phase: terminalPhase };
+        emit(stream, 'phase-changed');
       },
     },
     STREAM_FORCE_ABORT_MS,
@@ -1044,6 +1206,9 @@ export async function respondToPermission(
 
   const body = {
     permissionRequestId: perm.permissionRequestId,
+    // Echo the server-issued HMAC token; the route rejects responses
+    // without a valid one (Phase 4 ② hardening).
+    ...(perm.approvalToken ? { approvalToken: perm.approvalToken } : {}),
     decision: decision === 'deny'
       ? { behavior: 'deny' as const, message: denyMessage || 'User denied permission' }
       : {
@@ -1150,6 +1315,7 @@ export function seedSnapshotPatch(
     toolOutputAccumulated: '',
     toolTimeoutInfo: null,
     isIdleTimeout: false,
+    sawUpstreamModelOutput: false,
     sendMessageFn: null,
     rewindPoints: [],
     snapshot: {
@@ -1163,6 +1329,7 @@ export function seedSnapshotPatch(
       statusText: undefined,
       pendingPermission: null,
       permissionResolved: null,
+      reviewNotices: [],
       tokenUsage: null,
       startedAt: Date.now(),
       completedAt: Date.now(),
@@ -1172,4 +1339,113 @@ export function seedSnapshotPatch(
     },
   };
   map.set(sessionId, placeholder);
+  // Schedule GC like the normal terminal transitions do (this placeholder is
+  // registered directly in a terminal phase='completed' and never passes
+  // through the stream lifecycle that would otherwise arm the timer). Without
+  // this, a seeded first-turn snapshot leaks in the module-global map forever
+  // (audit ⑤). GC only reclaims when the entry is still non-active at fire.
+  scheduleGC(placeholder);
+}
+
+// ==========================================
+// Message queue (Phase 2 ④)
+// ==========================================
+
+/**
+ * A message the user typed while a stream was already active. ChatView holds
+ * these above the composer and sends the next one when the current stream
+ * finishes.
+ *
+ * Phase 2 ④ — this used to live in `ChatView` React state, so switching away
+ * from a streaming session and back (ChatView unmount → remount) dropped every
+ * queued message. Moving the store here (keyed by sessionId, in the same
+ * globalThis-backed module the stream itself lives in) makes the queue survive
+ * the remount and stay bucketed per session — the queue now shares the stream's
+ * lifecycle instead of the component's.
+ */
+export interface QueuedMessage {
+  content: string;
+  files?: FileAttachment[];
+  systemPromptAppend?: string;
+  displayOverride?: string;
+  mentions?: MentionRef[];
+  /** Preserve badge-derived Skill labels across the queue so dequeued sends
+   *  carry them through to the producer. */
+  selectedSkills?: readonly string[];
+}
+
+const QUEUES_KEY = '__streamSessionQueues__' as const;
+const QUEUE_LISTENERS_KEY = '__streamSessionQueueListeners__' as const;
+
+function getQueuesMap(): Map<string, QueuedMessage[]> {
+  if (!(globalThis as Record<string, unknown>)[QUEUES_KEY]) {
+    (globalThis as Record<string, unknown>)[QUEUES_KEY] = new Map<string, QueuedMessage[]>();
+  }
+  return (globalThis as Record<string, unknown>)[QUEUES_KEY] as Map<string, QueuedMessage[]>;
+}
+
+function getQueueListenersMap(): Map<string, Set<() => void>> {
+  if (!(globalThis as Record<string, unknown>)[QUEUE_LISTENERS_KEY]) {
+    (globalThis as Record<string, unknown>)[QUEUE_LISTENERS_KEY] = new Map<string, Set<() => void>>();
+  }
+  return (globalThis as Record<string, unknown>)[QUEUE_LISTENERS_KEY] as Map<string, Set<() => void>>;
+}
+
+function notifyQueue(sessionId: string): void {
+  const listeners = getQueueListenersMap().get(sessionId);
+  if (listeners) {
+    for (const listener of listeners) {
+      try { listener(); } catch { /* listener error */ }
+    }
+  }
+}
+
+/** Current queued messages for a session (empty array when none). Returns a
+ *  fresh array reference each call so React state identity checks re-render. */
+export function getMessageQueue(sessionId: string): QueuedMessage[] {
+  return [...(getQueuesMap().get(sessionId) ?? [])];
+}
+
+/**
+ * Replace a session's queue. Accepts either the next array or an updater
+ * function (mirrors React's setState signature so ChatView's existing
+ * `setMessageQueue(prev => ...)` / `setMessageQueue([])` call sites port over
+ * unchanged). An emptied queue deletes its map entry so drained/stopped
+ * sessions don't leak in the module-global map.
+ */
+export function updateMessageQueue(
+  sessionId: string,
+  updater: QueuedMessage[] | ((prev: QueuedMessage[]) => QueuedMessage[]),
+): void {
+  const map = getQueuesMap();
+  const prev = map.get(sessionId) ?? [];
+  const next = typeof updater === 'function' ? updater([...prev]) : updater;
+  if (next.length === 0) {
+    map.delete(sessionId);
+  } else {
+    map.set(sessionId, [...next]);
+  }
+  notifyQueue(sessionId);
+}
+
+/** Append one message to a session's queue. */
+export function enqueueMessage(sessionId: string, message: QueuedMessage): void {
+  updateMessageQueue(sessionId, (prev) => [...prev, message]);
+}
+
+/** Subscribe to queue changes for a session. Returns an unsubscribe fn. */
+export function subscribeMessageQueue(sessionId: string, listener: () => void): () => void {
+  const listenersMap = getQueueListenersMap();
+  let listeners = listenersMap.get(sessionId);
+  if (!listeners) {
+    listeners = new Set();
+    listenersMap.set(sessionId, listeners);
+  }
+  listeners.add(listener);
+  return () => {
+    listeners!.delete(listener);
+    if (listeners!.size === 0) {
+      listenersMap.delete(sessionId);
+    }
+  };
 }

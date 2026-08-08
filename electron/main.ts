@@ -2,6 +2,9 @@
 import * as Sentry from '@sentry/electron/main';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
+import { configureElectronMainIntegrations, resolveTelemetryConfig, TELEMETRY_IGNORE_ERRORS } from '../src/lib/telemetry/contract';
+import { sanitizeTelemetryBreadcrumb, sanitizeTelemetryEvent } from '../src/lib/telemetry/sanitize';
+import { createTelemetrySmokeError, telemetrySmokeEnabled } from '../src/lib/telemetry/smoke';
 
 // Check opt-out before init — reads a marker file that the renderer writes
 const sentryOptOutPath = join(
@@ -12,23 +15,102 @@ const sentryOptOutPath = join(
 const sentryDisabled = existsSync(sentryOptOutPath) &&
   readFileSync(sentryOptOutPath, 'utf-8').trim() === 'true';
 
-if (!sentryDisabled) {
+const electronTelemetry = resolveTelemetryConfig({
+  dsn: process.env.CODEPILOT_SENTRY_DSN,
+  channel: process.env.CODEPILOT_APP_CHANNEL,
+  version: process.env.CODEPILOT_APP_VERSION,
+  nodeEnv: process.env.NODE_ENV,
+  optedOut: sentryDisabled,
+});
+
+if (electronTelemetry.enabled) {
   Sentry.init({
-    dsn: 'https://245dc3525425bcd8eb99dd4b9a2ca5cd@o4511161899548672.ingest.us.sentry.io/4511161904791552',
+    dsn: electronTelemetry.dsn,
+    environment: electronTelemetry.environment,
+    release: electronTelemetry.release,
+    sendDefaultPii: false,
+    attachScreenshot: false,
+    tracesSampleRate: 0,
+    ignoreErrors: TELEMETRY_IGNORE_ERRORS,
+    integrations: (defaults) => configureElectronMainIntegrations(
+      defaults,
+      Sentry.mainProcessSessionIntegration({ sendOnCreate: true }),
+    ),
+    beforeBreadcrumb(breadcrumb) {
+      return sanitizeTelemetryBreadcrumb(breadcrumb);
+    },
+    beforeSend(event) {
+      return sanitizeTelemetryEvent(event, {
+        layer: 'electron_main',
+        channel: electronTelemetry.channel,
+        platform: process.platform,
+        arch: process.arch,
+      });
+    },
   });
+  if (telemetrySmokeEnabled(process.env.CODEPILOT_TELEMETRY_SMOKE)) {
+    const eventId = Sentry.captureException(createTelemetrySmokeError('electron_main'));
+    console.log(`[telemetry-smoke] layer=electron_main event_id=${eventId}`);
+    void Sentry.flush(5_000);
+  }
 }
 
-import { app, BrowserWindow, Notification, nativeImage, dialog, session, utilityProcess, ipcMain, shell, Tray, Menu } from 'electron';
+const nativeCrashSmokeEnabled = electronTelemetry.enabled
+  && telemetrySmokeEnabled(process.env.CODEPILOT_TELEMETRY_SMOKE)
+  && process.env.CODEPILOT_NATIVE_CRASH_SMOKE === '1';
+
+import { app, BrowserWindow, Notification, nativeImage, nativeTheme, dialog, session, utilityProcess, ipcMain, shell, Tray, Menu, clipboard } from 'electron';
+import { resolveDefaultAssistantHome } from './default-assistant-home';
+import {
+  buildNativeNotificationOptions,
+  deliverNativeNotification,
+  NativeNotificationRetention,
+} from './notification-lifecycle';
+import {
+  NotificationClickQueue,
+  resolveNotificationActionRoute,
+  type NotificationClickAction,
+} from './notification-click-queue';
+import { externalOpenFailureCopy, openExternalSafely } from './external-navigation';
 import path from 'path';
 import { execFileSync, spawn, ChildProcess } from 'child_process';
 import fs from 'fs';
 import net from 'net';
 import os from 'os';
 import { TerminalManager } from './terminal-manager';
+import { validateTerminalCreateOpts } from './terminal-create-validation';
+import {
+  buildCodexPowerShellLaunchSpec,
+  findWindowsNpmCommand,
+  isTrustedCodexRecoverySender,
+  selectCodexWindowsInstallCommand,
+} from './codex-windows-recovery';
+import { initializeProviderSecretEnvironment } from './provider-secret-key';
 import { sanitizeLogLine } from './log-sanitize';
+import {
+  buildMacosKeychainEnvironment,
+  getMacosDefaultKeychainProbe,
+} from '../src/lib/macos-keychain-guard';
 import { getTrayMenuLabels } from '../src/lib/tray-menu-labels';
+import { NATIVE_NOTIFICATION_ERROR } from '../src/lib/notification-error-codes';
 import { BoundedLineRing } from '../src/lib/logging/bounded-line-ring';
 import { createRotatingLogWriter, type RotatingLogWriter } from '../src/lib/logging/main-log-rotation';
+import { classifyNavigation } from '../src/lib/navigation-policy';
+import { buildProxySafeEnvironment } from '../src/lib/process-proxy-env';
+import { isNativeThemeSource } from '../src/lib/native-theme-source';
+import {
+  deriveHtmlThumbnailRequestScope,
+  HTML_THUMBNAIL_CAPTURE_TIMEOUT_MS,
+  HtmlThumbnailCaptureTimeoutError,
+  isHtmlThumbnailRequestAllowed,
+  SerializedDeadlineQueue,
+} from './html-thumbnail-security';
+import {
+  buildScopedPathInspectionUrl,
+  type ScopedSystemPathRequest,
+  type SystemPathPurpose,
+  validateScopedPathInspection,
+} from '../src/lib/local-path-security';
 
 // B-025: hard caps for the persistent main log + the in-memory server-output
 // ring. The 12.5 GB log a user hit came from an unbounded active file plus an
@@ -58,6 +140,11 @@ function sanitizedProcessEnv(): Record<string, string> {
 }
 
 let mainWindow: BrowserWindow | null = null;
+const notificationClickQueue = new NotificationClickQueue((action) => {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('notification:click', action);
+  }
+});
 let serverProcess: Electron.UtilityProcess | null = null;
 let serverPort: number | null = null;
 const serverErrors = new BoundedLineRing(SERVER_ERRORS_MAX_LINES, SERVER_ERRORS_MAX_BYTES);
@@ -69,9 +156,42 @@ let serverExited = false;
 let serverExitCode: number | null = null;
 let userShellEnv: Record<string, string> = {};
 let resolvedProxyEnv: Record<string, string> = {};
+let providerSecretEnvironment: Record<string, string> = {};
+let macosKeychainEnvironment: Record<string, string> = {};
 let isQuitting = false;
 let tray: Tray | null = null;
-let bgNotifyTimer: ReturnType<typeof setInterval> | null = null;
+let nativeDeliveryTimer: ReturnType<typeof setInterval> | null = null;
+let nativeDeliveryPolling = false;
+const nativeDeliveryOwner = `electron-main-${process.pid}-${Math.random().toString(36).slice(2)}`;
+const nativeNotificationRetention = new NativeNotificationRetention<Notification>();
+
+function openExternalInSystemBrowser(targetUrl: string): void {
+  void openExternalSafely(
+    targetUrl,
+    (url) => shell.openExternal(url),
+    async () => {
+      console.warn('[external-navigation] code=external_open_failed');
+      const locale = (() => {
+        try { return app.getLocale(); } catch { return 'en'; }
+      })();
+      const copy = externalOpenFailureCopy(locale);
+      const options: Electron.MessageBoxOptions = {
+        type: 'error',
+        title: copy.title,
+        message: copy.message,
+        detail: copy.detail,
+        buttons: ['OK'],
+        defaultId: 0,
+        noLink: true,
+      };
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        await dialog.showMessageBox(mainWindow, options);
+      } else {
+        await dialog.showMessageBox(options);
+      }
+    },
+  );
+}
 
 // --- Install orchestrator ---
 interface InstallStep {
@@ -230,6 +350,42 @@ function chatWindowUrlForRevival(): string | undefined {
   return `http://127.0.0.1:${serverPort}`;
 }
 
+async function resolveScopedSystemPath(
+  event: Electron.IpcMainInvokeEvent,
+  request: ScopedSystemPathRequest,
+  purpose: SystemPathPurpose,
+): Promise<{ realPath: string } | { error: string }> {
+  try {
+    const inspectUrl = buildScopedPathInspectionUrl(
+      event.sender.getURL(),
+      request,
+      purpose,
+    );
+    const response = await fetch(inspectUrl, { cache: 'no-store' });
+    if (!response.ok) return { error: `Path validation failed (${response.status})` };
+    const inspected = validateScopedPathInspection(await response.json(), purpose);
+
+    // The route returns a canonical real path. Re-check it immediately before
+    // the OS call so swapping that path to a symlink after inspection cannot
+    // turn an allowed HTML file into an executable or bundle.
+    const currentRealPath = fs.realpathSync(inspected.realPath);
+    if (currentRealPath !== inspected.realPath) {
+      return { error: 'Path changed after validation' };
+    }
+    const stat = fs.statSync(currentRealPath);
+    validateScopedPathInspection(
+      {
+        realPath: currentRealPath,
+        kind: stat.isFile() ? 'file' : stat.isDirectory() ? 'directory' : 'other',
+      },
+      purpose,
+    );
+    return { realPath: currentRealPath };
+  } catch {
+    return { error: 'Path validation failed' };
+  }
+}
+
 /**
  * Show / focus the main window. Re-creates it if the user previously hit
  * Cmd+Q during a hidden state and it was destroyed; otherwise just unhides
@@ -324,192 +480,145 @@ function destroyTray(): void {
     tray.destroy();
     tray = null;
   }
-  stopBgNotifyPoll();
+  stopNativeDeliveryService();
 }
 
-/**
- * Parse notification API response. Canonical version: src/lib/bg-notify-parser.ts
- *
- * Phase 3 Step 3: surfaces `event_id` / `task_id` / `session_id` so the
- * bg-poller can ack delivery and route clicks. We tolerate missing
- * fields (older payloads / external sources) by keeping them optional.
- */
-interface BgNotificationPayload {
+interface NativeDeliveryPayload {
+  delivery_id: string;
+  event_id: string;
   title: string;
   body: string;
-  priority: string;
-  event_id?: string;
-  task_id?: string;
-  session_id?: string;
+  priority: 'low' | 'normal' | 'urgent';
+  task_id: string | null;
+  session_id: string | null;
+  action_type: string | null;
+  action_payload: string | null;
 }
 
-function parseBgNotifications(json: string): BgNotificationPayload[] {
-  try {
-    const parsed = JSON.parse(json);
-    const notifications: BgNotificationPayload[] = parsed.notifications || [];
-    return notifications.filter((n: { title: string }) => n.title);
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Phase 3 Step 3 — ack a delivery row from the Electron main process.
- * Used by the bg-poller after `notification.show()` succeeds.
- *
- * Best effort: if the server is unreachable or the ack fails, we just
- * log; the user-visible notification has already fired, the worst case
- * is the delivery row stays `queued` (which the UI represents
- * honestly as "shown, ack pending" — see v3 plan ack-loss path).
- */
-function ackDelivery(
+async function postNotificationApi<T>(
   port: number,
-  payload: { event_id: string; channel: string; status: 'delivered' | 'error'; error?: string },
-): void {
+  route: string,
+  payload: unknown,
+): Promise<T> {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const http = require('http');
   const body = JSON.stringify(payload);
-  const req = http.request(
-    {
+  return new Promise<T>((resolve, reject) => {
+    const req = http.request({
       hostname: '127.0.0.1',
       port,
-      path: '/api/tasks/notify/ack',
+      path: route,
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(body),
+        'X-CodePilot-Consumer': 'electron-main',
       },
-    },
-    () => { /* ignore response */ },
-  );
-  req.on('error', () => { /* best effort */ });
-  req.setTimeout(2000, () => { req.destroy(); });
-  req.write(body);
-  req.end();
+    }, (res: import('http').IncomingMessage) => {
+      let responseBody = '';
+      res.on('data', (chunk: Buffer) => { responseBody += chunk.toString(); });
+      res.on('end', () => {
+        if ((res.statusCode || 500) >= 400) {
+          reject(new Error(`notification API ${route} returned ${res.statusCode}`));
+          return;
+        }
+        try { resolve(JSON.parse(responseBody) as T); }
+        catch { reject(new Error(`notification API ${route} returned invalid JSON`)); }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(3000, () => { req.destroy(new Error('notification API timeout')); });
+    req.write(body);
+    req.end();
+  });
 }
 
 /**
- * Background notification poller — runs in the main process whenever the
- * main window is hidden or destroyed, so local macOS notifications continue
- * working even after the user closes the window into the menubar. When the
- * window is visible the renderer's `useNotificationPoll` hook handles the
- * same queue, so we self-stop to avoid duplicate delivery.
- *
- * This is intentionally bridge-independent: bridges (Telegram / 飞书 / QQ /
- * Discord) are optional remote channels. Local notifications must work with
- * just CodePilot menubar-resident, no bridge configured.
+ * One native owner for the entire app lifetime. Visibility changes never
+ * transfer ownership to the renderer, so an event cannot be shown twice at
+ * the visible/hidden boundary.
  */
-function startBgNotifyPoll(): void {
-  if (bgNotifyTimer) return;
-
-  bgNotifyTimer = setInterval(async () => {
-    // Stop polling whenever the renderer is on screen — it will drain the
-    // queue itself via useNotificationPoll. We check `isVisible()` instead
-    // of "window count" because in the new menubar-resident model the main
-    // window stays alive (just hidden) when the user clicks close.
-    if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) {
-      stopBgNotifyPoll();
+function startNativeDeliveryService(): void {
+  if (nativeDeliveryTimer) return;
+  const poll = async () => {
+    if (nativeDeliveryPolling) return;
+    nativeDeliveryPolling = true;
+    const port = serverPort;
+    if (!port) {
+      nativeDeliveryPolling = false;
       return;
     }
-
-    // Re-read the port each tick. In prod the loading window is created
-    // BEFORE startServerOnStablePort() resolves; if the user closes that
-    // loading window during boot, `hide` fires and startBgNotifyPoll()
-    // runs while serverPort is still null. Caching `serverPort || 3000`
-    // at start would then pin the poller to 3000 forever, even after the
-    // real port lands. Skipping the tick keeps the timer armed; it'll
-    // succeed on the next 5s wakeup once the server is ready.
-    const port = serverPort;
-    if (!port) return;
-
     try {
-      const http = await import('http');
-      const data = await new Promise<string>((resolve, reject) => {
-        const req = http.get(`http://127.0.0.1:${port}/api/tasks/notify`, (res) => {
-          let body = '';
-          res.on('data', (chunk: Buffer) => { body += chunk.toString(); });
-          res.on('end', () => resolve(body));
-        });
-        req.on('error', reject);
-        req.setTimeout(3000, () => { req.destroy(); reject(new Error('timeout')); });
-      });
+      const claimed = await postNotificationApi<{ delivery: NativeDeliveryPayload | null }>(
+        port,
+        '/api/tasks/notify/claim',
+        { channel: 'electron-native', owner: nativeDeliveryOwner },
+      );
+      const delivery = claimed.delivery;
+      if (!delivery) return;
 
-      const notifications = parseBgNotifications(data);
-      for (const notif of notifications) {
-        try {
-          const notification = new Notification({
-            title: notif.title,
-            body: notif.body || '',
-          });
-          // #34 observability — bg (window-hidden) show path. supported=false
-          // OR no banner despite supported=true ⇒ macOS notification permission
-          // for this app (esp. an unsigned dev Electron binary) is the suspect.
-          console.log(`[notify] bg-poller OS notification: supported=${Notification.isSupported()} title=${JSON.stringify(notif.title)}`);
-          // Phase 3 Step 3: click → re-open window AND forward payload
-          // to renderer so it can route to /settings/tasks?focus=<id>
-          // (or the relevant chat session). The IPC channel is the
-          // same one notification:show uses for in-renderer display.
-          notification.on('click', () => {
-            showMainWindow();
-            if (notif.task_id || notif.session_id) {
-              mainWindow?.webContents.send('notification:click', {
-                taskId: notif.task_id,
-                sessionId: notif.session_id,
-                event_id: notif.event_id,
-              });
-            }
-          });
-          notification.show();
-          // v6 fix (P1): unify on `electron-native`. `sendNotification`
-          // pre-writes a `electron-native` row in queued state when
-          // priority is normal/urgent; the bg-poller MUST ack THAT
-          // row, not introduce a new `electron-bg-native` channel
-          // that leaves the original queued forever. Whether the OS
-          // notification was rendered by the bg-poller (window hidden)
-          // or by the renderer's `useNotificationPoll` (window visible)
-          // is the same surface from the user's POV — one row tracking
-          // both is the honest representation.
-          if (notif.event_id) {
-            ackDelivery(port, {
-              event_id: notif.event_id,
-              channel: 'electron-native',
-              status: 'delivered',
-            });
-            // The drain consumed the queue, so the renderer (when the
-            // window returns visible) will NOT see this notification
-            // again. Mark its `renderer-toast` candidate as skipped so
-            // the UI can show "in-app toast: skipped (window hidden)"
-            // instead of perpetual queued. UPSERT semantics make this
-            // safe to call even if the row was already acked.
-            ackDelivery(port, {
-              event_id: notif.event_id,
-              channel: 'renderer-toast',
-              status: 'skipped',
-              error: 'window hidden — bg-poller delivered native notification only',
-            });
-          }
-        } catch (err) {
-          if (notif.event_id) {
-            ackDelivery(port, {
-              event_id: notif.event_id,
-              channel: 'electron-native',
-              status: 'error',
-              error: err instanceof Error ? err.message : String(err),
-            });
-          }
-        }
+      const action: NotificationClickAction = {
+        taskId: delivery.task_id || undefined,
+        sessionId: delivery.session_id || undefined,
+        event_id: delivery.event_id,
+        route: resolveNotificationActionRoute(delivery.action_type, delivery.action_payload),
+      };
+      const supported = Notification.isSupported();
+      // Electron's macOS implementation requires a code-signed application.
+      // `electron:dev` runs the unsigned Electron.app, whose `show` event can
+      // fire without anything reaching Notification Center on Electron 40.
+      // Fail closed instead of persisting a fake delivered receipt. Release
+      // builds remain subject to the signed-package smoke gate.
+      const unavailableReason = process.platform === 'darwin' && !app.isPackaged
+        ? NATIVE_NOTIFICATION_ERROR.macosUnsignedDevelopment
+        : undefined;
+      const notification = supported && !unavailableReason
+        ? new Notification(buildNativeNotificationOptions(process.platform, delivery.title, delivery.body || ''))
+        : null;
+      if (notification) {
+        nativeNotificationRetention.retain(notification);
+        notification.once('close', () => nativeNotificationRetention.release(notification));
       }
-    } catch {
-      // Server may not be reachable — ignore
+      const outcome = await deliverNativeNotification({
+        platform: process.platform,
+        supported,
+        notification,
+        unavailableReason,
+        onClick: () => {
+          if (notification) nativeNotificationRetention.release(notification);
+          showMainWindow();
+          notificationClickQueue.push(action);
+        },
+      });
+      if (outcome.status === 'error' && notification) {
+        nativeNotificationRetention.release(notification);
+      }
+      await postNotificationApi(port, '/api/tasks/notify/ack', {
+        delivery_id: delivery.delivery_id,
+        owner: nativeDeliveryOwner,
+        channel: 'electron-native',
+        outcome: outcome.status,
+        error: outcome.status === 'error' ? outcome.error : undefined,
+        retryable: outcome.status === 'error' ? outcome.retryable : false,
+      });
+      console.log(`[notify] native delivery event_id=${delivery.event_id} outcome=${outcome.status}`);
+    } catch (error) {
+      console.warn('[notify] native delivery poll failed:', error instanceof Error ? error.message : String(error));
+    } finally {
+      nativeDeliveryPolling = false;
     }
-  }, 5000);
+  };
+  void poll();
+  nativeDeliveryTimer = setInterval(() => { void poll(); }, 2_000);
 }
 
-function stopBgNotifyPoll(): void {
-  if (bgNotifyTimer) {
-    clearInterval(bgNotifyTimer);
-    bgNotifyTimer = null;
+function stopNativeDeliveryService(): void {
+  if (nativeDeliveryTimer) {
+    clearInterval(nativeDeliveryTimer);
+    nativeDeliveryTimer = null;
   }
+  nativeDeliveryPolling = false;
+  nativeNotificationRetention.clear();
 }
 
 /**
@@ -865,20 +974,30 @@ function startServer(port: number): Electron.UtilityProcess {
   const home = os.homedir();
   const constructedPath = getExpandedShellPath();
 
-  const env: Record<string, string> = {
-    ...userShellEnv,
-    ...sanitizedProcessEnv(),
-    // Ensure user shell env vars override (especially API keys)
-    ...userShellEnv,
-    // Inject system proxy (only if not already set in shell env)
-    ...(!userShellEnv.HTTP_PROXY && !userShellEnv.HTTPS_PROXY ? resolvedProxyEnv : {}),
-    PORT: String(port),
-    HOSTNAME: '127.0.0.1',
-    CLAUDE_GUI_DATA_DIR: path.join(home, '.codepilot'),
-    HOME: home,
-    USERPROFILE: home,
-    PATH: constructedPath,
-  };
+  const env = buildProxySafeEnvironment({
+    // Ensure user shell env vars override inherited values (especially API
+    // keys). On Windows loadUserShellEnv() is empty, so inherited process.env
+    // remains the explicit-proxy source of truth.
+    baseEnv: {
+      ...sanitizedProcessEnv(),
+      ...userShellEnv,
+    },
+    // Chromium's system proxy is only a fallback. The shared helper checks all
+    // upper/lower-case proxy keys before applying it, then ensures loopback
+    // traffic cannot be sent through Clash/Surge/etc.
+    fallbackProxyEnv: resolvedProxyEnv,
+    overrides: {
+      ...macosKeychainEnvironment,
+      ...providerSecretEnvironment,
+      PORT: String(port),
+      HOSTNAME: '127.0.0.1',
+      CLAUDE_GUI_DATA_DIR: path.join(home, '.codepilot'),
+      HOME: home,
+      USERPROFILE: home,
+      PATH: constructedPath,
+    },
+    platform: process.platform,
+  }) as Record<string, string>;
 
   // Use Electron's utilityProcess to run the server in a child process
   // without spawning a separate Dock icon on macOS.
@@ -972,6 +1091,50 @@ const LOADING_HTML = `data:text/html;charset=utf-8,${encodeURIComponent(`<!DOCTY
 </body>
 </html>`)}`;
 
+/**
+ * Give every editable renderer surface the platform-native editing menu.
+ *
+ * Chromium does not add a copy/paste context menu to Electron inputs by
+ * default. Keeping this in the main process covers ordinary inputs,
+ * textareas and contenteditable editors (including CodeMirror) without each
+ * React component having to reimplement clipboard behavior. Electron roles
+ * also supply native labels, shortcuts and enablement semantics per platform.
+ */
+function attachRendererEditingContextMenu(targetWindow: BrowserWindow): void {
+  targetWindow.webContents.on('context-menu', (_event, params) => {
+    const hasSelection = params.selectionText.length > 0;
+    const isPassword = params.inputFieldType === 'password';
+
+    if (!params.isEditable && !hasSelection) return;
+
+    const template: Electron.MenuItemConstructorOptions[] = params.isEditable
+      ? [
+          { role: 'undo', enabled: params.editFlags.canUndo },
+          { role: 'redo', enabled: params.editFlags.canRedo },
+          { type: 'separator' },
+          {
+            role: 'cut',
+            enabled: !isPassword && params.editFlags.canCut,
+          },
+          {
+            role: 'copy',
+            enabled: !isPassword && params.editFlags.canCopy,
+          },
+          { role: 'paste', enabled: params.editFlags.canPaste },
+          { role: 'delete', enabled: params.editFlags.canDelete },
+          { type: 'separator' },
+          { role: 'selectAll', enabled: params.editFlags.canSelectAll },
+        ]
+      : [
+          { role: 'copy', enabled: hasSelection },
+          { type: 'separator' },
+          { role: 'selectAll' },
+        ];
+
+    Menu.buildFromTemplate(template).popup({ window: targetWindow });
+  });
+}
+
 function createWindow(url?: string) {
   const windowOptions: Electron.BrowserWindowConstructorOptions = {
     width: 1280,
@@ -1003,9 +1166,11 @@ function createWindow(url?: string) {
     //   ELECTRON_VIBRANCY=menu|sidebar|under-window|content|fullscreen-ui|off
     //   ELECTRON_TRANSPARENT=true|false                   (default: true)
     //
-    // Defaults reflect what we know so far:
-    //   - `'menu'` is what /Applications/Codex.app actually uses
-    //     as its primary window material (verified in app.asar).
+    // Default material:
+    //   - `'under-window'` keeps the native translucent backing while
+    //     preserving more background definition than the heavier
+    //     `'menu'` material. The user selected this after a same-window
+    //     visual comparison on 2026-07-30.
     //   - `transparent: true` makes Electron honor an alpha-0
     //     backgroundColor on macOS — required for `vibrancy` to
     //     surface unless we go the davidcann route of native
@@ -1022,7 +1187,7 @@ function createWindow(url?: string) {
     const envVibrancy = process.env.ELECTRON_VIBRANCY;
     const vibrancyChoice = envVibrancy && (VIBRANCY_CANDIDATES.has(envVibrancy) || envVibrancy === 'off')
       ? envVibrancy
-      : 'menu';
+      : 'under-window';
     const envTransparent = process.env.ELECTRON_TRANSPARENT;
     const transparentChoice = envTransparent === 'false' ? false : true;
 
@@ -1059,21 +1224,36 @@ function createWindow(url?: string) {
   }
 
   mainWindow = new BrowserWindow(windowOptions);
+  attachRendererEditingContextMenu(mainWindow);
+  mainWindow.webContents.on('did-start-loading', () => {
+    // A navigation replaces the renderer and its IPC listeners. Hold native
+    // notification clicks until the new AppShell explicitly announces that
+    // its route listener is installed.
+    notificationClickQueue.setReady(false);
+  });
 
   // External links: open in system default browser instead of Electron
   mainWindow.webContents.setWindowOpenHandler(({ url: targetUrl }) => {
     if (targetUrl.startsWith('http://') || targetUrl.startsWith('https://')) {
-      shell.openExternal(targetUrl);
+      openExternalInSystemBrowser(targetUrl);
       return { action: 'deny' };
     }
     return { action: 'deny' };
   });
   mainWindow.webContents.on('will-navigate', (event, targetUrl) => {
-    // Allow navigating within the app (localhost dev server)
-    const appOrigin = new URL(mainWindow!.webContents.getURL()).origin;
-    if (new URL(targetUrl).origin !== appOrigin) {
-      event.preventDefault();
-      shell.openExternal(targetUrl);
+    // Policy lives in a pure, unit-tested helper (src/lib/navigation-policy).
+    // In-app navigation is allowed ONLY for same-origin http/https. The
+    // startup splash is a `data:` page whose origin serializes to "null", so
+    // an origin-only same-origin check would let data:/file:/javascript:/
+    // vscode: targets masquerade as same-origin and skip the http/https
+    // external-link whitelist. Non-web targets are blocked outright and never
+    // reach shell.openExternal (which would let AI-authored content launch OS
+    // protocol handlers). (audit 2026-07 finding 1.7 + Codex Loop-1 review)
+    const decision = classifyNavigation(mainWindow!.webContents.getURL(), targetUrl);
+    if (decision === 'allow-in-app') return;
+    event.preventDefault();
+    if (decision === 'open-external') {
+      openExternalInSystemBrowser(targetUrl);
     }
   });
 
@@ -1207,21 +1387,16 @@ function createWindow(url?: string) {
   // quitting the app. Only `isQuitting` (set by the tray "Quit CodePilot"
   // menu item or by `before-quit`) lets the close go through to a real
   // teardown. The scheduler and local notifications keep running while
-  // hidden — see startBgNotifyPoll().
+  // hidden. Native notification delivery is owned by Electron Main for the
+  // whole app lifetime and does not change with window visibility.
   mainWindow.on('close', (event) => {
     if (isQuitting) return;
     event.preventDefault();
     mainWindow?.hide();
   });
 
-  // When the window goes hidden, hand off notification polling to the main
-  // process (the renderer's useNotificationPoll may be throttled by Chromium
-  // background heuristics on hidden BrowserWindows). When it returns visible,
-  // the renderer takes over and the main-process poller self-stops.
-  mainWindow.on('hide', () => { startBgNotifyPoll(); });
-  mainWindow.on('show', () => { stopBgNotifyPoll(); });
-
   mainWindow.on('closed', () => {
+    notificationClickQueue.setReady(false);
     mainWindow = null;
   });
 }
@@ -1481,8 +1656,44 @@ app.whenReady().then(async () => {
   // memory evidence instead of vanishing.
   registerCrashBreadcrumbs();
 
+  if (nativeCrashSmokeEnabled) {
+    console.log('[telemetry-smoke] native crash fixture armed');
+    setTimeout(() => process.crash(), 3_000);
+    return;
+  }
+
   // Load user's full shell environment (API keys, PATH, etc.)
   userShellEnv = loadUserShellEnv();
+
+  // Electron owns OS credential-store access. The standalone Next child gets
+  // only the in-memory data-encryption key; the database never stores it.
+  const macosKeychainProbe = getMacosDefaultKeychainProbe();
+  const macosSecurityShimDir = app.isPackaged
+    ? path.join(process.resourcesPath, 'macos-keychain-guard')
+    : path.join(app.getAppPath(), 'resources', 'macos-keychain-guard');
+  macosKeychainEnvironment = buildMacosKeychainEnvironment(
+    macosKeychainProbe,
+    macosSecurityShimDir,
+  );
+
+  if (macosKeychainProbe.status === 'unavailable') {
+    providerSecretEnvironment = {};
+    console.warn(
+      `[macos-keychain] default keychain unavailable; noninteractive guard enabled; reason=${macosKeychainProbe.reason}`,
+    );
+    console.warn('[provider-secret] safeStorage skipped; legacy provider secrets will not be migrated');
+  } else {
+    try {
+      providerSecretEnvironment = initializeProviderSecretEnvironment(app.getPath('userData'));
+      console.log(
+        `[provider-secret] backend=${providerSecretEnvironment.CODEPILOT_PROVIDER_SECRET_BACKEND} `
+        + `level=${providerSecretEnvironment.CODEPILOT_PROVIDER_SECRET_LEVEL}`,
+      );
+    } catch (error) {
+      providerSecretEnvironment = {};
+      console.warn('[provider-secret] OS-protected storage unavailable; legacy provider secrets will not be migrated', error);
+    }
+  }
 
   // Detect system proxy for Chinese users behind VPN (Clash, Surge, etc.)
   resolvedProxyEnv = await resolveSystemProxy();
@@ -1991,9 +2202,68 @@ app.whenReady().then(async () => {
 
   // --- End install wizard IPC handlers ---
 
-  // Open a folder in the system file manager (Finder / Explorer)
-  ipcMain.handle('shell:open-path', async (_event: Electron.IpcMainInvokeEvent, folderPath: string) => {
-    return shell.openPath(folderPath);
+  // Narrow Codex recovery capability: fixed official command, no arguments.
+  // The command is copied but never passed to PowerShell, pasted or executed.
+  ipcMain.handle('codex:prepare-windows-recovery', async (event: Electron.IpcMainInvokeEvent) => {
+    if (
+      process.platform !== 'win32'
+      || event.sender !== mainWindow?.webContents
+      || !isTrustedCodexRecoverySender(event.sender.getURL(), serverPort)
+    ) {
+      return { ok: false, copied: false, opened: false, error: 'unsupported_or_untrusted' };
+    }
+
+    let copied = false;
+    try {
+      const install = selectCodexWindowsInstallCommand(findWindowsNpmCommand());
+      clipboard.writeText(install.command);
+      copied = true;
+      const spec = buildCodexPowerShellLaunchSpec();
+      const launcher = spawn(spec.command, spec.args, {
+        windowsHide: spec.windowsHide,
+        windowsVerbatimArguments: spec.windowsVerbatimArguments,
+        shell: spec.shell,
+        stdio: 'ignore',
+      });
+      await new Promise<void>((resolve, reject) => {
+        launcher.once('error', reject);
+        launcher.once('close', code => {
+          if (code === 0) resolve();
+          else reject(new Error(`powershell_launcher_exit:${code ?? 'unknown'}`));
+        });
+      });
+      console.log(`[codex-recovery] copied=true opened=true install_method=${install.method}`);
+      return { ok: true, copied: true, opened: true, installMethod: install.method };
+    } catch (error) {
+      console.warn('[codex-recovery] copied command but PowerShell open failed', error);
+      return {
+        ok: false,
+        copied,
+        opened: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  });
+
+  // AI-authored paths never enter a generic shell.openPath bridge. Reveal is
+  // non-launching, and the only launching path is a workspace-scoped HTML
+  // file that has passed the server + main-process realpath checks.
+  ipcMain.handle('shell:reveal-path', async (
+    event: Electron.IpcMainInvokeEvent,
+    request: ScopedSystemPathRequest,
+  ) => {
+    const resolved = await resolveScopedSystemPath(event, request, 'reveal');
+    if ('error' in resolved) return resolved.error;
+    shell.showItemInFolder(resolved.realPath);
+    return '';
+  });
+  ipcMain.handle('shell:open-html-file', async (
+    event: Electron.IpcMainInvokeEvent,
+    request: ScopedSystemPathRequest,
+  ) => {
+    const resolved = await resolveScopedSystemPath(event, request, 'open-html');
+    if ('error' in resolved) return resolved.error;
+    return shell.openPath(resolved.realPath);
   });
 
   // Phase 2C.6 follow-up: expose the persistent log directory to the
@@ -2006,6 +2276,20 @@ app.whenReady().then(async () => {
     } catch {
       return null;
     }
+  });
+
+  ipcMain.handle('app:get-default-assistant-home', async () => {
+    return resolveDefaultAssistantHome(app.getPath('documents'));
+  });
+
+  // Keep the NSVisualEffectView appearance aligned with the renderer's
+  // next-themes mode. Without this bridge, an app-level dark selection can
+  // sit over a light native material (or vice versa), which previously led us
+  // to hide the mismatch behind an almost-opaque CSS tint.
+  ipcMain.handle('theme:set-source', (_event, source: unknown) => {
+    if (!isNativeThemeSource(source)) return false;
+    nativeTheme.themeSource = source;
+    return true;
   });
 
   // Bridge status IPC
@@ -2077,6 +2361,160 @@ app.whenReady().then(async () => {
     }
   });
 
+  // --- Asset Library HTML thumbnail capture ---
+  // The Gallery never embeds archived HTML. It asks this isolated window to
+  // paint one bounded frame, persists the returned PNG through the scoped
+  // Asset API, then renders only that static image on subsequent visits.
+  // Calls are serialized so opening a library with legacy HTML Assets cannot
+  // create a burst of hidden Chromium renderers.
+  const htmlThumbnailCaptureQueue = new SerializedDeadlineQueue();
+  ipcMain.handle('asset:capture-html-thumbnail', async (
+    event,
+    params: { previewUrl?: unknown; width?: unknown; height?: unknown },
+  ) => {
+    let captureWindow: BrowserWindow | null = null;
+    try {
+      return await htmlThumbnailCaptureQueue.run(async () => {
+        const senderUrl = new URL(event.sender.getURL());
+        const width = params.width === undefined ? 1280 : Number(params.width);
+        const height = params.height === undefined ? 720 : Number(params.height);
+        if (
+          senderUrl.protocol !== 'http:'
+          || senderUrl.hostname !== '127.0.0.1'
+          || typeof params.previewUrl !== 'string'
+          || params.previewUrl.length > 16_384
+          || !Number.isInteger(width)
+          || !Number.isInteger(height)
+          || width !== 1280
+          || height !== 720
+        ) {
+          return { error: 'invalid_request' as const };
+        }
+        const targetUrl = new URL(params.previewUrl, senderUrl.origin);
+        if (
+          targetUrl.origin !== senderUrl.origin
+          || targetUrl.searchParams.has('interactive')
+        ) {
+          return { error: 'invalid_preview_url' as const };
+        }
+        let requestScope: ReturnType<typeof deriveHtmlThumbnailRequestScope>;
+        try {
+          requestScope = deriveHtmlThumbnailRequestScope(targetUrl);
+        } catch {
+          return { error: 'invalid_preview_url' as const };
+        }
+        const partition = `asset-thumbnail-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        const captureSession = session.fromPartition(partition, { cache: false });
+        captureSession.setPermissionCheckHandler(() => false);
+        captureSession.setPermissionRequestHandler(
+          (_webContents, _permission, callback) => callback(false),
+        );
+        captureSession.webRequest.onBeforeRequest(
+          {
+            urls: ['<all_urls>'],
+          },
+          (details, callback) => {
+            callback({
+              cancel: !isHtmlThumbnailRequestAllowed(details.url, requestScope),
+            });
+          },
+        );
+
+        captureWindow = new BrowserWindow({
+          show: false,
+          width,
+          height,
+          backgroundColor: '#ffffff',
+          paintWhenInitiallyHidden: true,
+          webPreferences: {
+            contextIsolation: true,
+            nodeIntegration: false,
+            sandbox: true,
+            backgroundThrottling: false,
+            partition,
+          },
+        });
+        captureWindow.webContents.on('will-navigate', (navigationEvent) => {
+          navigationEvent.preventDefault();
+        });
+        captureWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+        try {
+          await captureWindow.loadURL(targetUrl.toString());
+          await captureWindow.webContents.insertCSS(`
+            html, body {
+              width: 1280px !important;
+              height: 720px !important;
+              overflow: hidden !important;
+              scrollbar-width: none !important;
+            }
+            *, *::before, *::after {
+              animation: none !important;
+              transition: none !important;
+              caret-color: transparent !important;
+            }
+            ::-webkit-scrollbar { display: none !important; }
+          `);
+          await Promise.race([
+            captureWindow.webContents.executeJavaScript(`
+              Promise.all([
+                document.fonts ? document.fonts.ready : Promise.resolve(),
+                ...Array.from(document.images).map((image) =>
+                  image.complete
+                    ? Promise.resolve()
+                    : new Promise((resolve) => {
+                        image.addEventListener('load', resolve, { once: true });
+                        image.addEventListener('error', resolve, { once: true });
+                      })
+                ),
+              ]).then(() => true)
+            `),
+            new Promise((resolve) => setTimeout(resolve, 2500)),
+          ]);
+          await new Promise((resolve) => setTimeout(resolve, 150));
+          const image = await captureWindow.webContents.capturePage({
+            x: 0,
+            y: 0,
+            width,
+            height,
+          });
+          const resized = image.resize({ width, height, quality: 'best' });
+          return {
+            base64: resized.toPNG().toString('base64'),
+            width,
+            height,
+          };
+        } finally {
+          if (captureWindow && !captureWindow.isDestroyed()) {
+            captureWindow.destroy();
+          }
+          captureWindow = null;
+          captureSession.webRequest.onBeforeRequest(null);
+          captureSession.setPermissionCheckHandler(null);
+          captureSession.setPermissionRequestHandler(null);
+        }
+      }, {
+        timeoutMs: HTML_THUMBNAIL_CAPTURE_TIMEOUT_MS,
+        onTimeout: () => {
+          if (captureWindow && !captureWindow.isDestroyed()) {
+            captureWindow.webContents.stop();
+            captureWindow.destroy();
+          }
+          captureWindow = null;
+        },
+      });
+    } catch (error) {
+      console.warn(
+        '[asset:capture-html-thumbnail] capture failed:',
+        error instanceof Error ? error.message : String(error),
+      );
+      return {
+        error: error instanceof HtmlThumbnailCaptureTimeoutError
+          ? 'capture_timeout' as const
+          : 'capture_failed' as const,
+      };
+    }
+  });
+
   // --- Artifact long-shot export (Phase 3) ---
   // Captures an arbitrary HTML source as a single full-page PNG, using
   // Chromium's CDP captureBeyondViewport so we can exceed the viewport
@@ -2093,7 +2531,10 @@ app.whenReady().then(async () => {
     html: string;
     width: number;
     pixelRatio?: number;
-    outPath?: string;
+    // NOTE: no `outPath`. The renderer must NOT name an arbitrary filesystem
+    // path here — a compromised renderer could overwrite any file with PNG
+    // bytes. The handler only returns base64; the renderer saves it via a Blob
+    // download (src/lib/artifact-export.ts). (audit 2026-07 finding 1.1)
     maxHeightPx?: number;
     timeoutMs?: number;
   }) => {
@@ -2106,7 +2547,6 @@ app.whenReady().then(async () => {
       html,
       width,
       pixelRatio = 2,
-      outPath,
       maxHeightPx = 50000,
       timeoutMs = 30000,
     } = params;
@@ -2200,12 +2640,9 @@ app.whenReady().then(async () => {
         }
       }
 
-      if (outPath) {
-        const fs = await import('fs/promises');
-        const buf = Buffer.from(pngBase64, 'base64');
-        await fs.writeFile(outPath, buf);
-        return { path: outPath, bytes: buf.length };
-      }
+      // Always return base64 to the renderer; never write to a
+      // renderer-supplied path (removed — audit 2026-07 finding 1.1). The
+      // renderer saves via a Blob download in src/lib/artifact-export.ts.
       return { base64: pngBase64, bytes: Buffer.from(pngBase64, 'base64').length };
     } catch (err) {
       return {
@@ -2232,12 +2669,26 @@ app.whenReady().then(async () => {
   });
 
   ipcMain.handle('terminal:create', async (_event, opts: { id: string; cwd: string; cols: number; rows: number }) => {
+    // Validate before spawning (stability audit ⑦): a non-string/duplicate id
+    // would poison the id→terminal map or clobber a live terminal, and a
+    // missing cwd would spawn in the wrong place or throw an ambiguous ENOENT.
+    const validation = validateTerminalCreateOpts(opts, {
+      idExists: (id) => terminalManager.has(id),
+      cwdIsDirectory: (cwd) => {
+        try { return fs.statSync(cwd).isDirectory(); } catch { return false; }
+      },
+    });
+    if (!validation.ok) {
+      console.warn(`[terminal:create] rejected (${validation.error}): ${validation.detail}`);
+      return { ok: false as const, error: validation.error, detail: validation.detail };
+    }
     terminalManager.create(opts.id, {
       cwd: opts.cwd,
       cols: opts.cols,
       rows: opts.rows,
       env: userShellEnv,
     });
+    return { ok: true as const };
   });
 
   ipcMain.on('terminal:write', (_event, data: { id: string; data: string }) => {
@@ -2254,51 +2705,10 @@ app.whenReady().then(async () => {
 
   // --- End terminal IPC handlers ---
 
-  // --- Notification IPC handler ---
-  // Phase 3 Step 3: payload extended with `taskId` / `sessionId` /
-  // `event_id` so a click → re-open + route to /settings/tasks?focus=…
-  // works whether the notification was rendered here (window visible)
-  // or by the bg-poller (window hidden). The legacy `onClick` field is
-  // kept for backward compatibility with non-task notifications.
-  ipcMain.handle('notification:show', async (_event, options: {
-    title: string;
-    body: string;
-    onClick?: { type: string; payload: string };
-    taskId?: string;
-    sessionId?: string;
-    event_id?: string;
-  }) => {
-    try {
-      const notification = new Notification({
-        title: options.title,
-        body: options.body || '',
-      });
-      // #34 observability — renderer (window-visible) show path. On macOS the
-      // OS banner is SUPPRESSED while the app is focused (focused=true) — the
-      // in-app toast from useNotificationPoll is the visible fallback there.
-      console.log(`[notify] notification:show renderer path: supported=${Notification.isSupported()} focused=${mainWindow?.isFocused() ?? 'n/a'} title=${JSON.stringify(options.title)}`);
-      const hasTaskPayload = !!(options.taskId || options.sessionId);
-      if (options.onClick || hasTaskPayload) {
-        notification.on('click', () => {
-          mainWindow?.show();
-          mainWindow?.focus();
-          if (hasTaskPayload) {
-            mainWindow?.webContents.send('notification:click', {
-              taskId: options.taskId,
-              sessionId: options.sessionId,
-              event_id: options.event_id,
-            });
-          } else if (options.onClick) {
-            mainWindow?.webContents.send('notification:click', options.onClick);
-          }
-        });
-      }
-      notification.show();
-      return true;
-    } catch (err) {
-      console.error('[notification] Failed to show:', err);
-      return false;
-    }
+  // Notification ownership is deliberately one-way: the renderer may listen
+  // for clicks but cannot ask Main to show arbitrary native notifications.
+  ipcMain.on('notification:renderer-ready', () => {
+    notificationClickQueue.setReady(true);
   });
 
   // Proxy resolution IPC — allows renderer/API routes to query system proxy
@@ -2365,6 +2775,8 @@ app.whenReady().then(async () => {
       autoStartReq.end();
     }
 
+    startNativeDeliveryService();
+
   } catch (err) {
     console.error('Failed to start:', err);
     dialog.showErrorBox(
@@ -2408,6 +2820,7 @@ app.on('activate', async () => {
       createWindow();
       const port = await startServerOnStablePort();
       serverPort = port;
+      startNativeDeliveryService();
       if (mainWindow) {
         mainWindow.loadURL(`http://127.0.0.1:${port}`);
       }
